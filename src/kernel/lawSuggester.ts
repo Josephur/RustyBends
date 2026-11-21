@@ -551,7 +551,7 @@ export function analyzeRustForLaws(rustSource: string): RustAnalysisReport {
 
     // 1. Panicking unwrap()/expect() inside critical logic
     if (hasUnwrap) {
-      const snippet = `def safe_${fn.name}(+a: Nat, +b: Nat) -> Nat:\n  a - b\n\nlaw ${fn.name}_no_underflow_floor(for +x: Nat):\n  safe_${fn.name}(x, x) == 0n\n\nproof ${fn.name}_no_underflow_floor:\n  refl`;
+      const snippet = `def safe_${fn.name}(+a: Nat, +b: Nat) -> Nat:\n  (a - b : Nat)\n\nlaw ${fn.name}_no_underflow_floor(for +x: Nat):\n  safe_${fn.name}(x, x) == 0n\n\nproof ${fn.name}_no_underflow_floor:\n  refl`;
       findings.push({
         id: `${fn.name}:unwrap`,
         fnName: fn.name,
@@ -571,7 +571,7 @@ export function analyzeRustForLaws(rustSource: string): RustAnalysisReport {
       /transfer|reserve|release|move|rebalance|allocate/.test(lowerName) &&
       (hasMutState || (hasAdd && hasSub))
     ) {
-      const snippet = `def credit(+bal: Nat, +amt: Nat) -> Nat:\n  bal + amt\n\ndef pool_total(+a: Nat, +b: Nat) -> Nat:\n  a + b\n\nlaw ${fn.name}_conserves_total(for +a: Nat, for +b: Nat, for +amt: Nat):\n  pool_total(credit(a, amt), b) == pool_total(a, credit(b, amt))\n\nproof ${fn.name}_conserves_total:\n  refl`;
+      const snippet = `def credit(+bal: Nat, +amt: Nat) -> Nat:\n  (bal + amt : Nat)\n\ndef pool_total(+a: Nat, +b: Nat) -> Nat:\n  (a + b : Nat)\n\nlaw ${fn.name}_conserves_total(for +a: Nat, for +b: Nat, for +amt: Nat):\n  pool_total(credit(a, amt), b) == pool_total(a, credit(b, amt))\n\nproof ${fn.name}_conserves_total:\n  refl`;
       findings.push({
         id: `${fn.name}:conservation`,
         fnName: fn.name,
@@ -591,7 +591,7 @@ export function analyzeRustForLaws(rustSource: string): RustAnalysisReport {
       /fee|deduct|withdraw|discount|sub|net|debit|burn/.test(lowerName) ||
       (hasSub && !hasMutState && !/decode|unpack/.test(lowerName))
     ) {
-      const snippet = `def ${fn.name}(+gross: Nat, +fee: Nat) -> Nat:\n  gross - fee\n\nlaw ${fn.name}_zero_unchanged(for +gross: Nat):\n  ${fn.name}(gross, 0n) == gross\n\nproof ${fn.name}_zero_unchanged:\n  refl\n\nlaw ${fn.name}_full_cancel(for +x: Nat):\n  ${fn.name}(x, x) == 0n\n\nproof ${fn.name}_full_cancel:\n  refl`;
+      const snippet = `def ${fn.name}(+gross: Nat, +fee: Nat) -> Nat:\n  (gross - fee : Nat)\n\nlaw ${fn.name}_zero_unchanged(for +gross: Nat):\n  ${fn.name}(gross, 0n) == gross\n\nproof ${fn.name}_zero_unchanged:\n  refl\n\nlaw ${fn.name}_full_cancel(for +x: Nat):\n  ${fn.name}(x, x) == 0n\n\nproof ${fn.name}_full_cancel:\n  refl`;
       findings.push({
         id: `${fn.name}:sub_bounds`,
         fnName: fn.name,
@@ -612,7 +612,7 @@ export function analyzeRustForLaws(rustSource: string): RustAnalysisReport {
       hasAdd &&
       !hasSub
     ) {
-      const snippet = `def ${fn.name}(+a: Nat, +b: Nat) -> Nat:\n  a + b\n\nlaw ${fn.name}_zero_identity(for +a: Nat):\n  ${fn.name}(a, 0n) == a\n\nproof ${fn.name}_zero_identity:\n  refl\n\nlaw ${fn.name}_commutative(for +a: Nat, for +b: Nat):\n  ${fn.name}(a, b) == ${fn.name}(b, a)\n\nproof ${fn.name}_commutative:\n  refl`;
+      const snippet = `def ${fn.name}(+a: Nat, +b: Nat) -> Nat:\n  (a + b : Nat)\n\nlaw ${fn.name}_zero_identity(for +a: Nat):\n  ${fn.name}(a, 0n) == a\n\nproof ${fn.name}_zero_identity:\n  refl\n\nlaw ${fn.name}_commutative(for +a: Nat, for +b: Nat):\n  ${fn.name}(a, b) == ${fn.name}(b, a)\n\nproof ${fn.name}_commutative:\n  refl`;
       findings.push({
         id: `${fn.name}:additive`,
         fnName: fn.name,
@@ -645,7 +645,7 @@ export function analyzeRustForLaws(rustSource: string): RustAnalysisReport {
 
     // 6. Authorization / Permission / RBAC guards
     if (/allow|deny|auth|perm|role|access|guard/.test(lowerName)) {
-      const snippet = `def ${fn.name}_effective(+allow: Nat, +deny: Nat) -> Nat:\n  allow - deny\n\nlaw ${fn.name}_deny_overrides_allow(for +mask: Nat):\n  ${fn.name}_effective(mask, mask) == 0n\n\nproof ${fn.name}_deny_overrides_allow:\n  refl`;
+      const snippet = `def ${fn.name}_effective(+allow: Nat, +deny: Nat) -> Nat:\n  (allow - deny : Nat)\n\nlaw ${fn.name}_deny_overrides_allow(for +mask: Nat):\n  ${fn.name}_effective(mask, mask) == 0n\n\nproof ${fn.name}_deny_overrides_allow:\n  refl`;
       findings.push({
         id: `${fn.name}:authz`,
         fnName: fn.name,
@@ -673,7 +673,7 @@ export function analyzeRustForLaws(rustSource: string): RustAnalysisReport {
       );
     });
     if (dec) {
-      const snippet = `def ${enc.name}(+payload: Nat) -> Nat:\n  payload + 4n\n\ndef ${dec.name}(+total: Nat) -> Nat:\n  total - 4n\n\nlaw ${enc.name}_roundtrip:\n  ${dec.name}(${enc.name}(12n)) == 12n\n\nproof ${enc.name}_roundtrip:\n  refl`;
+      const snippet = `def ${enc.name}(+payload: Nat) -> Nat:\n  (payload + 4n : Nat)\n\ndef ${dec.name}(+total: Nat) -> Nat:\n  (total - 4n : Nat)\n\nlaw ${enc.name}_roundtrip:\n  ${dec.name}(${enc.name}(12n)) == 12n\n\nproof ${enc.name}_roundtrip:\n  refl`;
       findings.push({
         id: `${enc.name}:${dec.name}:roundtrip`,
         fnName: `${enc.name} / ${dec.name}`,

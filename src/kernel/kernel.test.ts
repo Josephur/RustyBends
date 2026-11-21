@@ -147,10 +147,24 @@ test('starter kit and AI kickoff prompt generate all required v1.0.0 artifacts',
   assert.ok(emitRs.includes('pub fn emit_verified_rust'));
   assert.ok(emitRs.includes('pub enum '));
   assert.ok(emitRs.includes('match '));
+  assert.ok(emitRs.includes('emits_real_bend2_syntax_and_erases_proof_defs'));
+  assert.ok(emitRs.includes('emits_bend2_base_nat_and_bool_helpers'));
+  assert.ok(emitRs.includes('emits_wrapping_for_u32_and_saturating_for_nat'));
+  assert.ok(emitRs.includes('emits_nested_match_multi_scrutinee_succ_and_let'));
+  assert.ok(emitRs.includes('emits_pair_types_and_pair_accessors'));
+  assert.ok(emitRs.includes('Nat.is_le'));
+  assert.ok(emitRs.includes('Bool.and'));
+  assert.ok(emitRs.includes('wrapping_add'));
   assert.ok(emitRs.includes('#[cfg(test)]'));
   assert.ok(emitRs.includes('saturating_add'));
   assert.ok(emitRs.includes("out.push('\\n');"));
   assert.ok(!emitRs.includes('\\\\n'), 'emit.rs must not contain double-escaped \\\\n');
+
+  const coreBend = byPath.get('example-app/verified/core.bend')!.content;
+  assert.ok(coreBend.includes('import Base'));
+  assert.ok(coreBend.includes('type OrderState is Data:'));
+  assert.ok(coreBend.includes('law deposit_zero:'));
+  assert.ok(coreBend.includes('{==}'));
 
   const bendPin = byPath.get('example-app/bend.pin')!.content;
   assert.ok(bendPin.includes('BEND_PIN_VERSION'));

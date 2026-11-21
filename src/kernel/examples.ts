@@ -16,10 +16,10 @@ export const BEND_EXAMPLES: BendExample[] = [
 # +bal and +amt are Data (q=2): duplicable, pure u64 values
 
 def deposit(+bal: Nat, +amt: Nat) -> Nat:
-  bal + amt
+  (bal + amt : Nat)
 
 def total_pair(+a: Nat, +b: Nat) -> Nat:
-  a + b
+  (a + b : Nat)
 
 law deposit_zero(for +bal: Nat):
   deposit(bal, 0n) == bal
@@ -53,7 +53,7 @@ def id(-T: Type, x: T) -> T:
   (x : T)
 
 def double(+n: Nat) -> Nat:
-  n + n
+  (n + n : Nat)
 
 law id_left(for +x: Nat):
   id(Nat, x) == x
@@ -77,7 +77,7 @@ proof double_three:
 # Counterexample search immediately finds a concrete failing input!
 
 def net_amount(+gross: Nat, +fee: Nat) -> Nat:
-  (gross - fee) + 1n
+  ((gross - fee : Nat) + 1n : Nat)
 
 law zero_fee_unchanged(for +gross: Nat):
   net_amount(gross, 0n) == gross
@@ -95,7 +95,7 @@ proof zero_fee_unchanged:
 # A law without an accepted proof fails the build and blocks Rust codegen.
 
 def inc(+n: Nat) -> Nat:
-  n + 1n
+  (n + 1n : Nat)
 
 law inc_two:
   inc(2n) == 3n
@@ -168,7 +168,7 @@ def can_write(+is_admin: Bool, +is_revoked: Bool) -> Bool:
   if is_revoked: false else: is_admin
 
 def add_fee(+bal: Nat, +fee: Nat) -> Nat:
-  bal + fee
+  (bal + fee : Nat)
 
 law revoked_never_writes(for +is_admin: Bool):
   can_write(is_admin, true) == false

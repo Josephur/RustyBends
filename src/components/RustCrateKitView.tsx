@@ -79,7 +79,7 @@ export const RustCrateKitView: React.FC<RustCrateKitViewProps> = ({
             <code className="text-slate-800">lock.rs</code> fingerprinting, erases{' '}
             <code className="text-slate-800">q=0</code> terms, and emits ADTs (<code className="text-slate-800">pub enum</code>),{' '}
             <code className="text-slate-800">match</code>, and verified functions into{' '}
-            <code className="text-slate-800">OUT_DIR/verified.rs</code> — with 13{' '}
+            <code className="text-slate-800">OUT_DIR/verified.rs</code> — with 19{' '}
             <code className="text-slate-800">cargo test</code> unit tests.
           </p>
         </div>
