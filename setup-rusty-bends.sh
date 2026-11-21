@@ -82,7 +82,11 @@ impl Default for Config {
             .unwrap_or(VerdictMode::Auto);
         Self {
             verified_dir: PathBuf::from("verified"),
-            bend_bin: env::var("BEND_BIN").unwrap_or_else(|_| "bend".to_string()),
+            bend_bin: resolve_bend_bin(
+                env::var("BEND_BIN").ok(),
+                env::var_os("PATH"),
+                env::var_os("HOME").map(PathBuf::from),
+            ),
             check_flag: env::var("BEND_CHECK_FLAG").unwrap_or_else(|_| "--check-only".to_string()),
             verdict_flag: env::var("BEND_VERDICT_FLAG").unwrap_or_else(|_| "--verdict".to_string()),
             verdict_mode,
@@ -177,7 +181,32 @@ pub fn read_active_pin(cfg: &Config) -> Result<Option<String>, String> {
     Ok(None)
 }
 
-/// Checks whether the installed 'bend --version' string satisfies the pinned prefix.
+/// Picks the 'bend' executable: '$BEND_BIN' when set, else 'bend' if it is on 'PATH', else
+/// '~/.bend/bin/bend' (the default Bend 2 install location, often missing from the PATH of
+/// non-interactive Cargo shells) when it exists, else plain 'bend'.
+pub fn resolve_bend_bin(
+    bend_bin_env: Option<String>,
+    path: Option<std::ffi::OsString>,
+    home: Option<PathBuf>,
+) -> String {
+    if let Some(bin) = bend_bin_env.filter(|v| !v.trim().is_empty()) {
+        return bin;
+    }
+    let on_path = path
+        .map(|p| env::split_paths(&p).any(|dir| dir.join("bend").is_file()))
+        .unwrap_or(false);
+    if !on_path {
+        if let Some(home) = home {
+            let installed = home.join(".bend").join("bin").join("bend");
+            if installed.is_file() {
+                return installed.to_string_lossy().into_owned();
+            }
+        }
+    }
+    "bend".to_string()
+}
+
+/// Checks whether the installed 'bend version' string satisfies the pinned prefix.
 pub fn verify_bend_version_str(expected_pin: &str, actual_output: &str) -> Result<(), String> {
     let trimmed_pin = expected_pin.trim();
     if trimmed_pin.is_empty() || actual_output.contains(trimmed_pin) {
@@ -189,16 +218,27 @@ pub fn verify_bend_version_str(expected_pin: &str, actual_output: &str) -> Resul
     ))
 }
 
+/// Asks the Bend CLI for its version. Bend 2 (2.0.40+) only accepts the 'version'
+/// subcommand ('--version' is rejected as an unknown option), so try that first and fall
+/// back to '--version' for older releases.
 fn query_bend_version(bend_bin: &str) -> Result<String, String> {
-    let output = Command::new(bend_bin)
-        .arg("--version")
-        .output()
-        .map_err(|e| {
-            format!("[E_BEND_MISSING] Failed to run '{bend_bin} --version': {e}\nHint: Install Bend 2 (~/.bend/bin) or set BEND_BIN=/path/to/bend")
+    let mut failures = Vec::new();
+    for arg in ["version", "--version"] {
+        let output = Command::new(bend_bin).arg(arg).output().map_err(|e| {
+            format!("[E_BEND_MISSING] Failed to run '{bend_bin} {arg}': {e}\nHint: Install Bend 2 (~/.bend/bin) or set BEND_BIN=/path/to/bend")
         })?;
-    let stdout = String::from_utf8_lossy(&output.stdout);
-    let stderr = String::from_utf8_lossy(&output.stderr);
-    Ok(format!("{stdout}{stderr}"))
+        let stdout = String::from_utf8_lossy(&output.stdout);
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        let text = format!("{stdout}{stderr}");
+        if output.status.success() {
+            return Ok(text);
+        }
+        failures.push(format!("'{bend_bin} {arg}': {}", text.trim()));
+    }
+    Err(format!(
+        "[E_BEND_VERSION_QUERY] Could not read the Bend version:\n{}\nHint: Set BEND_BIN to a working Bend 2 binary or remove the bend.pin / BEND_PIN_VERSION pin.",
+        failures.join("\n")
+    ))
 }
 
 /// Core pipeline with pluggable 'bend' runner for deterministic unit testing.
@@ -496,6 +536,87 @@ mod tests {
         assert!(verify_bend_version_str("0.2.38", "bend 0.2.38 (commit abc123)").is_ok());
         let err = verify_bend_version_str("0.2.38", "bend 0.3.0").unwrap_err();
         assert!(err.contains("E_BEND_VERSION_MISMATCH"));
+    }
+
+    #[test]
+    fn bend_bin_resolution_prefers_env_then_path_then_home_install() {
+        let root = temp_workspace("bend_bin_resolve");
+        let home = root.join("home");
+        let path_dir = root.join("pathdir");
+        fs::create_dir_all(home.join(".bend/bin")).unwrap();
+        fs::create_dir_all(&path_dir).unwrap();
+        let installed = home.join(".bend/bin/bend");
+        fs::write(&installed, "").unwrap();
+        let empty_path = Some(env::join_paths([&path_dir]).unwrap());
+
+        // Explicit BEND_BIN always wins.
+        assert_eq!(
+            resolve_bend_bin(
+                Some("/opt/bend".into()),
+                empty_path.clone(),
+                Some(home.clone())
+            ),
+            "/opt/bend"
+        );
+        // Not on PATH -> fall back to ~/.bend/bin/bend.
+        assert_eq!(
+            resolve_bend_bin(None, empty_path.clone(), Some(home.clone())),
+            installed.to_string_lossy()
+        );
+        // Blank BEND_BIN is treated as unset.
+        assert_eq!(
+            resolve_bend_bin(Some("  ".into()), empty_path.clone(), Some(home.clone())),
+            installed.to_string_lossy()
+        );
+        // On PATH -> keep plain 'bend'.
+        fs::write(path_dir.join("bend"), "").unwrap();
+        assert_eq!(
+            resolve_bend_bin(None, empty_path, Some(home.clone())),
+            "bend"
+        );
+        // Nothing installed anywhere -> plain 'bend' (fails later with E_BEND_MISSING).
+        assert_eq!(
+            resolve_bend_bin(None, None, Some(root.join("nohome"))),
+            "bend"
+        );
+
+        let _ = fs::remove_dir_all(&root);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn bend_version_query_uses_subcommand_and_falls_back() {
+        use std::os::unix::fs::PermissionsExt;
+        let root = temp_workspace("bend_version_query");
+        let script = |name: &str, body: &str| {
+            let p = root.join(name);
+            fs::write(&p, format!("#!/bin/sh\n{body}\n")).unwrap();
+            fs::set_permissions(&p, fs::Permissions::from_mode(0o755)).unwrap();
+            p.to_string_lossy().into_owned()
+        };
+        // Bend 2.0.40: 'version' works, '--version' is an unknown option.
+        let new_bend = script(
+            "bend_new",
+            r#"if [ "$1" = version ]; then echo "bend 2.0.40"; else echo "bend: unknown option $1" >&2; exit 1; fi"#,
+        );
+        let v = query_bend_version(&new_bend).unwrap();
+        assert!(v.contains("2.0.40"));
+        assert!(verify_bend_version_str("2.0.40", &v).is_ok());
+
+        // Older releases: only '--version' works.
+        let old_bend = script(
+            "bend_old",
+            r#"if [ "$1" = --version ]; then echo "bend 0.2.38"; else exit 2; fi"#,
+        );
+        assert!(query_bend_version(&old_bend).unwrap().contains("0.2.38"));
+
+        // Neither works: report the failure instead of matching the pin against error text.
+        let broken = script("bend_broken", "echo boom >&2; exit 1");
+        let err = query_bend_version(&broken).unwrap_err();
+        assert!(err.contains("E_BEND_VERSION_QUERY"));
+        assert!(err.contains("boom"));
+
+        let _ = fs::remove_dir_all(&root);
     }
 
     #[test]
@@ -2588,9 +2709,9 @@ RUSTY_BENDS_EOF
 cat << 'RUSTY_BENDS_EOF' > "example-app/bend.pin"
 # Optional Bend 2 compiler version pin (uncomment a version prefix to enforce in CI/local builds).
 # Example:
-# 0.2.38
+# 2.0.40
 #
-# When uncommented (or when BEND_PIN_VERSION is set), rusty-bends-build runs 'bend --version'
+# When uncommented (or when BEND_PIN_VERSION is set), rusty-bends-build runs 'bend version'
 # and fails fast with E_BEND_VERSION_MISMATCH if upstream Bend 2 drifts unexpectedly.
 RUSTY_BENDS_EOF
 
@@ -2808,6 +2929,6 @@ def cancel_idempotent(s):
 RUSTY_BENDS_EOF
 
 echo "Done! Next steps on desktop:"
-echo "  1. Run rusty-bends-build unit tests (19 tests):  (cd rusty-bends-build && cargo test)"
+echo "  1. Run rusty-bends-build unit tests (21 tests):  (cd rusty-bends-build && cargo test)"
 echo "  2. Build & verify example app with bend CLI:     (cd example-app && cargo check && cargo run)"
 echo "  3. Optional: set BEND_VERDICT=require in CI or pin Bend version in example-app/bend.pin"

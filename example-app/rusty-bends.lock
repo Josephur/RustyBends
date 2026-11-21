@@ -1,0 +1,3 @@
+8a4a712b79f366c7  cancel_idempotent  law cancel_idempotent : for s : OrderState { cancel_order ( cancel_order ( s ) ) == cancel_order ( s ) : OrderState }
+c7086690a6e4c16b  deposit_from_zero  law deposit_from_zero : for amt : Nat { deposit ( 0n , amt ) == amt : Nat }
+70bf2ecec778c27b  deposit_zero  law deposit_zero : for bal : Nat { deposit ( bal , 0n ) == bal : Nat }
