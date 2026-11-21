@@ -423,7 +423,7 @@ mod tests {
             "law conserved(for +a: Nat, for +b: Nat):\\n  deposit(a, b) == deposit(b, a)\\nproof conserved:\\n  refl\\n",
         )
         .unwrap();
-        assert_eq!(enforce_law_lock(&lock, &[file.clone()], false).unwrap(), 1);
+        assert_eq!(enforce_law_lock(&lock, std::slice::from_ref(&file), false).unwrap(), 1);
 
         // Multi-line reformat + comments inside the law must remain locked-valid!
         fs::write(
@@ -446,7 +446,7 @@ mod tests {
             "law cancel_idempotent(\\n  for +s: OrderState\\n):\\n  cancel_order(\\n    cancel_order(s)\\n  ) == cancel_order(s)\\n\\nproof cancel_idempotent:\\n  refl\\n",
         )
         .unwrap();
-        enforce_law_lock(&lock, &[file.clone()], false).unwrap();
+        enforce_law_lock(&lock, std::slice::from_ref(&file), false).unwrap();
 
         // Subtle change on line 6 of the multi-line law must be caught
         fs::write(
@@ -466,7 +466,7 @@ mod tests {
         let lock = dir.join("rusty-bends.lock");
 
         fs::write(&file, "law keep_me:\\n  1n == 1n\\nproof keep_me:\\n  refl\\n").unwrap();
-        enforce_law_lock(&lock, &[file.clone()], false).unwrap();
+        enforce_law_lock(&lock, std::slice::from_ref(&file), false).unwrap();
 
         fs::write(&file, "def x(+n: Nat) -> Nat:\\n  n\\n").unwrap();
         let err = enforce_law_lock(&lock, &[file], false).unwrap_err();
@@ -482,7 +482,7 @@ mod tests {
         let lock = dir.join("rusty-bends.lock");
 
         fs::write(&file, "law first:\\n  1n == 1n\\nproof first:\\n  refl\\n").unwrap();
-        enforce_law_lock(&lock, &[file.clone()], false).unwrap();
+        enforce_law_lock(&lock, std::slice::from_ref(&file), false).unwrap();
 
         fs::write(
             &file,
@@ -2267,17 +2267,21 @@ impl Default for Config {
 /// runs real 'bend <file> --check-only' (plus '--verdict' when Lean/$BENDTT is available),
 /// and emits pure Rust into OUT_DIR/verified.rs.
 pub fn verify_and_emit(dir: impl AsRef<Path>) {
-    let mut cfg = Config::default();
-    cfg.verified_dir = dir.as_ref().to_path_buf();
-    cfg.emit_rust = true;
+    let cfg = Config {
+        verified_dir: dir.as_ref().to_path_buf(),
+        emit_rust: true,
+        ..Default::default()
+    };
     run_or_fail(&cfg);
 }
 
 /// Check-only build.rs entry point (verifies proofs & locks without emitting verified.rs).
 pub fn verify_dir(dir: impl AsRef<Path>) {
-    let mut cfg = Config::default();
-    cfg.verified_dir = dir.as_ref().to_path_buf();
-    cfg.emit_rust = false;
+    let cfg = Config {
+        verified_dir: dir.as_ref().to_path_buf(),
+        emit_rust: false,
+        ..Default::default()
+    };
     run_or_fail(&cfg);
 }
 
