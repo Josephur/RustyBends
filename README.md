@@ -14,7 +14,10 @@ reusable crate: parse, check, and compile Bend 2 programs from Rust.
   Read-only reference for compiler internals (`compiler/`,
   `library/`); do not edit. To deepen later:
   `git -C upstream/rust fetch --unshallow`.
-- `crates/` — our Rust crates (planned; not yet scaffolded).
+- `crates/` — our Rust crates (`rusty-bends`: AST mirror of BendTT today;
+  parser, checker and build integration to come).
+- `AGENTS.md` — working conventions for this repo (read it before changing
+  anything).
 
 ## Upstream pin
 

@@ -1,0 +1,9 @@
+[package]
+name = "rusty-bends"
+version = "0.1.0"
+description = "Rust implementation of Bend 2: parse, check (laws included), and compile Bend programs from Rust"
+edition.workspace = true
+license.workspace = true
+
+[lib]
+name = "rusty_bends"
