@@ -23,6 +23,9 @@ mod tests {
     fn verified_module_runs_with_zero_runtime_proof_overhead() {
         assert_eq!(deposit(100, 25), 125);
         assert_eq!(cancel_order(OrderState::Paid(50)), OrderState::Cancelled);
-        assert_eq!(cancel_order(OrderState::Shipped(50)), OrderState::Shipped(50));
+        assert_eq!(
+            cancel_order(OrderState::Shipped(50)),
+            OrderState::Shipped(50)
+        );
     }
 }

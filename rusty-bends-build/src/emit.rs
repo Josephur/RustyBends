@@ -296,7 +296,9 @@ pub fn parse_book_items(source: &str) -> Result<(Vec<TypeDef>, Vec<Def>), String
             }
 
             if body.trim().is_empty() {
-                return Err(format!("[E_EMIT_EMPTY_BODY] Empty body in 'def {header_part}'"));
+                return Err(format!(
+                    "[E_EMIT_EMPTY_BODY] Empty body in 'def {header_part}'"
+                ));
             }
             defs.push(parse_def_header(header_part, body)?);
             continue;
@@ -519,7 +521,11 @@ fn parse_nat_succ_pattern(p: &str) -> Option<(u64, String)> {
     if k == 0 {
         return None;
     }
-    let var = rhs.trim().trim_start_matches('+').trim_start_matches('-').trim();
+    let var = rhs
+        .trim()
+        .trim_start_matches('+')
+        .trim_start_matches('-')
+        .trim();
     if var.is_empty() || !var.chars().all(|c| c.is_ascii_alphanumeric() || c == '_') {
         return None;
     }
@@ -589,9 +595,16 @@ fn emit_single_pattern(
             let fields: Vec<String> = split_top_level(inner, ',')
                 .into_iter()
                 .map(|b| {
-                    let clean = b.trim().trim_start_matches('+').trim_start_matches('-').trim();
+                    let clean = b
+                        .trim()
+                        .trim_start_matches('+')
+                        .trim_start_matches('-')
+                        .trim();
                     let rhs = if let Some((_, v)) = clean.split_once(':') {
-                        v.trim().trim_start_matches('+').trim_start_matches('-').trim()
+                        v.trim()
+                            .trim_start_matches('+')
+                            .trim_start_matches('-')
+                            .trim()
                     } else {
                         clean
                     };
@@ -660,7 +673,10 @@ fn clean_let_binding(raw: &str) -> String {
             .collect::<Vec<_>>();
         return format!("({})", parts.join(", "));
     }
-    t.trim_start_matches('+').trim_start_matches('-').trim().to_string()
+    t.trim_start_matches('+')
+        .trim_start_matches('-')
+        .trim()
+        .to_string()
 }
 
 fn split_top_level_ws(s: &str) -> Vec<&str> {
@@ -704,8 +720,22 @@ fn split_match_scrutinees(scrut: &str) -> Vec<&str> {
     let has_op_or_kw = tokens.iter().any(|t| {
         matches!(
             *t,
-            "+" | "-" | "*" | "/" | "%" | "==" | "!=" | "<" | ">" | "<=" | ">=" | "&&" | "||"
-                | "if" | "let" | "match" | "else:"
+            "+" | "-"
+                | "*"
+                | "/"
+                | "%"
+                | "=="
+                | "!="
+                | "<"
+                | ">"
+                | "<="
+                | ">="
+                | "&&"
+                | "||"
+                | "if"
+                | "let"
+                | "match"
+                | "else:"
         )
     });
     if has_op_or_kw {
@@ -865,11 +895,7 @@ fn emit_expr_with_mode(
     let s = if lines.len() == 1 {
         first_trim
     } else {
-        owned_flat = lines
-            .iter()
-            .map(|l| l.trim())
-            .collect::<Vec<_>>()
-            .join(" ");
+        owned_flat = lines.iter().map(|l| l.trim()).collect::<Vec<_>>().join(" ");
         owned_flat.as_str()
     };
 
@@ -1047,11 +1073,7 @@ fn emit_expr_with_mode(
                 }
                 emitted_args.push(emit_expr_with_mode(arg, defs, ctors, mode));
             }
-            return format!(
-                "{}({})",
-                callee.replace('.', "::"),
-                emitted_args.join(", ")
-            );
+            return format!("{}({})", callee.replace('.', "::"), emitted_args.join(", "));
         }
     }
 
@@ -1468,7 +1490,9 @@ def keep_nat(+n: Nat) -> Nat:
     fn handles_tuple_duplication_for_data_params() {
         let src = "def dup(+n: Nat) -> Nat:\n  (n, n)\n";
         let summary = emit_verified_rust(src, 0).expect("emit succeeded");
-        assert!(summary.rust_source.contains("pub fn dup(n: u64) -> (u64, u64)"));
+        assert!(summary
+            .rust_source
+            .contains("pub fn dup(n: u64) -> (u64, u64)"));
         assert!(summary.rust_source.contains("(n, n)"));
     }
 
@@ -1500,8 +1524,12 @@ proof cancel_idempotent:
         assert_eq!(summary.defs_emitted, 1);
         assert!(summary.rust_source.contains("pub enum OrderState"));
         assert!(summary.rust_source.contains("Paid(u64),"));
-        assert!(summary.rust_source.contains("OrderState::Draft => OrderState::Cancelled,"));
-        assert!(summary.rust_source.contains("OrderState::Paid(amt) => OrderState::Cancelled,"));
+        assert!(summary
+            .rust_source
+            .contains("OrderState::Draft => OrderState::Cancelled,"));
+        assert!(summary
+            .rust_source
+            .contains("OrderState::Paid(amt) => OrderState::Cancelled,"));
         assert!(!summary.rust_source.contains("cancel_idempotent"));
         assert!(!summary.rust_source.contains("refl"));
     }
@@ -1513,8 +1541,12 @@ def can_write(+is_admin: Bool, +is_revoked: Bool) -> Bool:
   if is_revoked: false else: is_admin
 "#;
         let summary = emit_verified_rust(src, 0).expect("emit succeeded");
-        assert!(summary.rust_source.contains("pub fn can_write(is_admin: bool, is_revoked: bool) -> bool"));
-        assert!(summary.rust_source.contains("if is_revoked { false } else { is_admin }"));
+        assert!(summary
+            .rust_source
+            .contains("pub fn can_write(is_admin: bool, is_revoked: bool) -> bool"));
+        assert!(summary
+            .rust_source
+            .contains("if is_revoked { false } else { is_admin }"));
     }
 
     #[test]
@@ -1572,9 +1604,15 @@ def cancel_idempotent(s):
         assert!(summary.rust_source.contains("Draft,"));
         assert!(summary.rust_source.contains("Paid(u64),"));
         assert!(summary.rust_source.contains("(bal).saturating_add(amt)"));
-        assert!(summary.rust_source.contains("OrderState::Draft => OrderState::Cancelled,"));
-        assert!(summary.rust_source.contains("OrderState::Paid(amt) => OrderState::Cancelled,"));
-        assert!(summary.rust_source.contains("OrderState::Shipped(amt) => OrderState::Shipped(amt),"));
+        assert!(summary
+            .rust_source
+            .contains("OrderState::Draft => OrderState::Cancelled,"));
+        assert!(summary
+            .rust_source
+            .contains("OrderState::Paid(amt) => OrderState::Cancelled,"));
+        assert!(summary
+            .rust_source
+            .contains("OrderState::Shipped(amt) => OrderState::Shipped(amt),"));
         assert!(!summary.rust_source.contains("deposit_zero"));
         assert!(!summary.rust_source.contains("cancel_idempotent"));
         assert!(!summary.rust_source.contains("{==}"));
@@ -1603,10 +1641,16 @@ def cmp_flags(a: Nat, b: Nat) -> Bool:
         assert!(summary.rust_source.contains("<= (cap)"));
         assert!(summary.rust_source.contains("(!(((req) > (0_u64))))"));
         assert!(summary.rust_source.contains("((n).max(lo)).min(hi)"));
-        assert!(summary.rust_source.contains("if __b == 0_u64 { 0_u64 } else { __a / __b }"));
-        assert!(summary.rust_source.contains("if __b == 0_u64 { __a } else { __a % __b }"));
+        assert!(summary
+            .rust_source
+            .contains("if __b == 0_u64 { 0_u64 } else { __a / __b }"));
+        assert!(summary
+            .rust_source
+            .contains("if __b == 0_u64 { __a } else { __a % __b }"));
         assert!(summary.rust_source.contains("if (({ let __a = tokens;"));
-        assert!(summary.rust_source.contains("(((a) < (b))) && (((b) >= (a)))"));
+        assert!(summary
+            .rust_source
+            .contains("(((a) < (b))) && (((b) >= (a)))"));
         assert!(!summary.rust_source.contains("Nat::"));
         assert!(!summary.rust_source.contains("Bool::"));
     }
@@ -1621,9 +1665,15 @@ def sat_nat(a: Nat, b: Nat) -> Nat:
   (a - b : Nat)
 "#;
         let summary = emit_verified_rust(src, 0).expect("arith mode emit succeeded");
-        assert!(summary.rust_source.contains("pub fn wrap_u32(a: u32, b: u32) -> u32"));
-        assert!(summary.rust_source.contains("((a).wrapping_add(b)).wrapping_mul((a).wrapping_sub(b))"));
-        assert!(summary.rust_source.contains("pub fn sat_nat(a: u64, b: u64) -> u64"));
+        assert!(summary
+            .rust_source
+            .contains("pub fn wrap_u32(a: u32, b: u32) -> u32"));
+        assert!(summary
+            .rust_source
+            .contains("((a).wrapping_add(b)).wrapping_mul((a).wrapping_sub(b))"));
+        assert!(summary
+            .rust_source
+            .contains("pub fn sat_nat(a: u64, b: u64) -> u64"));
         assert!(summary.rust_source.contains("(a).saturating_sub(b)"));
     }
 
@@ -1665,7 +1715,9 @@ def helper_lemma(x: Nat) -> {x == x : Nat}:
         assert_eq!(summary.defs_emitted, 2);
         assert!(summary.rust_source.contains("let ok = ((req) <= (free));"));
         assert!(summary.rust_source.contains("match ok {"));
-        assert!(summary.rust_source.contains("true => PoolState::Ready((free).saturating_sub(req)),"));
+        assert!(summary
+            .rust_source
+            .contains("true => PoolState::Ready((free).saturating_sub(req)),"));
         assert!(summary.rust_source.contains("match (a, b) {"));
         assert!(summary.rust_source.contains("(0_u64, _) => 0_u64,"));
         assert!(summary.rust_source.contains("(__rb_n0 @ 1_u64..=u64::MAX, __rb_n1 @ 1_u64..=u64::MAX) => { let ap = __rb_n0 - 1_u64; let bp = __rb_n1 - 1_u64;"));
@@ -1684,9 +1736,15 @@ def first_of_pair(p: Nat & Nat) -> Nat:
   Pair.fst(Nat, Nat, p)
 "#;
         let summary = emit_verified_rust(src, 0).expect("pair emit succeeded");
-        assert!(summary.rust_source.contains("pub fn split_tiles(n: u64, tile: u64) -> (u64, u64)"));
-        assert!(summary.rust_source.contains("if __b == 0_u64 { (0_u64, __a) } else { (__a / __b, __a % __b) }"));
-        assert!(summary.rust_source.contains("pub fn first_of_pair(p: (u64, u64)) -> u64"));
+        assert!(summary
+            .rust_source
+            .contains("pub fn split_tiles(n: u64, tile: u64) -> (u64, u64)"));
+        assert!(summary
+            .rust_source
+            .contains("if __b == 0_u64 { (0_u64, __a) } else { (__a / __b, __a % __b) }"));
+        assert!(summary
+            .rust_source
+            .contains("pub fn first_of_pair(p: (u64, u64)) -> u64"));
         assert!(summary.rust_source.contains("(p).0"));
     }
 }

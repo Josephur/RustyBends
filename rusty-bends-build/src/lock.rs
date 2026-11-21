@@ -220,7 +220,10 @@ mod tests {
             "law conserved(for +a: Nat, for +b: Nat):\n  deposit(a, b) == deposit(b, a)\nproof conserved:\n  refl\n",
         )
         .unwrap();
-        assert_eq!(enforce_law_lock(&lock, std::slice::from_ref(&file), false).unwrap(), 1);
+        assert_eq!(
+            enforce_law_lock(&lock, std::slice::from_ref(&file), false).unwrap(),
+            1
+        );
 
         // Multi-line reformat + comments inside the law must remain locked-valid!
         fs::write(

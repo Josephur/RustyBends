@@ -64,7 +64,9 @@ impl Default for Config {
             verdict_mode,
             lock_file: PathBuf::from("rusty-bends.lock"),
             pin_file: PathBuf::from("bend.pin"),
-            pinned_version: env::var("BEND_PIN_VERSION").ok().filter(|v| !v.trim().is_empty()),
+            pinned_version: env::var("BEND_PIN_VERSION")
+                .ok()
+                .filter(|v| !v.trim().is_empty()),
             out_dir: PathBuf::from(env::var("OUT_DIR").unwrap_or_else(|_| "target".to_string())),
             allow_lock_update: env::var("RUSTY_BENDS_UPDATE_LAWS").ok().as_deref() == Some("1"),
             emit_rust: true,
@@ -211,7 +213,11 @@ where
         .map(|s| s.trim() == combined_hash)
         .unwrap_or(false);
     if cache_hit && (!cfg.emit_rust || verified_rs.exists()) {
-        return Ok(if cfg.emit_rust { Some(verified_rs) } else { None });
+        return Ok(if cfg.emit_rust {
+            Some(verified_rs)
+        } else {
+            None
+        });
     }
 
     // 3. Run real Bend 2 checker (--check-only, plus --verdict when laws are present)
@@ -277,7 +283,11 @@ fn verify_with_bend_cli(cfg: &Config, file: &Path, has_laws: bool) -> Result<(),
 }
 
 fn has_verdict_runtime() -> bool {
-    if env::var("BENDTT").ok().filter(|v| !v.trim().is_empty()).is_some() {
+    if env::var("BENDTT")
+        .ok()
+        .filter(|v| !v.trim().is_empty())
+        .is_some()
+    {
         return true;
     }
     if let Ok(home) = env::var("HOME") {
@@ -369,10 +379,7 @@ mod tests {
 
     fn temp_workspace(name: &str) -> PathBuf {
         let n = TEST_SEQ.fetch_add(1, Ordering::SeqCst);
-        let dir = env::temp_dir().join(format!(
-            "rusty_bends_v1_{name}_{}_{n}",
-            std::process::id()
-        ));
+        let dir = env::temp_dir().join(format!("rusty_bends_v1_{name}_{}_{n}", std::process::id()));
         let _ = fs::remove_dir_all(&dir);
         fs::create_dir_all(dir.join("verified")).unwrap();
         fs::create_dir_all(dir.join("out")).unwrap();
