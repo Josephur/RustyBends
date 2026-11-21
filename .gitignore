@@ -1,11 +1,6 @@
-# Rust build output
-/target/
-**/target/
-
-# Cargo lock for libraries is usually not committed for libs, but we keep
-# the workspace lock during early development; remove this line if this
-# becomes a published library.
-# Cargo.lock
+# Node / Vite build output
+node_modules/
+dist/
 
 # Editor / OS noise
 .idea/
@@ -17,3 +12,4 @@
 
 # Env files
 .env
+.env.local

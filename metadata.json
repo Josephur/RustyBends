@@ -1,0 +1,4 @@
+{
+  "name": "RustyBends — BendTT Kernel Workbench",
+  "description": "Interactive BendTT AST parser, affine quantity checker (Dead/Live/Data), erasure verifier, and law proof build gate ported from RustyBends."
+}
