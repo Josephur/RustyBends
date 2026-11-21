@@ -3,5 +3,12 @@
 version = 4
 
 [[package]]
-name = "rusty-bends"
+name = "my-verified-app"
 version = "0.1.0"
+dependencies = [
+ "rusty-bends-build",
+]
+
+[[package]]
+name = "rusty-bends-build"
+version = "1.0.0"
