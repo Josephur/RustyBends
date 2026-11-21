@@ -1,5 +1,6 @@
 import test from 'node:test';
 import assert from 'node:assert/strict';
+import fs from 'node:fs';
 import { Quantity, isErased } from './ast';
 import { checkBook, createLawLock } from './checker';
 import { emitVerifiedRust } from './codegen';
@@ -311,4 +312,22 @@ proof always_cancelled:
     `Expected OrderState.Paid(...) counterexample, got ${verdict.counterexample.bindings.s}`
   );
 });
+
+test('on-disk Rust crate, example-app, and setup-rusty-bends.sh match starterKit.ts byte-for-byte', () => {
+  const files = generateStarterKitFiles('', '', '');
+  for (const file of files) {
+    assert.ok(fs.existsSync(file.path), `Expected ${file.path} to exist on disk`);
+    const diskContent = fs.readFileSync(file.path, 'utf8');
+    const expected = `${file.content.replace(/\n+$/, '')}\n`;
+    assert.equal(diskContent, expected, `On-disk ${file.path} drifted from starterKit.ts`);
+  }
+  assert.ok(fs.existsSync('setup-rusty-bends.sh'), 'Expected setup-rusty-bends.sh on disk');
+  assert.equal(
+    fs.readFileSync('setup-rusty-bends.sh', 'utf8'),
+    buildWorkspaceSetupScript(files),
+    'On-disk setup-rusty-bends.sh drifted from starterKit.ts'
+  );
+  assert.ok(fs.existsSync('Cargo.toml'), 'Expected root workspace Cargo.toml on disk');
+});
+
 

@@ -1,0 +1,6 @@
+[workspace]
+members = [
+    "rusty-bends-build",
+    "example-app",
+]
+resolver = "2"

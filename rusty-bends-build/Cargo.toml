@@ -1,0 +1,9 @@
+[package]
+name = "rusty-bends-build"
+version = "1.0.0"
+edition = "2021"
+description = "Build-time Bend 2 proof gate (--check-only / --verdict), token-canonical LAWS lock, bend.pin check, and pure Rust ADT/match OUT_DIR emitter"
+license = "Apache-2.0"
+
+[dependencies]
+# Zero external dependencies — Rust stdlib only!

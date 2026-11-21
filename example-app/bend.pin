@@ -1,0 +1,6 @@
+# Optional Bend 2 compiler version pin (uncomment a version prefix to enforce in CI/local builds).
+# Example:
+# 0.2.38
+#
+# When uncommented (or when BEND_PIN_VERSION is set), rusty-bends-build runs 'bend --version'
+# and fails fast with E_BEND_VERSION_MISMATCH if upstream Bend 2 drifts unexpectedly.

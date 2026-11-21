@@ -1,0 +1,10 @@
+[package]
+name = "my-verified-app"
+version = "0.1.0"
+edition = "2021"
+
+[dependencies]
+# Pure Rust runtime dependencies only — NO Bend 2 or proof libraries here!
+
+[build-dependencies]
+rusty-bends-build = { path = "../rusty-bends-build" }
