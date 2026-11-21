@@ -1068,7 +1068,7 @@ pub fn emit_verified_rust(source: &str, laws_verified: usize) -> Result<EmitSumm
         let ret_ty = infer_return_type(&def.body, &def.ret, &type_param_set);
 
         blocks.push(format!(
-            "#[inline]\n#[allow(unused_variables)]\npub fn {name}{generics}({rust_params}) -> {ret_ty} {{\n    {body_expr}\n}}",
+            "#[inline]\n#[allow(unused_variables, unused_parens)]\npub fn {name}{generics}({rust_params}) -> {ret_ty} {{\n    {body_expr}\n}}",
             name = def.name
         ));
     }
@@ -1190,7 +1190,15 @@ pub fn parse_book_items(source: &str) -> Result<(Vec<TypeDef>, Vec<Def>), String
             continue;
         }
 
-        if let Some(rest) = stripped.strip_prefix("def ") {
+        if stripped.starts_with("def ") {
+            // Bend 2 allows the parameter list (and an equality return type) to span lines:
+            //   def f(
+            //     +a: Nat,
+            //     b: Nat
+            //   ) -> Bool:
+            let (header, last_header_line) = collect_header(&lines, i);
+            i = last_header_line;
+            let rest = &header["def ".len()..];
             let (header_part, inline_body) = split_header_colon(rest)?;
             let mut body_lines = Vec::new();
             if !inline_body.is_empty() {
@@ -1300,12 +1308,44 @@ fn strip_comment(line: &str) -> &str {
     &line[..end]
 }
 
+/// Net bracket depth change of a (comment-stripped) source fragment, over '()', '{}' and '[]'.
+fn bracket_depth_delta(s: &str) -> i32 {
+    s.chars().fold(0, |depth, ch| match ch {
+        '(' | '{' | '[' => depth + 1,
+        ')' | '}' | ']' => depth - 1,
+        _ => depth,
+    })
+}
+
+/// Joins a top-level item header starting at 'lines[start]' with its continuation lines
+/// while any '(' / '{' / '[' is still open, so multi-line parameter lists parse like
+/// single-line ones. Returns the flattened, comment-stripped header and the index of the
+/// last line it consumed.
+fn collect_header(lines: &[&str], start: usize) -> (String, usize) {
+    let mut header = strip_comment(lines[start]).trim().to_string();
+    let mut depth = bracket_depth_delta(&header);
+    let mut last = start;
+    while depth > 0 && last + 1 < lines.len() {
+        last += 1;
+        let piece = strip_comment(lines[last]).trim();
+        if piece.is_empty() {
+            continue;
+        }
+        if !header.ends_with('(') && !header.ends_with('{') && !header.ends_with('[') {
+            header.push(' ');
+        }
+        header.push_str(piece);
+        depth += bracket_depth_delta(piece);
+    }
+    (header, last)
+}
+
 fn split_header_colon(rest: &str) -> Result<(&str, &str), String> {
     let mut depth = 0i32;
     for (idx, ch) in rest.char_indices() {
         match ch {
-            '(' => depth += 1,
-            ')' => depth -= 1,
+            '(' | '{' | '[' => depth += 1,
+            ')' | '}' | ']' => depth -= 1,
             ':' if depth == 0 => {
                 return Ok((rest[..idx].trim(), rest[idx + 1..].trim()));
             }
@@ -2680,6 +2720,46 @@ def first_of_pair(p: Nat & Nat) -> Nat:
             .contains("pub fn first_of_pair(p: (u64, u64)) -> u64"));
         assert!(summary.rust_source.contains("(p).0"));
     }
+
+    #[test]
+    fn parses_multi_line_def_headers_and_erases_multi_line_lemmas() {
+        // Accepted by 'bend --check-only' on Bend 2.0.40.
+        let src = r#"
+import Base
+
+def pfx_reuse_valid(
+  +snap_pos: Nat,  # comment inside the header
+  +lcp: Nat,
+  prompt_len: Nat,
+  +tile: Nat
+) -> Bool:
+  (snap_pos <= lcp : Nat) && (lcp <= prompt_len : Nat)
+
+def add_zero_eq(
+  n: Nat
+) -> {Nat.add(n, 0n) == n : Nat}:
+  match n:
+    case 0n:
+      {==}
+    case 1n+p:
+      %add_zero_eq(p) : {1n+Nat.add(p, 0n) == 1n+_ : Nat}
+      {==}
+
+def one_liner(n: Nat) -> Nat: Nat.add(n, 1n)
+"#;
+        let summary = emit_verified_rust(src, 0).expect("multi-line headers emit");
+        assert_eq!(summary.defs_emitted, 2);
+        assert!(summary.rust_source.contains(
+            "pub fn pfx_reuse_valid(snap_pos: u64, lcp: u64, prompt_len: u64, tile: u64) -> bool"
+        ));
+        assert!(summary
+            .rust_source
+            .contains("pub fn one_liner(n: u64) -> u64"));
+        assert!(!summary.rust_source.contains("add_zero_eq"));
+        assert!(summary
+            .rust_source
+            .contains("#[allow(unused_variables, unused_parens)]"));
+    }
 }
 RUSTY_BENDS_EOF
 
@@ -2730,6 +2810,14 @@ type OrderState is Data:
 
 def deposit(bal: Nat, amt: Nat) -> Nat:
   Nat.add(bal, amt)
+
+# Multi-line parameter lists are valid Bend 2 and emit like single-line headers.
+def can_reuse_prefix(
+  +snap_pos: Nat,
+  +lcp: Nat,
+  prompt_len: Nat
+) -> Bool:
+  (snap_pos <= lcp : Nat) && (lcp <= prompt_len : Nat)
 
 def cancel_order(s: OrderState) -> OrderState:
   match s:
@@ -2793,19 +2881,23 @@ fn main() {
     let total = verified::deposit(100, 25);
     let cancelled = verified::cancel_order(verified::OrderState::Paid(total));
     let shipped = verified::cancel_order(verified::OrderState::Shipped(total));
+    let reuse = verified::can_reuse_prefix(4, 8, 16);
     println!(
-        "RustyBends v1 Verified Core OK -> deposit(100, 25) = {total}, cancel(Paid) = {cancelled:?}, cancel(Shipped) = {shipped:?}"
+        "RustyBends v1 Verified Core OK -> deposit(100, 25) = {total}, cancel(Paid) = {cancelled:?}, cancel(Shipped) = {shipped:?}, can_reuse_prefix(4, 8, 16) = {reuse}"
     );
 }
 
 #[cfg(test)]
 mod tests {
-    use super::verified::{cancel_order, deposit, OrderState};
+    use super::verified::{can_reuse_prefix, cancel_order, deposit, OrderState};
 
     #[test]
     fn verified_module_runs_with_zero_runtime_proof_overhead() {
         assert_eq!(deposit(100, 25), 125);
         assert_eq!(cancel_order(OrderState::Paid(50)), OrderState::Cancelled);
+        assert!(can_reuse_prefix(4, 8, 16));
+        assert!(!can_reuse_prefix(9, 8, 16));
+        assert!(!can_reuse_prefix(4, 8, 7));
         assert_eq!(
             cancel_order(OrderState::Shipped(50)),
             OrderState::Shipped(50)
@@ -2929,6 +3021,6 @@ def cancel_idempotent(s):
 RUSTY_BENDS_EOF
 
 echo "Done! Next steps on desktop:"
-echo "  1. Run rusty-bends-build unit tests (21 tests):  (cd rusty-bends-build && cargo test)"
+echo "  1. Run rusty-bends-build unit tests (22 tests):  (cd rusty-bends-build && cargo test)"
 echo "  2. Build & verify example app with bend CLI:     (cd example-app && cargo check && cargo run)"
 echo "  3. Optional: set BEND_VERDICT=require in CI or pin Bend version in example-app/bend.pin"

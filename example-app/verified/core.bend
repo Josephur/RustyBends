@@ -13,6 +13,14 @@ type OrderState is Data:
 def deposit(bal: Nat, amt: Nat) -> Nat:
   Nat.add(bal, amt)
 
+# Multi-line parameter lists are valid Bend 2 and emit like single-line headers.
+def can_reuse_prefix(
+  +snap_pos: Nat,
+  +lcp: Nat,
+  prompt_len: Nat
+) -> Bool:
+  (snap_pos <= lcp : Nat) && (lcp <= prompt_len : Nat)
+
 def cancel_order(s: OrderState) -> OrderState:
   match s:
     case Draft{}:
