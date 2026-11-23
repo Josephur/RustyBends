@@ -23,8 +23,9 @@ On each build, for every `.bend` file in the verified directory:
    kernel check of the proofs) according to `BEND_VERDICT`.
 3. **Law lock.** It compares every `law` with the token-canonical copy in
    `rusty-bends.lock`. A locked law that was edited, weakened or deleted fails the build
-   with `E_LAW_LOCK_TAMPERED`; new laws are added to the lock only when you build with
-   `RUSTY_BENDS_UPDATE_LAWS=1`.
+   with `E_LAW_LOCK_TAMPERED`. Building with `RUSTY_BENDS_UPDATE_LAWS=1` rewrites the whole
+   lock from the current sources, so it is how new laws get locked, and it skips the check:
+   build once without it first, and review the lock's diff (it should only add lines).
 4. **Erasure and emission.** It drops laws, proof `def`s, equality lemmas and other `q=0`
    terms, and writes the rest (ADTs as `pub enum`, `match`, functions over `Nat` /
    fixed-width integers / `Bool` / pairs) to `$OUT_DIR/verified.rs`.
@@ -96,7 +97,7 @@ code, and hand it to a coding agent working on a RustyBends project.
 | `BEND_PIN_VERSION` | Required Bend version prefix (overrides `bend.pin`). |
 | `BEND_CHECK_FLAG`, `BEND_VERDICT_FLAG` | Override the `--check-only` / `--verdict` flags. |
 | `BENDTT` | When set, `--verdict` counts as available even if `lean` is not in `~/.elan/bin` or on `PATH`. |
-| `RUSTY_BENDS_UPDATE_LAWS` | `1` adds new laws to `rusty-bends.lock`. Locked laws still cannot change. |
+| `RUSTY_BENDS_UPDATE_LAWS` | `1` rewrites `rusty-bends.lock` from the current laws, skipping the tamper check. Review the lock's diff before committing. |
 
 ## Repository layout
 
