@@ -330,7 +330,7 @@ where
     let mut combined_source = String::new();
     for file in &bend_files {
         let text = fs::read_to_string(file).map_err(|e| e.to_string())?;
-        combined_source.push_str(&text);
+        combined_source.push_str(&emit::resolve_import_aliases(&text));
         combined_source.push('\n');
         file_sources.push((file, text));
     }
@@ -1031,6 +1031,110 @@ def sum_list_cat(xs, ys):
 
         let _ = fs::remove_dir_all(&root);
     }
+
+    #[test]
+    fn issue10_sibling_import_aliases_verify_mutate_and_compile_end_to_end() {
+        let root = temp_workspace("issue10_imports");
+        let base_rules = root.join("verified/base_rules.bend");
+        let uses = root.join("verified/uses.bend");
+
+        fs::write(
+            &base_rules,
+            r#"import Base
+
+type Status is Data:
+  Open{}
+  Closed{}
+
+def br_within(pos: Nat, limit: Nat) -> Bool:
+  Nat.is_le(pos, limit)
+"#,
+        )
+        .unwrap();
+
+        fs::write(
+            &uses,
+            r#"import Base
+import base_rules.bend as B
+
+def us_both(+pos: Nat, a: Nat, b: Nat) -> Bool:
+  Bool.and(B.br_within(pos, a), Nat.is_le(pos, b))
+
+def us_open_or(s: B.Status, flag: Bool) -> Bool:
+  match s:
+    case B.Open{}: True{}
+    case B.Closed{}: flag
+
+def us_diag_aux(a: Bool) -> {Bool.and(a, a) == a : Bool}:
+  match a:
+    case True{}: {==}
+    case False{}: {==}
+
+# promise: checking both limits when they are equal matches br_within
+law us_both_diag:
+  for +pos: Nat
+  for +a: Nat
+  {us_both(pos, a, a) == B.br_within(pos, a) : Bool}
+
+def us_both_diag(pos, a):
+  us_diag_aux(B.br_within(pos, a))
+
+# promise: an open status always permits the action regardless of fallback flag
+law us_open_or_open:
+  for flag: Bool
+  {us_open_or(B.Open{}, flag) == True{} : Bool}
+
+def us_open_or_open(flag):
+  {==}
+"#,
+        )
+        .unwrap();
+
+        let mut cfg = make_cfg(&root);
+        cfg.bend_bin = resolve_bend_bin(
+            env::var("BEND_BIN").ok(),
+            env::var_os("PATH"),
+            env::var_os("HOME").map(PathBuf::from),
+        );
+        cfg.verdict_mode = if has_verdict_runtime() {
+            VerdictMode::Require
+        } else {
+            VerdictMode::Off
+        };
+
+        let out_rs = run(&cfg)
+            .expect("sibling import aliases must pass bend, mutation check, lock, and emit")
+            .expect("expected emitted verified.rs");
+        let emitted = fs::read_to_string(&out_rs).unwrap();
+        assert!(!emitted.contains("B::"), "emitted leaked B::\n{emitted}");
+        assert!(emitted.contains("br_within(pos, a)"), "got:\n{emitted}");
+        assert!(emitted.contains("pub enum Status"), "got:\n{emitted}");
+
+        let bin_path = root.join("out/test_bin");
+        let rustc = env::var("RUSTC").unwrap_or_else(|_| "rustc".to_string());
+        let compile = Command::new(&rustc)
+            .args(["--edition", "2021", "--test", "-D", "warnings", "-o"])
+            .arg(&bin_path)
+            .arg(&out_rs)
+            .output()
+            .expect("rustc --test must execute");
+        assert!(
+            compile.status.success(),
+            "rustc --test failed:\n{}",
+            String::from_utf8_lossy(&compile.stderr)
+        );
+        let run_tests = Command::new(&bin_path)
+            .output()
+            .expect("generated law test binary must run");
+        assert!(
+            run_tests.status.success(),
+            "generated law tests failed:\n{}{}",
+            String::from_utf8_lossy(&run_tests.stdout),
+            String::from_utf8_lossy(&run_tests.stderr)
+        );
+
+        let _ = fs::remove_dir_all(&root);
+    }
 }
 RUSTY_BENDS_EOF
 
@@ -1072,9 +1176,23 @@ pub fn extract_canonical_laws(files: &[PathBuf]) -> Result<BTreeMap<String, Cano
     Ok(map)
 }
 
+fn normalize_alias_token<'a>(tok: &'a str, aliases: &BTreeSet<String>) -> &'a str {
+    if !aliases.is_empty() {
+        if let Some((prefix, rest)) = tok.split_once('.') {
+            if aliases.contains(prefix) && !rest.is_empty() {
+                return rest;
+            }
+        }
+    }
+    tok
+}
+
 /// Tokenizes Bend source (stripping comments and whitespace) and extracts every full multi-line `law`.
 pub fn extract_laws_from_source(source: &str) -> Vec<CanonicalLaw> {
     let docs = extract_law_doc_comments(source);
+    let aliases: BTreeSet<String> = crate::emit::parse_import_aliases(source)
+        .into_iter()
+        .collect();
     let tokens = tokenize_bend(source);
     let mut laws = Vec::new();
     let mut i = 0usize;
@@ -1087,7 +1205,11 @@ pub fn extract_laws_from_source(source: &str) -> Vec<CanonicalLaw> {
             while i < tokens.len() && !is_top_level_keyword(&tokens[i]) {
                 i += 1;
             }
-            let canonical_sig = tokens[start..i].join(" ");
+            let canonical_sig = tokens[start..i]
+                .iter()
+                .map(|tok| normalize_alias_token(tok, &aliases))
+                .collect::<Vec<_>>()
+                .join(" ");
             let hash = fnv1a_hex(canonical_sig.as_bytes());
             let (promise, harm) = docs.get(&name).cloned().unwrap_or((None, None));
             laws.push(CanonicalLaw {
@@ -1700,6 +1822,53 @@ law beta:
         let listing = format_law_list(&map);
         assert_eq!(listing, "alpha: first guarantee\nbeta: (no promise)");
     }
+
+    #[test]
+    fn renaming_import_alias_preserves_canonical_law_hash_and_lock() {
+        let dir = tmp_dir("alias_lock");
+        let uses = dir.join("uses.bend");
+        let lock = dir.join("rusty-bends.lock");
+
+        let src_b = r#"import Base
+import base_rules.bend as B
+
+# promise: us_both with identical bounds agrees with br_within
+law us_both_diag:
+  for +pos: Nat
+  for +a: Nat
+  {us_both(pos, a, a) == B.br_within(pos, a) : Bool}
+"#;
+        fs::write(&uses, src_b).unwrap();
+        enforce_law_lock(&lock, std::slice::from_ref(&uses), false).unwrap();
+        let hash_b = extract_canonical_laws(std::slice::from_ref(&uses))
+            .unwrap()
+            .get("us_both_diag")
+            .unwrap()
+            .hash
+            .clone();
+
+        let src_rules = r#"import Base
+import base_rules.bend as Rules
+
+# promise: us_both with identical bounds agrees with br_within
+law us_both_diag:
+  for +pos: Nat
+  for +a: Nat
+  {us_both(pos, a, a) == Rules.br_within(pos, a) : Bool}
+"#;
+        fs::write(&uses, src_rules).unwrap();
+        let hash_rules = extract_canonical_laws(std::slice::from_ref(&uses))
+            .unwrap()
+            .get("us_both_diag")
+            .unwrap()
+            .hash
+            .clone();
+        assert_eq!(hash_b, hash_rules);
+        check_law_lock(&lock, &[uses], false)
+            .expect("renaming import alias must not trip E_LAW_LOCK_TAMPERED");
+
+        let _ = fs::remove_dir_all(&dir);
+    }
 }
 RUSTY_BENDS_EOF
 
@@ -2223,7 +2392,166 @@ pub(crate) fn emit_items_to_rust(
     })
 }
 
+fn is_valid_alias_ident(s: &str) -> bool {
+    let mut chars = s.chars();
+    match chars.next() {
+        Some(c) if c.is_ascii_alphabetic() || c == '_' => {}
+        _ => return false,
+    }
+    chars.all(|c| c.is_ascii_alphanumeric() || c == '_')
+}
+
+fn parse_import_alias_line(raw_line: &str) -> Option<String> {
+    if raw_line.starts_with(|c: char| c.is_whitespace() && c != '\r') {
+        return None;
+    }
+    let clean = strip_comment(raw_line).trim();
+    let parts: Vec<&str> = clean.split_whitespace().collect();
+    if parts.len() == 4
+        && parts[0] == "import"
+        && parts[1].ends_with(".bend")
+        && parts[2] == "as"
+        && is_valid_alias_ident(parts[3])
+        && parts[3] != "Base"
+    {
+        Some(parts[3].to_string())
+    } else {
+        None
+    }
+}
+
+/// Parses unindented `import <path>.bend as <Alias>` directives from a Bend 2 source file.
+pub fn parse_import_aliases(source: &str) -> HashSet<String> {
+    let mut aliases = HashSet::new();
+    for raw in source.lines() {
+        if let Some(alias) = parse_import_alias_line(raw) {
+            aliases.insert(alias);
+        }
+    }
+    aliases
+}
+
+fn split_code_and_comment(line: &str) -> (&str, &str) {
+    let bytes = line.as_bytes();
+    let mut i = 0usize;
+    let mut in_string = false;
+    while i < bytes.len() {
+        if in_string {
+            if bytes[i] == b'\\' && i + 1 < bytes.len() {
+                i += 2;
+                continue;
+            }
+            if bytes[i] == b'"' {
+                in_string = false;
+            }
+            let ch = line[i..].chars().next().unwrap();
+            i += ch.len_utf8();
+            continue;
+        }
+        if bytes[i] == b'"' {
+            in_string = true;
+            i += 1;
+            continue;
+        }
+        if bytes[i] == b'#' || (bytes[i] == b'-' && i + 1 < bytes.len() && bytes[i + 1] == b'-') {
+            return (&line[..i], &line[i..]);
+        }
+        let ch = line[i..].chars().next().unwrap();
+        i += ch.len_utf8();
+    }
+    (line, "")
+}
+
+fn strip_aliases_in_code(code: &str, aliases: &HashSet<String>) -> String {
+    let bytes = code.as_bytes();
+    let mut out = String::with_capacity(code.len());
+    let mut i = 0usize;
+    let mut in_string = false;
+
+    while i < bytes.len() {
+        if in_string {
+            if bytes[i] == b'\\' && i + 1 < bytes.len() {
+                out.push(bytes[i] as char);
+                let next_ch = code[i + 1..].chars().next().unwrap();
+                out.push(next_ch);
+                i += 1 + next_ch.len_utf8();
+                continue;
+            }
+            if bytes[i] == b'"' {
+                in_string = false;
+            }
+            let ch = code[i..].chars().next().unwrap();
+            out.push(ch);
+            i += ch.len_utf8();
+            continue;
+        }
+        if bytes[i] == b'"' {
+            in_string = true;
+            out.push('"');
+            i += 1;
+            continue;
+        }
+        let prev_is_ident_or_dot = i > 0
+            && (bytes[i - 1].is_ascii_alphanumeric()
+                || bytes[i - 1] == b'_'
+                || bytes[i - 1] == b'.');
+        if !prev_is_ident_or_dot && (bytes[i].is_ascii_alphabetic() || bytes[i] == b'_') {
+            let seg_start = i;
+            i += 1;
+            while i < bytes.len() && (bytes[i].is_ascii_alphanumeric() || bytes[i] == b'_') {
+                i += 1;
+            }
+            let seg = &code[seg_start..i];
+            if aliases.contains(seg)
+                && i + 1 < bytes.len()
+                && bytes[i] == b'.'
+                && (bytes[i + 1].is_ascii_alphabetic() || bytes[i + 1] == b'_')
+            {
+                i += 1;
+                let next_start = i;
+                i += 1;
+                while i < bytes.len() && (bytes[i].is_ascii_alphanumeric() || bytes[i] == b'_') {
+                    i += 1;
+                }
+                out.push_str(&code[next_start..i]);
+                continue;
+            }
+            out.push_str(seg);
+            continue;
+        }
+        let ch = code[i..].chars().next().unwrap();
+        out.push(ch);
+        i += ch.len_utf8();
+    }
+    out
+}
+
+/// Resolves sibling `.bend` import aliases (`import foo.bend as X`) within a single file's
+/// source by dropping the import directive line and stripping `X.` qualifiers from code tokens,
+/// leaving comments and string literals untouched. Idempotent by construction.
+pub fn resolve_import_aliases(source: &str) -> String {
+    let aliases = parse_import_aliases(source);
+    if aliases.is_empty() {
+        return source.to_string();
+    }
+    let mut out_lines = Vec::new();
+    for raw in source.split('\n') {
+        let line = raw.strip_suffix('\r').unwrap_or(raw);
+        let cr = if raw.ends_with('\r') { "\r" } else { "" };
+        if parse_import_alias_line(line).is_some() {
+            out_lines.push(cr.to_string());
+            continue;
+        }
+        let (code, comment) = split_code_and_comment(line);
+        let rewritten = strip_aliases_in_code(code, &aliases);
+        out_lines.push(format!("{rewritten}{comment}{cr}"));
+    }
+    out_lines.join("\n")
+}
+
 pub fn parse_book_items(source: &str) -> Result<(Vec<TypeDef>, Vec<Def>), String> {
+    let resolved = resolve_import_aliases(source);
+    let source = resolved.as_str();
     // Pass 1: Collect all law names so real Bend 2 proof definitions ('def <law_name>(...):')
     // are recognized as q=0 proofs and completely erased before Rust emission.
     let mut law_names: HashSet<String> = HashSet::new();
@@ -4839,6 +5167,71 @@ def sample_list() -> List<&2, Nat>:
         assert!(run.status.success(), "runtime assertions failed");
         let _ = std::fs::remove_dir_all(&dir);
     }
+
+    #[test]
+    fn resolves_sibling_import_aliases_in_functions_types_and_comments() {
+        let base_src = r#"import Base
+
+type Status is Data:
+  Open{}
+  Closed{}
+
+def br_within(pos: Nat, limit: Nat) -> Bool:
+  Nat.is_le(pos, limit)
+"#;
+        let uses_src = r#"import Base
+import base_rules.bend as B  # trailing comment
+
+def us_both(+pos: Nat, a: Nat, b: Nat) -> Bool:
+  Bool.and(B.br_within(pos, a), Nat.is_le(pos, b))
+
+def us_open_or(s: B.Status, flag: Bool) -> Bool:
+  match s:
+    case B.Open{}: True{}
+    case B.Closed{}: flag
+
+# promise: B.br_within comment text stays untouched
+law us_both_diag:
+  for +pos: Nat
+  for +a: Nat
+  {us_both(pos, a, a) == B.br_within(pos, a) : Bool}
+"#;
+        let resolved_uses = resolve_import_aliases(uses_src);
+        // Idempotent
+        assert_eq!(resolve_import_aliases(&resolved_uses), resolved_uses);
+        assert!(!resolved_uses.contains("import base_rules.bend"));
+        assert!(resolved_uses.contains("import Base"));
+        assert!(resolved_uses.contains("br_within(pos, a)"));
+        assert!(resolved_uses.contains("s: Status, flag: Bool"));
+        assert!(resolved_uses.contains("case Open{}:"));
+        assert!(resolved_uses.contains("# promise: B.br_within comment text stays untouched"));
+        assert!(!resolved_uses.contains("B.br_within(pos, a)"));
+
+        // Per-file isolation: a sibling file without `as B` can define its own `type B`
+        let other_src = r#"import Base
+
+type B is Data:
+  Tag{}
+
+def use_b(x: B) -> Nat:
+  match x:
+    case Tag{}: 1n
+"#;
+        let combined = format!(
+            "{}\n{}\n{}\n",
+            resolve_import_aliases(base_src),
+            resolved_uses,
+            resolve_import_aliases(other_src)
+        );
+        let summary = emit_verified_rust(&combined, 1).expect("emit with resolved aliases");
+        assert!(!summary.rust_source.contains("B::br_within"));
+        assert!(!summary.rust_source.contains("B::Status"));
+        assert!(!summary.rust_source.contains("B::Open"));
+        assert!(summary.rust_source.contains("B::Tag"));
+        assert!(summary.rust_source.contains("br_within(pos, a)"));
+        assert!(summary.rust_source.contains("pub enum Status"));
+        assert!(summary.rust_source.contains("pub enum B"));
+    }
 }
 RUSTY_BENDS_EOF
 
@@ -4893,7 +5286,8 @@ pub struct ParsedLaw {
 /// Parses all `law` declarations from Bend source (Bend 2 `for ... {lhs == rhs : Ty}`
 /// as well as legacy `law name(for ...): lhs == rhs` syntax).
 pub fn parse_laws(source: &str) -> Vec<ParsedLaw> {
-    let lines: Vec<&str> = source.lines().collect();
+    let resolved = crate::emit::resolve_import_aliases(source);
+    let lines: Vec<&str> = resolved.lines().collect();
     let mut laws = Vec::new();
     let mut i = 0usize;
 
@@ -8785,6 +9179,7 @@ def cancel_idempotent(s):
   - `(a + b : U32)` / `U64` / `I32` / `I64` emit **wrapping** ops (`wrapping_add`, `wrapping_sub`, `wrapping_mul`) matching Bend 2's fixed-width integer semantics.
 - **Control flow & patterns:** nested `match`, multi-scrutinee `match a b:`, `case 1n+p:` and nested `case 1n+1n+q:` successor patterns, and multi-line `let` bindings are all supported.
 - **Recursive ADTs & built-in `List`:** direct or mutually recursive `type` definitions automatically box cycle-forming fields (`Box<T>`), omit `Copy` (`#[derive(Debug, Clone, PartialEq, Eq)]`) across recursive types and any wrappers containing them, unbox patterns (`*__rb_box` + nested guards), and insert `.clone()` on multi-use non-`Copy` values. Built-in `Base` `List<T>` / `List<&2, T>`, `Nil{}` / `Con{head, tail}`, and list literals `[]` / `[a, b]` emit `pub enum List<T> { Nil, Con(T, Box<List<T>>) }`.
+- **Cross-file sibling imports (`import sibling.bend as X`):** files under `verified/` can import sibling `.bend` files (`import base_rules.bend as B`) to share functions, types, laws, and helper lemmas (`B.fn_name(...)`, `B.TypeName`, `B.Ctor{}`). Keep top-level names unique across `verified/*.bend`; the emitter resolves each file's import aliases into the single emitted `verified.rs` module, and `rusty-bends.lock` normalizes aliases so renaming `as B` does not trip `E_LAW_LOCK_TAMPERED`.
 - **Generated per-law Rust tests:** every `law` also emits a `#[cfg(test)]` Rust test into `OUT_DIR/verified.rs` (run automatically by `cargo test`) that checks the emitted functions across small values, `u64::MAX - 1`, `u64::MAX`, ADT constructors, and deterministic PRNG samples (skipping only checked `Nat` overflow panics).
 - **Counterexample vs proof-failure diagnosis:** when `bend --check-only` fails on a law, `rusty-bends-build` evaluates the emitted Rust on concrete inputs first and reports `[E_LAW_FALSE]` with aligned `lhs`/`rhs` values if the law is false, or notes `"no counterexample up to ...: the law may be true; the proof is what failed"` if no counterexample exists.
 - **Mutation checking before sealing (`E_LAW_VACUOUS`):** every unlocked/new law is checked against small mutants of the live functions in its dependency cone (`True{}`/`False{}` swap, `Nat.is_le`/`Nat.is_lt` swap, `Nat.add`/`Nat.sub` swap, `Bool.and`/`Bool.or` operand drop, returning a constructor argument unchanged, swapping match arms) and fails with `[E_LAW_VACUOUS]` if it catches none. Run `RUSTY_BENDS_MUTATE=all cargo check` to report caught/survived status for already-locked laws without failing.

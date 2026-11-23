@@ -517,7 +517,166 @@ pub(crate) fn emit_items_to_rust(
     })
 }
 
+fn is_valid_alias_ident(s: &str) -> bool {
+    let mut chars = s.chars();
+    match chars.next() {
+        Some(c) if c.is_ascii_alphabetic() || c == '_' => {}
+        _ => return false,
+    }
+    chars.all(|c| c.is_ascii_alphanumeric() || c == '_')
+}
+
+fn parse_import_alias_line(raw_line: &str) -> Option<String> {
+    if raw_line.starts_with(|c: char| c.is_whitespace() && c != '\r') {
+        return None;
+    }
+    let clean = strip_comment(raw_line).trim();
+    let parts: Vec<&str> = clean.split_whitespace().collect();
+    if parts.len() == 4
+        && parts[0] == "import"
+        && parts[1].ends_with(".bend")
+        && parts[2] == "as"
+        && is_valid_alias_ident(parts[3])
+        && parts[3] != "Base"
+    {
+        Some(parts[3].to_string())
+    } else {
+        None
+    }
+}
+
+/// Parses unindented `import <path>.bend as <Alias>` directives from a Bend 2 source file.
+pub fn parse_import_aliases(source: &str) -> HashSet<String> {
+    let mut aliases = HashSet::new();
+    for raw in source.lines() {
+        if let Some(alias) = parse_import_alias_line(raw) {
+            aliases.insert(alias);
+        }
+    }
+    aliases
+}
+
+fn split_code_and_comment(line: &str) -> (&str, &str) {
+    let bytes = line.as_bytes();
+    let mut i = 0usize;
+    let mut in_string = false;
+    while i < bytes.len() {
+        if in_string {
+            if bytes[i] == b'\\' && i + 1 < bytes.len() {
+                i += 2;
+                continue;
+            }
+            if bytes[i] == b'"' {
+                in_string = false;
+            }
+            let ch = line[i..].chars().next().unwrap();
+            i += ch.len_utf8();
+            continue;
+        }
+        if bytes[i] == b'"' {
+            in_string = true;
+            i += 1;
+            continue;
+        }
+        if bytes[i] == b'#' || (bytes[i] == b'-' && i + 1 < bytes.len() && bytes[i + 1] == b'-') {
+            return (&line[..i], &line[i..]);
+        }
+        let ch = line[i..].chars().next().unwrap();
+        i += ch.len_utf8();
+    }
+    (line, "")
+}
+
+fn strip_aliases_in_code(code: &str, aliases: &HashSet<String>) -> String {
+    let bytes = code.as_bytes();
+    let mut out = String::with_capacity(code.len());
+    let mut i = 0usize;
+    let mut in_string = false;
+
+    while i < bytes.len() {
+        if in_string {
+            if bytes[i] == b'\\' && i + 1 < bytes.len() {
+                out.push(bytes[i] as char);
+                let next_ch = code[i + 1..].chars().next().unwrap();
+                out.push(next_ch);
+                i += 1 + next_ch.len_utf8();
+                continue;
+            }
+            if bytes[i] == b'"' {
+                in_string = false;
+            }
+            let ch = code[i..].chars().next().unwrap();
+            out.push(ch);
+            i += ch.len_utf8();
+            continue;
+        }
+        if bytes[i] == b'"' {
+            in_string = true;
+            out.push('"');
+            i += 1;
+            continue;
+        }
+        let prev_is_ident_or_dot = i > 0
+            && (bytes[i - 1].is_ascii_alphanumeric()
+                || bytes[i - 1] == b'_'
+                || bytes[i - 1] == b'.');
+        if !prev_is_ident_or_dot && (bytes[i].is_ascii_alphabetic() || bytes[i] == b'_') {
+            let seg_start = i;
+            i += 1;
+            while i < bytes.len() && (bytes[i].is_ascii_alphanumeric() || bytes[i] == b'_') {
+                i += 1;
+            }
+            let seg = &code[seg_start..i];
+            if aliases.contains(seg)
+                && i + 1 < bytes.len()
+                && bytes[i] == b'.'
+                && (bytes[i + 1].is_ascii_alphabetic() || bytes[i + 1] == b'_')
+            {
+                i += 1;
+                let next_start = i;
+                i += 1;
+                while i < bytes.len() && (bytes[i].is_ascii_alphanumeric() || bytes[i] == b'_') {
+                    i += 1;
+                }
+                out.push_str(&code[next_start..i]);
+                continue;
+            }
+            out.push_str(seg);
+            continue;
+        }
+        let ch = code[i..].chars().next().unwrap();
+        out.push(ch);
+        i += ch.len_utf8();
+    }
+    out
+}
+
+/// Resolves sibling `.bend` import aliases (`import foo.bend as X`) within a single file's
+/// source by dropping the import directive line and stripping `X.` qualifiers from code tokens,
+/// leaving comments and string literals untouched. Idempotent by construction.
+pub fn resolve_import_aliases(source: &str) -> String {
+    let aliases = parse_import_aliases(source);
+    if aliases.is_empty() {
+        return source.to_string();
+    }
+    let mut out_lines = Vec::new();
+    for raw in source.split('\n') {
+        let line = raw.strip_suffix('\r').unwrap_or(raw);
+        let cr = if raw.ends_with('\r') { "\r" } else { "" };
+        if parse_import_alias_line(line).is_some() {
+            out_lines.push(cr.to_string());
+            continue;
+        }
+        let (code, comment) = split_code_and_comment(line);
+        let rewritten = strip_aliases_in_code(code, &aliases);
+        out_lines.push(format!("{rewritten}{comment}{cr}"));
+    }
+    out_lines.join("\n")
+}
+
 pub fn parse_book_items(source: &str) -> Result<(Vec<TypeDef>, Vec<Def>), String> {
+    let resolved = resolve_import_aliases(source);
+    let source = resolved.as_str();
     // Pass 1: Collect all law names so real Bend 2 proof definitions ('def <law_name>(...):')
     // are recognized as q=0 proofs and completely erased before Rust emission.
     let mut law_names: HashSet<String> = HashSet::new();
@@ -3132,5 +3291,70 @@ def sample_list() -> List<&2, Nat>:
             .expect("run compiled binary");
         assert!(run.status.success(), "runtime assertions failed");
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn resolves_sibling_import_aliases_in_functions_types_and_comments() {
+        let base_src = r#"import Base
+
+type Status is Data:
+  Open{}
+  Closed{}
+
+def br_within(pos: Nat, limit: Nat) -> Bool:
+  Nat.is_le(pos, limit)
+"#;
+        let uses_src = r#"import Base
+import base_rules.bend as B  # trailing comment
+
+def us_both(+pos: Nat, a: Nat, b: Nat) -> Bool:
+  Bool.and(B.br_within(pos, a), Nat.is_le(pos, b))
+
+def us_open_or(s: B.Status, flag: Bool) -> Bool:
+  match s:
+    case B.Open{}: True{}
+    case B.Closed{}: flag
+
+# promise: B.br_within comment text stays untouched
+law us_both_diag:
+  for +pos: Nat
+  for +a: Nat
+  {us_both(pos, a, a) == B.br_within(pos, a) : Bool}
+"#;
+        let resolved_uses = resolve_import_aliases(uses_src);
+        // Idempotent
+        assert_eq!(resolve_import_aliases(&resolved_uses), resolved_uses);
+        assert!(!resolved_uses.contains("import base_rules.bend"));
+        assert!(resolved_uses.contains("import Base"));
+        assert!(resolved_uses.contains("br_within(pos, a)"));
+        assert!(resolved_uses.contains("s: Status, flag: Bool"));
+        assert!(resolved_uses.contains("case Open{}:"));
+        assert!(resolved_uses.contains("# promise: B.br_within comment text stays untouched"));
+        assert!(!resolved_uses.contains("B.br_within(pos, a)"));
+
+        // Per-file isolation: a sibling file without `as B` can define its own `type B`
+        let other_src = r#"import Base
+
+type B is Data:
+  Tag{}
+
+def use_b(x: B) -> Nat:
+  match x:
+    case Tag{}: 1n
+"#;
+        let combined = format!(
+            "{}\n{}\n{}\n",
+            resolve_import_aliases(base_src),
+            resolved_uses,
+            resolve_import_aliases(other_src)
+        );
+        let summary = emit_verified_rust(&combined, 1).expect("emit with resolved aliases");
+        assert!(!summary.rust_source.contains("B::br_within"));
+        assert!(!summary.rust_source.contains("B::Status"));
+        assert!(!summary.rust_source.contains("B::Open"));
+        assert!(summary.rust_source.contains("B::Tag"));
+        assert!(summary.rust_source.contains("br_within(pos, a)"));
+        assert!(summary.rust_source.contains("pub enum Status"));
+        assert!(summary.rust_source.contains("pub enum B"));
     }
 }

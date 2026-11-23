@@ -35,9 +35,23 @@ pub fn extract_canonical_laws(files: &[PathBuf]) -> Result<BTreeMap<String, Cano
     Ok(map)
 }
 
+fn normalize_alias_token<'a>(tok: &'a str, aliases: &BTreeSet<String>) -> &'a str {
+    if !aliases.is_empty() {
+        if let Some((prefix, rest)) = tok.split_once('.') {
+            if aliases.contains(prefix) && !rest.is_empty() {
+                return rest;
+            }
+        }
+    }
+    tok
+}
+
 /// Tokenizes Bend source (stripping comments and whitespace) and extracts every full multi-line `law`.
 pub fn extract_laws_from_source(source: &str) -> Vec<CanonicalLaw> {
     let docs = extract_law_doc_comments(source);
+    let aliases: BTreeSet<String> = crate::emit::parse_import_aliases(source)
+        .into_iter()
+        .collect();
     let tokens = tokenize_bend(source);
     let mut laws = Vec::new();
     let mut i = 0usize;
@@ -50,7 +64,11 @@ pub fn extract_laws_from_source(source: &str) -> Vec<CanonicalLaw> {
             while i < tokens.len() && !is_top_level_keyword(&tokens[i]) {
                 i += 1;
             }
-            let canonical_sig = tokens[start..i].join(" ");
+            let canonical_sig = tokens[start..i]
+                .iter()
+                .map(|tok| normalize_alias_token(tok, &aliases))
+                .collect::<Vec<_>>()
+                .join(" ");
             let hash = fnv1a_hex(canonical_sig.as_bytes());
             let (promise, harm) = docs.get(&name).cloned().unwrap_or((None, None));
             laws.push(CanonicalLaw {
@@ -662,5 +680,52 @@ law beta:
             .collect();
         let listing = format_law_list(&map);
         assert_eq!(listing, "alpha: first guarantee\nbeta: (no promise)");
+    }
+
+    #[test]
+    fn renaming_import_alias_preserves_canonical_law_hash_and_lock() {
+        let dir = tmp_dir("alias_lock");
+        let uses = dir.join("uses.bend");
+        let lock = dir.join("rusty-bends.lock");
+
+        let src_b = r#"import Base
+import base_rules.bend as B
+
+# promise: us_both with identical bounds agrees with br_within
+law us_both_diag:
+  for +pos: Nat
+  for +a: Nat
+  {us_both(pos, a, a) == B.br_within(pos, a) : Bool}
+"#;
+        fs::write(&uses, src_b).unwrap();
+        enforce_law_lock(&lock, std::slice::from_ref(&uses), false).unwrap();
+        let hash_b = extract_canonical_laws(std::slice::from_ref(&uses))
+            .unwrap()
+            .get("us_both_diag")
+            .unwrap()
+            .hash
+            .clone();
+
+        let src_rules = r#"import Base
+import base_rules.bend as Rules
+
+# promise: us_both with identical bounds agrees with br_within
+law us_both_diag:
+  for +pos: Nat
+  for +a: Nat
+  {us_both(pos, a, a) == Rules.br_within(pos, a) : Bool}
+"#;
+        fs::write(&uses, src_rules).unwrap();
+        let hash_rules = extract_canonical_laws(std::slice::from_ref(&uses))
+            .unwrap()
+            .get("us_both_diag")
+            .unwrap()
+            .hash
+            .clone();
+        assert_eq!(hash_b, hash_rules);
+        check_law_lock(&lock, &[uses], false)
+            .expect("renaming import alias must not trip E_LAW_LOCK_TAMPERED");
+
+        let _ = fs::remove_dir_all(&dir);
     }
 }

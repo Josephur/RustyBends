@@ -48,7 +48,8 @@ pub struct ParsedLaw {
 /// Parses all `law` declarations from Bend source (Bend 2 `for ... {lhs == rhs : Ty}`
 /// as well as legacy `law name(for ...): lhs == rhs` syntax).
 pub fn parse_laws(source: &str) -> Vec<ParsedLaw> {
-    let lines: Vec<&str> = source.lines().collect();
+    let resolved = crate::emit::resolve_import_aliases(source);
+    let lines: Vec<&str> = resolved.lines().collect();
     let mut laws = Vec::new();
     let mut i = 0usize;
 

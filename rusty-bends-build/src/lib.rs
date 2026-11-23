@@ -305,7 +305,7 @@ where
     let mut combined_source = String::new();
     for file in &bend_files {
         let text = fs::read_to_string(file).map_err(|e| e.to_string())?;
-        combined_source.push_str(&text);
+        combined_source.push_str(&emit::resolve_import_aliases(&text));
         combined_source.push('\n');
         file_sources.push((file, text));
     }
@@ -980,6 +980,110 @@ def sum_list_cat(xs, ys):
         assert!(emitted.contains("pub enum List<T>"));
         assert!(emitted.contains("fn law_chain_available_zero()"));
         assert!(emitted.contains("fn law_sum_list_cat()"));
+
+        let bin_path = root.join("out/test_bin");
+        let rustc = env::var("RUSTC").unwrap_or_else(|_| "rustc".to_string());
+        let compile = Command::new(&rustc)
+            .args(["--edition", "2021", "--test", "-D", "warnings", "-o"])
+            .arg(&bin_path)
+            .arg(&out_rs)
+            .output()
+            .expect("rustc --test must execute");
+        assert!(
+            compile.status.success(),
+            "rustc --test failed:\n{}",
+            String::from_utf8_lossy(&compile.stderr)
+        );
+        let run_tests = Command::new(&bin_path)
+            .output()
+            .expect("generated law test binary must run");
+        assert!(
+            run_tests.status.success(),
+            "generated law tests failed:\n{}{}",
+            String::from_utf8_lossy(&run_tests.stdout),
+            String::from_utf8_lossy(&run_tests.stderr)
+        );
+
+        let _ = fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn issue10_sibling_import_aliases_verify_mutate_and_compile_end_to_end() {
+        let root = temp_workspace("issue10_imports");
+        let base_rules = root.join("verified/base_rules.bend");
+        let uses = root.join("verified/uses.bend");
+
+        fs::write(
+            &base_rules,
+            r#"import Base
+
+type Status is Data:
+  Open{}
+  Closed{}
+
+def br_within(pos: Nat, limit: Nat) -> Bool:
+  Nat.is_le(pos, limit)
+"#,
+        )
+        .unwrap();
+
+        fs::write(
+            &uses,
+            r#"import Base
+import base_rules.bend as B
+
+def us_both(+pos: Nat, a: Nat, b: Nat) -> Bool:
+  Bool.and(B.br_within(pos, a), Nat.is_le(pos, b))
+
+def us_open_or(s: B.Status, flag: Bool) -> Bool:
+  match s:
+    case B.Open{}: True{}
+    case B.Closed{}: flag
+
+def us_diag_aux(a: Bool) -> {Bool.and(a, a) == a : Bool}:
+  match a:
+    case True{}: {==}
+    case False{}: {==}
+
+# promise: checking both limits when they are equal matches br_within
+law us_both_diag:
+  for +pos: Nat
+  for +a: Nat
+  {us_both(pos, a, a) == B.br_within(pos, a) : Bool}
+
+def us_both_diag(pos, a):
+  us_diag_aux(B.br_within(pos, a))
+
+# promise: an open status always permits the action regardless of fallback flag
+law us_open_or_open:
+  for flag: Bool
+  {us_open_or(B.Open{}, flag) == True{} : Bool}
+
+def us_open_or_open(flag):
+  {==}
+"#,
+        )
+        .unwrap();
+
+        let mut cfg = make_cfg(&root);
+        cfg.bend_bin = resolve_bend_bin(
+            env::var("BEND_BIN").ok(),
+            env::var_os("PATH"),
+            env::var_os("HOME").map(PathBuf::from),
+        );
+        cfg.verdict_mode = if has_verdict_runtime() {
+            VerdictMode::Require
+        } else {
+            VerdictMode::Off
+        };
+
+        let out_rs = run(&cfg)
+            .expect("sibling import aliases must pass bend, mutation check, lock, and emit")
+            .expect("expected emitted verified.rs");
+        let emitted = fs::read_to_string(&out_rs).unwrap();
+        assert!(!emitted.contains("B::"), "emitted leaked B::\n{emitted}");
+        assert!(emitted.contains("br_within(pos, a)"), "got:\n{emitted}");
+        assert!(emitted.contains("pub enum Status"), "got:\n{emitted}");
 
         let bin_path = root.join("out/test_bin");
         let rustc = env::var("RUSTC").unwrap_or_else(|_| "rustc".to_string());
