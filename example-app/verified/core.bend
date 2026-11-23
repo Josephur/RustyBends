@@ -13,6 +13,15 @@ type OrderState is Data:
 def deposit(bal: Nat, amt: Nat) -> Nat:
   Nat.add(bal, amt)
 
+def minus_two(n: Nat) -> Nat:
+  match n:
+    case 0n:
+      0n
+    case 1n:
+      0n
+    case 1n+1n+q:
+      q
+
 # Multi-line parameter lists are valid Bend 2 and emit like single-line headers.
 def can_reuse_prefix(
   +snap_pos: Nat,

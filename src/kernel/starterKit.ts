@@ -631,11 +631,11 @@ pub fn emit_verified_rust(source: &str, laws_verified: usize) -> Result<EmitSumm
             .join(", ");
 
         let default_mode = arith_mode_for_type(&def.ret, ArithMode::Saturating);
-        let body_expr = emit_expr_with_mode(&def.body, &def_map, &ctor_map, default_mode);
+        let body_expr = emit_expr_with_mode(&def.body, &def_map, &ctor_map, default_mode)?;
         let ret_ty = infer_return_type(&def.body, &def.ret, &type_param_set);
 
         blocks.push(format!(
-            "#[inline]\\n#[allow(unused_variables, unused_parens)]\\npub fn {name}{generics}({rust_params}) -> {ret_ty} {{\\n    {body_expr}\\n}}",
+            "#[inline]\\n#[allow(unused_variables, unused_parens, clippy::let_and_return)]\\npub fn {name}{generics}({rust_params}) -> {ret_ty} {{\\n    {body_expr}\\n}}",
             name = def.name
         ));
     }
@@ -1051,60 +1051,128 @@ fn infer_return_type(body: &str, declared_ret: &str, type_params: &HashSet<Strin
     bend_type_to_rust(declared_ret, type_params)
 }
 
-fn parse_nat_succ_pattern(p: &str) -> Option<(u64, String)> {
-    let (lhs, rhs) = split_top_level_once(p, '+')?;
-    let digits = lhs.trim().strip_suffix('n')?;
-    if digits.is_empty() || !digits.chars().all(|c| c.is_ascii_digit()) {
-        return None;
+enum NatPattern {
+    Const(u64),
+    Succ { offset: u64, var: String },
+}
+
+fn is_valid_rust_ident_or_wildcard(s: &str) -> bool {
+    if s == "_" {
+        return true;
     }
-    let k: u64 = digits.parse().ok()?;
-    if k == 0 {
-        return None;
+    let mut chars = s.chars();
+    match chars.next() {
+        Some(c) if c.is_ascii_alphabetic() || c == '_' => {}
+        _ => return false,
     }
-    let var = rhs
-        .trim()
-        .trim_start_matches('+')
-        .trim_start_matches('-')
-        .trim();
-    if var.is_empty() || !var.chars().all(|c| c.is_ascii_alphanumeric() || c == '_') {
-        return None;
+    chars.all(|c| c.is_ascii_alphanumeric() || c == '_')
+}
+
+fn parse_nat_succ_pattern(p: &str) -> Result<Option<NatPattern>, String> {
+    let mut cur = unwrap_outer_parens(p.trim());
+    let mut offset: u64 = 0;
+    let mut saw_succ = false;
+
+    while let Some((lhs, rhs)) = split_top_level_once(cur, '+') {
+        let lhs_trim = unwrap_outer_parens(lhs.trim());
+        if lhs_trim.is_empty() {
+            // Leading '+' on a Data binder like \`+q\` (or inside \`1n++q\`) leaves an empty LHS.
+            break;
+        }
+        let Some(digits) = lhs_trim.strip_suffix('n') else {
+            if saw_succ {
+                return Err(format!(
+                    "[E_EMIT_UNSUPPORTED_PATTERN] Unsupported nested Nat pattern '{p}'"
+                ));
+            }
+            return Ok(None);
+        };
+        if digits.is_empty() || !digits.chars().all(|c| c.is_ascii_digit()) {
+            if saw_succ {
+                return Err(format!(
+                    "[E_EMIT_UNSUPPORTED_PATTERN] Unsupported nested Nat pattern '{p}'"
+                ));
+            }
+            return Ok(None);
+        }
+        let k: u64 = digits.parse().map_err(|_| {
+            format!("[E_EMIT_UNSUPPORTED_PATTERN] Nat literal overflow in pattern '{p}'")
+        })?;
+        offset = offset.checked_add(k).ok_or_else(|| {
+            format!("[E_EMIT_UNSUPPORTED_PATTERN] Nat offset overflow in pattern '{p}'")
+        })?;
+        saw_succ = true;
+        cur = unwrap_outer_parens(rhs.trim());
     }
-    Some((k, var.to_string()))
+
+    if !saw_succ {
+        return Ok(None);
+    }
+
+    if let Some(digits) = cur.strip_suffix('n') {
+        if !digits.is_empty() && digits.chars().all(|c| c.is_ascii_digit()) {
+            let tail_k: u64 = digits.parse().map_err(|_| {
+                format!("[E_EMIT_UNSUPPORTED_PATTERN] Nat literal overflow in pattern '{p}'")
+            })?;
+            let total = offset.checked_add(tail_k).ok_or_else(|| {
+                format!("[E_EMIT_UNSUPPORTED_PATTERN] Nat offset overflow in pattern '{p}'")
+            })?;
+            return Ok(Some(NatPattern::Const(total)));
+        }
+    }
+
+    let var = cur.trim_start_matches('+').trim_start_matches('-').trim();
+    if !is_valid_rust_ident_or_wildcard(var) {
+        return Err(format!(
+            "[E_EMIT_UNSUPPORTED_PATTERN] Unsupported successor tail '{cur}' in pattern '{p}'"
+        ));
+    }
+
+    Ok(Some(NatPattern::Succ {
+        offset,
+        var: var.to_string(),
+    }))
 }
 
 fn emit_single_pattern(
     pat: &str,
     ctors: &HashMap<String, CtorInfo>,
     succ_counter: &mut usize,
-) -> (String, Vec<String>) {
+) -> Result<(String, Vec<String>), String> {
     let p = pat.trim();
     if p == "_" || p == "true" || p == "false" || p == "()" {
-        return (p.to_string(), Vec::new());
+        return Ok((p.to_string(), Vec::new()));
     }
     if p == "True{}" {
-        return ("true".to_string(), Vec::new());
+        return Ok(("true".to_string(), Vec::new()));
     }
     if p == "False{}" {
-        return ("false".to_string(), Vec::new());
+        return Ok(("false".to_string(), Vec::new()));
     }
     if p == "Unit{}" {
-        return ("()".to_string(), Vec::new());
+        return Ok(("()".to_string(), Vec::new()));
     }
-    if let Some((k, var)) = parse_nat_succ_pattern(p) {
-        if var == "_" {
-            return (format!("{k}_u64..=u64::MAX"), Vec::new());
-        }
-        let idx = *succ_counter;
-        *succ_counter += 1;
-        let tmp = format!("__rb_n{idx}");
-        return (
-            format!("{tmp} @ {k}_u64..=u64::MAX"),
-            vec![format!("let {var} = {tmp} - {k}_u64;")],
-        );
+    if let Some(nat_pat) = parse_nat_succ_pattern(p)? {
+        return match nat_pat {
+            NatPattern::Const(total) => Ok((format!("{total}_u64"), Vec::new())),
+            NatPattern::Succ { offset: 0, var } => Ok((var, Vec::new())),
+            NatPattern::Succ { offset, var } if var == "_" => {
+                Ok((format!("{offset}_u64..=u64::MAX"), Vec::new()))
+            }
+            NatPattern::Succ { offset, var } => {
+                let idx = *succ_counter;
+                *succ_counter += 1;
+                let tmp = format!("__rb_n{idx}");
+                Ok((
+                    format!("{tmp} @ {offset}_u64..=u64::MAX"),
+                    vec![format!("let {var} = {tmp} - {offset}_u64;")],
+                ))
+            }
+        };
     }
     if let Some(digits) = p.strip_suffix('n') {
         if !digits.is_empty() && digits.chars().all(|c| c.is_ascii_digit()) {
-            return (format!("{digits}_u64"), Vec::new());
+            return Ok((format!("{digits}_u64"), Vec::new()));
         }
     }
     // Tuple pattern: (a, b)
@@ -1115,63 +1183,87 @@ fn emit_single_pattern(
             let mut rust_parts = Vec::new();
             let mut bindings = Vec::new();
             for part in parts {
-                let (rp, mut b) = emit_single_pattern(part, ctors, succ_counter);
+                let (rp, mut b) = emit_single_pattern(part, ctors, succ_counter)?;
                 rust_parts.push(rp);
                 bindings.append(&mut b);
             }
-            return (format!("({})", rust_parts.join(", ")), bindings);
+            return Ok((format!("({})", rust_parts.join(", ")), bindings));
         }
     }
     // Real Bend 2 curly-brace pattern: Draft{}, Paid{amt}, Circle{+r}
     if let Some(open) = p.find('{') {
         if p.ends_with('}') {
             let head = p[..open].trim();
+            if !is_valid_path_ident(head) {
+                return Err(format!(
+                    "[E_EMIT_UNSUPPORTED_PATTERN] Unsupported constructor pattern '{p}'"
+                ));
+            }
             let inner = p[open + 1..p.len() - 1].trim();
             let rust_head = resolve_ctor_path(head, ctors);
             if inner.is_empty() {
-                return (rust_head, Vec::new());
+                return Ok((rust_head, Vec::new()));
             }
             let mut bindings = Vec::new();
-            let fields: Vec<String> = split_top_level(inner, ',')
-                .into_iter()
-                .map(|b| {
-                    let clean = b
-                        .trim()
+            let mut fields = Vec::new();
+            for b in split_top_level(inner, ',') {
+                let clean = b
+                    .trim()
+                    .trim_start_matches('+')
+                    .trim_start_matches('-')
+                    .trim();
+                let rhs = if let Some((_, v)) = clean.split_once(':') {
+                    v.trim()
                         .trim_start_matches('+')
                         .trim_start_matches('-')
-                        .trim();
-                    let rhs = if let Some((_, v)) = clean.split_once(':') {
-                        v.trim()
-                            .trim_start_matches('+')
-                            .trim_start_matches('-')
-                            .trim()
-                    } else {
-                        clean
-                    };
-                    let (rp, mut bs) = emit_single_pattern(rhs, ctors, succ_counter);
-                    bindings.append(&mut bs);
-                    rp
-                })
-                .collect();
-            return (format!("{rust_head}({})", fields.join(", ")), bindings);
+                        .trim()
+                } else {
+                    clean
+                };
+                let (rp, mut bs) = emit_single_pattern(rhs, ctors, succ_counter)?;
+                bindings.append(&mut bs);
+                fields.push(rp);
+            }
+            return Ok((format!("{rust_head}({})", fields.join(", ")), bindings));
         }
     }
     if let Some(open) = p.find('(') {
         if p.ends_with(')') {
             let head = p[..open].trim();
+            if !is_valid_path_ident(head) {
+                return Err(format!(
+                    "[E_EMIT_UNSUPPORTED_PATTERN] Unsupported constructor pattern '{p}'"
+                ));
+            }
             let args = p[open + 1..p.len() - 1].trim();
             let rust_head = resolve_ctor_path(head, ctors);
-            return (format!("{rust_head}({args})"), Vec::new());
+            if args.is_empty() {
+                return Ok((rust_head, Vec::new()));
+            }
+            let mut bindings = Vec::new();
+            let mut fields = Vec::new();
+            for arg in split_top_level(args, ',') {
+                let (rp, mut bs) = emit_single_pattern(arg, ctors, succ_counter)?;
+                bindings.append(&mut bs);
+                fields.push(rp);
+            }
+            return Ok((format!("{rust_head}({})", fields.join(", ")), bindings));
         }
     }
-    (resolve_ctor_path(p, ctors), Vec::new())
+    let clean = p.trim_start_matches('+').trim_start_matches('-').trim();
+    if clean.is_empty() || !clean.split('.').all(is_valid_rust_ident_or_wildcard) {
+        return Err(format!(
+            "[E_EMIT_UNSUPPORTED_PATTERN] Unsupported match pattern '{p}'"
+        ));
+    }
+    Ok((resolve_ctor_path(clean, ctors), Vec::new()))
 }
 
 fn emit_match_pattern(
     pat: &str,
     scrut_count: usize,
     ctors: &HashMap<String, CtorInfo>,
-) -> (String, Vec<String>) {
+) -> Result<(String, Vec<String>), String> {
     let mut succ_counter = 0usize;
     if scrut_count > 1 {
         let parts = split_pattern_tokens(pat);
@@ -1179,11 +1271,11 @@ fn emit_match_pattern(
             let mut rust_parts = Vec::new();
             let mut bindings = Vec::new();
             for part in &parts {
-                let (rp, mut b) = emit_single_pattern(part, ctors, &mut succ_counter);
+                let (rp, mut b) = emit_single_pattern(part, ctors, &mut succ_counter)?;
                 rust_parts.push(rp);
                 bindings.append(&mut b);
             }
-            return (format!("({})", rust_parts.join(", ")), bindings);
+            return Ok((format!("({})", rust_parts.join(", ")), bindings));
         }
     }
     emit_single_pattern(pat, ctors, &mut succ_counter)
@@ -1290,13 +1382,14 @@ fn split_pattern_tokens(pat: &str) -> Vec<String> {
     let mut out = Vec::new();
     let mut i = 0;
     while i < raw.len() {
-        if i + 2 < raw.len() && raw[i].ends_with('n') && raw[i + 1] == "+" {
-            out.push(format!("{}+{}", raw[i], raw[i + 2]));
-            i += 3;
-        } else {
-            out.push(raw[i].to_string());
-            i += 1;
+        let mut cur = raw[i].to_string();
+        while i + 2 < raw.len() && cur.ends_with('n') && raw[i + 1] == "+" {
+            cur.push('+');
+            cur.push_str(raw[i + 2]);
+            i += 2;
         }
+        out.push(cur);
+        i += 1;
     }
     out
 }
@@ -1346,10 +1439,10 @@ fn emit_expr_with_mode(
     defs: &HashMap<String, &Def>,
     ctors: &HashMap<String, CtorInfo>,
     mode: ArithMode,
-) -> String {
+) -> Result<String, String> {
     let lines: Vec<&str> = expr.lines().filter(|l| !l.trim().is_empty()).collect();
     if lines.is_empty() {
-        return "()".to_string();
+        return Ok("()".to_string());
     }
 
     let first_trim = lines[0].trim();
@@ -1377,12 +1470,12 @@ fn emit_expr_with_mode(
             if split_idx < lines.len() {
                 let val_src = val_lines.join("\\n");
                 let rest_src = lines[split_idx..].join("\\n");
-                return format!(
+                return Ok(format!(
                     "{{\\n        let {} = {};\\n        {}\\n    }}",
                     clean_let_binding(lhs_raw),
-                    emit_expr_with_mode(&val_src, defs, ctors, mode),
-                    emit_expr_with_mode(&rest_src, defs, ctors, mode)
-                );
+                    emit_expr_with_mode(&val_src, defs, ctors, mode)?,
+                    emit_expr_with_mode(&rest_src, defs, ctors, mode)?
+                ));
             }
         }
     }
@@ -1392,13 +1485,13 @@ fn emit_expr_with_mode(
         if let Some((scrut_raw, inline_arms)) = split_top_level_once(after_match, ':') {
             let scrut_parts = split_match_scrutinees(scrut_raw);
             let rust_scrut = if scrut_parts.len() > 1 {
-                let emitted: Vec<String> = scrut_parts
-                    .iter()
-                    .map(|p| emit_expr_with_mode(p, defs, ctors, mode))
-                    .collect();
+                let mut emitted = Vec::with_capacity(scrut_parts.len());
+                for p in &scrut_parts {
+                    emitted.push(emit_expr_with_mode(p, defs, ctors, mode)?);
+                }
                 format!("({})", emitted.join(", "))
             } else {
-                emit_expr_with_mode(scrut_raw, defs, ctors, mode)
+                emit_expr_with_mode(scrut_raw, defs, ctors, mode)?
             };
 
             let parsed_arms: Vec<(String, String)> = if lines.len() > 1 {
@@ -1415,8 +1508,8 @@ fn emit_expr_with_mode(
 
             let mut rust_arms = Vec::new();
             for (pat, arm_body) in parsed_arms {
-                let (rust_pat, bindings) = emit_match_pattern(&pat, scrut_parts.len(), ctors);
-                let emitted_body = emit_expr_with_mode(&arm_body, defs, ctors, mode);
+                let (rust_pat, bindings) = emit_match_pattern(&pat, scrut_parts.len(), ctors)?;
+                let emitted_body = emit_expr_with_mode(&arm_body, defs, ctors, mode)?;
                 if bindings.is_empty() {
                     rust_arms.push(format!("        {rust_pat} => {emitted_body},"));
                 } else {
@@ -1426,7 +1519,10 @@ fn emit_expr_with_mode(
                     ));
                 }
             }
-            return format!("match {rust_scrut} {{\\n{}\\n    }}", rust_arms.join("\\n"));
+            return Ok(format!(
+                "match {rust_scrut} {{\\n{}\\n    }}",
+                rust_arms.join("\\n")
+            ));
         }
     }
 
@@ -1440,25 +1536,25 @@ fn emit_expr_with_mode(
     };
 
     if s == "True{}" {
-        return "true".to_string();
+        return Ok("true".to_string());
     }
     if s == "False{}" {
-        return "false".to_string();
+        return Ok("false".to_string());
     }
     if s == "Unit{}" || s == "()" {
-        return "()".to_string();
+        return Ok("()".to_string());
     }
 
     // Handle conditionals: if cond: then_branch else: else_branch
     if let Some(rest) = s.strip_prefix("if ") {
         if let Some((before_else, after_else)) = split_keyword(rest, " else:") {
             if let Some((cond, then_b)) = split_top_level_once(before_else, ':') {
-                return format!(
+                return Ok(format!(
                     "if {} {{ {} }} else {{ {} }}",
-                    emit_expr_with_mode(cond, defs, ctors, mode),
-                    emit_expr_with_mode(then_b, defs, ctors, mode),
-                    emit_expr_with_mode(after_else, defs, ctors, mode)
-                );
+                    emit_expr_with_mode(cond, defs, ctors, mode)?,
+                    emit_expr_with_mode(then_b, defs, ctors, mode)?,
+                    emit_expr_with_mode(after_else, defs, ctors, mode)?
+                ));
             }
         }
     }
@@ -1468,11 +1564,11 @@ fn emit_expr_with_mode(
         let inner = s[1..s.len() - 1].trim();
         let tuple_parts = split_top_level(inner, ',');
         if tuple_parts.len() >= 2 {
-            let emitted: Vec<String> = tuple_parts
-                .iter()
-                .map(|p| emit_expr_with_mode(p, defs, ctors, mode))
-                .collect();
-            return format!("({})", emitted.join(", "));
+            let mut emitted = Vec::with_capacity(tuple_parts.len());
+            for p in &tuple_parts {
+                emitted.push(emit_expr_with_mode(p, defs, ctors, mode)?);
+            }
+            return Ok(format!("({})", emitted.join(", ")));
         }
         if let Some((term_part, ty_part)) = split_top_level_once(inner, ':') {
             let inner_mode = arith_mode_for_type(ty_part, mode);
@@ -1485,12 +1581,12 @@ fn emit_expr_with_mode(
     if let Some(rest) = s.strip_prefix("let ") {
         if let Some((binding, body)) = split_top_level_once(rest, ';') {
             if let Some((name, val)) = split_top_level_once(binding, '=') {
-                return format!(
+                return Ok(format!(
                     "{{\\n        let {} = {};\\n        {}\\n    }}",
                     clean_let_binding(name),
-                    emit_expr_with_mode(val, defs, ctors, mode),
-                    emit_expr_with_mode(body, defs, ctors, mode)
-                );
+                    emit_expr_with_mode(val, defs, ctors, mode)?,
+                    emit_expr_with_mode(body, defs, ctors, mode)?
+                ));
             }
         }
     }
@@ -1498,32 +1594,32 @@ fn emit_expr_with_mode(
     // Logical and comparison binary operators (lowest to highest precedence)
     for op in ["||", "&&", "==", "!=", "<=", ">=", "<", ">"] {
         if let Some((lhs, rhs)) = split_top_level_str(s, op) {
-            return format!(
+            return Ok(format!(
                 "({} {op} {})",
-                emit_expr_with_mode(lhs, defs, ctors, mode),
-                emit_expr_with_mode(rhs, defs, ctors, mode)
-            );
+                emit_expr_with_mode(lhs, defs, ctors, mode)?,
+                emit_expr_with_mode(rhs, defs, ctors, mode)?
+            ));
         }
     }
 
     // Right-to-left top-level '+' or '-' (saturating for Nat, wrapping for U32/U64/I32/I64)
     if let Some((op, lhs, rhs)) = split_last_additive(s) {
-        let l = emit_expr_with_mode(lhs, defs, ctors, mode);
-        let r = emit_expr_with_mode(rhs, defs, ctors, mode);
-        return match (mode, op) {
+        let l = emit_expr_with_mode(lhs, defs, ctors, mode)?;
+        let r = emit_expr_with_mode(rhs, defs, ctors, mode)?;
+        return Ok(match (mode, op) {
             (ArithMode::Saturating, '+') => format!("({l}).saturating_add({r})"),
             (ArithMode::Saturating, '-') => format!("({l}).saturating_sub({r})"),
             (ArithMode::Wrapping, '+') => format!("({l}).wrapping_add({r})"),
             (ArithMode::Wrapping, '-') => format!("({l}).wrapping_sub({r})"),
             _ => unreachable!(),
-        };
+        });
     }
 
     // Right-to-left top-level '*', '/', '%'
     if let Some((op, lhs, rhs)) = split_last_multiplicative(s) {
-        let l = emit_expr_with_mode(lhs, defs, ctors, mode);
-        let r = emit_expr_with_mode(rhs, defs, ctors, mode);
-        return match (mode, op) {
+        let l = emit_expr_with_mode(lhs, defs, ctors, mode)?;
+        let r = emit_expr_with_mode(rhs, defs, ctors, mode)?;
+        return Ok(match (mode, op) {
             (ArithMode::Saturating, '*') => format!("({l}).saturating_mul({r})"),
             (ArithMode::Wrapping, '*') => format!("({l}).wrapping_mul({r})"),
             (ArithMode::Saturating, '/') => {
@@ -1539,12 +1635,15 @@ fn emit_expr_with_mode(
                 format!("{{ let __a = {l}; let __b = {r}; if __b == 0 {{ 0 }} else {{ __a.wrapping_rem(__b) }} }}")
             }
             _ => unreachable!(),
-        };
+        });
     }
 
     // Unary boolean negation
     if let Some(operand) = s.strip_prefix('!') {
-        return format!("!({})", emit_expr_with_mode(operand, defs, ctors, mode));
+        return Ok(format!(
+            "!({})",
+            emit_expr_with_mode(operand, defs, ctors, mode)?
+        ));
     }
 
     // Real Bend 2 curly-brace ADT constructor: Draft{}, Paid{amt}, OrderState.Paid{10n}
@@ -1554,21 +1653,20 @@ fn emit_expr_with_mode(
             let args_inner = s[open + 1..s.len() - 1].trim();
             let rust_ctor = resolve_ctor_path(callee, ctors);
             if args_inner.is_empty() {
-                return rust_ctor;
+                return Ok(rust_ctor);
             }
-            let emitted_args: Vec<String> = split_top_level(args_inner, ',')
-                .iter()
-                .map(|a| {
-                    let trimmed = a.trim();
-                    let val = if let Some((_, v)) = split_top_level_once(trimmed, ':') {
-                        v
-                    } else {
-                        trimmed
-                    };
-                    emit_expr_with_mode(val, defs, ctors, mode)
-                })
-                .collect();
-            return format!("{rust_ctor}({})", emitted_args.join(", "));
+            let parts = split_top_level(args_inner, ',');
+            let mut emitted_args = Vec::with_capacity(parts.len());
+            for a in parts {
+                let trimmed = a.trim();
+                let val = if let Some((_, v)) = split_top_level_once(trimmed, ':') {
+                    v
+                } else {
+                    trimmed
+                };
+                emitted_args.push(emit_expr_with_mode(val, defs, ctors, mode)?);
+            }
+            return Ok(format!("{rust_ctor}({})", emitted_args.join(", ")));
         }
     }
 
@@ -1584,21 +1682,21 @@ fn emit_expr_with_mode(
             };
 
             // Built-in Bend 2.0.40 Base stdlib helpers (Nat.*, Bool.*, Pair.*) -> zero-overhead Rust
-            if let Some(builtin) = emit_base_builtin(callee, &raw_args, defs, ctors, mode) {
-                return builtin;
+            if let Some(builtin) = emit_base_builtin(callee, &raw_args, defs, ctors, mode)? {
+                return Ok(builtin);
             }
 
             if let Some(info) = ctors.get(callee) {
-                let emitted_args: Vec<String> = raw_args
-                    .iter()
-                    .map(|a| emit_expr_with_mode(a, defs, ctors, mode))
-                    .collect();
-                return format!(
+                let mut emitted_args = Vec::with_capacity(raw_args.len());
+                for a in &raw_args {
+                    emitted_args.push(emit_expr_with_mode(a, defs, ctors, mode)?);
+                }
+                return Ok(format!(
                     "{}::{}({})",
                     info.type_name,
                     info.variant_name,
                     emitted_args.join(", ")
-                );
+                ));
             }
 
             let mut emitted_args = Vec::new();
@@ -1611,27 +1709,31 @@ fn emit_expr_with_mode(
                         }
                     }
                 }
-                emitted_args.push(emit_expr_with_mode(arg, defs, ctors, mode));
+                emitted_args.push(emit_expr_with_mode(arg, defs, ctors, mode)?);
             }
-            return format!("{}({})", callee.replace('.', "::"), emitted_args.join(", "));
+            return Ok(format!(
+                "{}({})",
+                callee.replace('.', "::"),
+                emitted_args.join(", ")
+            ));
         }
     }
 
     // Natural number literals (0n, 42n)
     if let Some(digits) = s.strip_suffix('n') {
         if !digits.is_empty() && digits.chars().all(|c| c.is_ascii_digit()) {
-            return format!("{digits}_u64");
+            return Ok(format!("{digits}_u64"));
         }
     }
 
     // Unit ADT constructor (e.g. OrderState.Draft or Draft)
     if let Some(info) = ctors.get(s) {
         if info.arity == 0 {
-            return format!("{}::{}", info.type_name, info.variant_name);
+            return Ok(format!("{}::{}", info.type_name, info.variant_name));
         }
     }
 
-    s.replace('.', "::")
+    Ok(s.replace('.', "::"))
 }
 
 fn emit_base_builtin(
@@ -1640,135 +1742,135 @@ fn emit_base_builtin(
     defs: &HashMap<String, &Def>,
     ctors: &HashMap<String, CtorInfo>,
     mode: ArithMode,
-) -> Option<String> {
+) -> Result<Option<String>, String> {
     let e = |a: &str, m: ArithMode| emit_expr_with_mode(a, defs, ctors, m);
-    match (callee, raw_args.len()) {
+    Ok(match (callee, raw_args.len()) {
         // Unary Bool / Nat / Pair helpers
-        ("Bool.not", 1) => Some(format!("(!({}))", e(raw_args[0], mode))),
-        ("Nat.is_zero", 1) => Some(format!("(({}) == 0_u64)", e(raw_args[0], ArithMode::Saturating))),
-        ("Nat.succ", 1) => Some(format!("({}).saturating_add(1_u64)", e(raw_args[0], ArithMode::Saturating))),
-        ("Nat.pred", 1) => Some(format!("({}).saturating_sub(1_u64)", e(raw_args[0], ArithMode::Saturating))),
-        ("Pair.fst", 1) => Some(format!("({}).0", e(raw_args[0], mode))),
-        ("Pair.snd", 1) => Some(format!("({}).1", e(raw_args[0], mode))),
+        ("Bool.not", 1) => Some(format!("(!({}))", e(raw_args[0], mode)?)),
+        ("Nat.is_zero", 1) => Some(format!("(({}) == 0_u64)", e(raw_args[0], ArithMode::Saturating)?)),
+        ("Nat.succ", 1) => Some(format!("({}).saturating_add(1_u64)", e(raw_args[0], ArithMode::Saturating)?)),
+        ("Nat.pred", 1) => Some(format!("({}).saturating_sub(1_u64)", e(raw_args[0], ArithMode::Saturating)?)),
+        ("Pair.fst", 1) => Some(format!("({}).0", e(raw_args[0], mode)?)),
+        ("Pair.snd", 1) => Some(format!("({}).1", e(raw_args[0], mode)?)),
 
         // Binary Nat arithmetic (saturating u64 + total div/mod matching Bend 2 base.bend)
         ("Nat.add", 2) => Some(format!(
             "({}).saturating_add({})",
-            e(raw_args[0], ArithMode::Saturating),
-            e(raw_args[1], ArithMode::Saturating)
+            e(raw_args[0], ArithMode::Saturating)?,
+            e(raw_args[1], ArithMode::Saturating)?
         )),
         ("Nat.sub", 2) => Some(format!(
             "({}).saturating_sub({})",
-            e(raw_args[0], ArithMode::Saturating),
-            e(raw_args[1], ArithMode::Saturating)
+            e(raw_args[0], ArithMode::Saturating)?,
+            e(raw_args[1], ArithMode::Saturating)?
         )),
         ("Nat.mul", 2) => Some(format!(
             "({}).saturating_mul({})",
-            e(raw_args[0], ArithMode::Saturating),
-            e(raw_args[1], ArithMode::Saturating)
+            e(raw_args[0], ArithMode::Saturating)?,
+            e(raw_args[1], ArithMode::Saturating)?
         )),
         ("Nat.div", 2) => Some(format!(
             "{{ let __a = {}; let __b = {}; if __b == 0_u64 {{ 0_u64 }} else {{ __a / __b }} }}",
-            e(raw_args[0], ArithMode::Saturating),
-            e(raw_args[1], ArithMode::Saturating)
+            e(raw_args[0], ArithMode::Saturating)?,
+            e(raw_args[1], ArithMode::Saturating)?
         )),
         ("Nat.mod", 2) => Some(format!(
             "{{ let __a = {}; let __b = {}; if __b == 0_u64 {{ __a }} else {{ __a % __b }} }}",
-            e(raw_args[0], ArithMode::Saturating),
-            e(raw_args[1], ArithMode::Saturating)
+            e(raw_args[0], ArithMode::Saturating)?,
+            e(raw_args[1], ArithMode::Saturating)?
         )),
         ("Nat.divmod", 2) => Some(format!(
             "{{ let __a = {}; let __b = {}; if __b == 0_u64 {{ (0_u64, __a) }} else {{ (__a / __b, __a % __b) }} }}",
-            e(raw_args[0], ArithMode::Saturating),
-            e(raw_args[1], ArithMode::Saturating)
+            e(raw_args[0], ArithMode::Saturating)?,
+            e(raw_args[1], ArithMode::Saturating)?
         )),
         ("Nat.min", 2) => Some(format!(
             "({}).min({})",
-            e(raw_args[0], ArithMode::Saturating),
-            e(raw_args[1], ArithMode::Saturating)
+            e(raw_args[0], ArithMode::Saturating)?,
+            e(raw_args[1], ArithMode::Saturating)?
         )),
         ("Nat.max", 2) => Some(format!(
             "({}).max({})",
-            e(raw_args[0], ArithMode::Saturating),
-            e(raw_args[1], ArithMode::Saturating)
+            e(raw_args[0], ArithMode::Saturating)?,
+            e(raw_args[1], ArithMode::Saturating)?
         )),
 
         // Binary Nat comparisons
         ("Nat.is_le" | "Nat.le" | "Nat.lte", 2) => Some(format!(
             "(({}) <= ({}))",
-            e(raw_args[0], ArithMode::Saturating),
-            e(raw_args[1], ArithMode::Saturating)
+            e(raw_args[0], ArithMode::Saturating)?,
+            e(raw_args[1], ArithMode::Saturating)?
         )),
         ("Nat.is_lt" | "Nat.lt", 2) => Some(format!(
             "(({}) < ({}))",
-            e(raw_args[0], ArithMode::Saturating),
-            e(raw_args[1], ArithMode::Saturating)
+            e(raw_args[0], ArithMode::Saturating)?,
+            e(raw_args[1], ArithMode::Saturating)?
         )),
         ("Nat.is_ge" | "Nat.ge" | "Nat.gte", 2) => Some(format!(
             "(({}) >= ({}))",
-            e(raw_args[0], ArithMode::Saturating),
-            e(raw_args[1], ArithMode::Saturating)
+            e(raw_args[0], ArithMode::Saturating)?,
+            e(raw_args[1], ArithMode::Saturating)?
         )),
         ("Nat.is_gt" | "Nat.gt", 2) => Some(format!(
             "(({}) > ({}))",
-            e(raw_args[0], ArithMode::Saturating),
-            e(raw_args[1], ArithMode::Saturating)
+            e(raw_args[0], ArithMode::Saturating)?,
+            e(raw_args[1], ArithMode::Saturating)?
         )),
         ("Nat.is_eq" | "Nat.eq" | "Nat.equal", 2) => Some(format!(
             "(({}) == ({}))",
-            e(raw_args[0], ArithMode::Saturating),
-            e(raw_args[1], ArithMode::Saturating)
+            e(raw_args[0], ArithMode::Saturating)?,
+            e(raw_args[1], ArithMode::Saturating)?
         )),
         ("Nat.is_ne" | "Nat.ne", 2) => Some(format!(
             "(({}) != ({}))",
-            e(raw_args[0], ArithMode::Saturating),
-            e(raw_args[1], ArithMode::Saturating)
+            e(raw_args[0], ArithMode::Saturating)?,
+            e(raw_args[1], ArithMode::Saturating)?
         )),
 
         // Binary Bool logic
         ("Bool.and", 2) => Some(format!(
             "(({}) && ({}))",
-            e(raw_args[0], mode),
-            e(raw_args[1], mode)
+            e(raw_args[0], mode)?,
+            e(raw_args[1], mode)?
         )),
         ("Bool.or", 2) => Some(format!(
             "(({}) || ({}))",
-            e(raw_args[0], mode),
-            e(raw_args[1], mode)
+            e(raw_args[0], mode)?,
+            e(raw_args[1], mode)?
         )),
         ("Bool.xor", 2) => Some(format!(
             "(({}) ^ ({}))",
-            e(raw_args[0], mode),
-            e(raw_args[1], mode)
+            e(raw_args[0], mode)?,
+            e(raw_args[1], mode)?
         )),
         ("Bool.is_eq" | "Bool.eq", 2) => Some(format!(
             "(({}) == ({}))",
-            e(raw_args[0], mode),
-            e(raw_args[1], mode)
+            e(raw_args[0], mode)?,
+            e(raw_args[1], mode)?
         )),
         ("Bool.is_ne" | "Bool.ne", 2) => Some(format!(
             "(({}) != ({}))",
-            e(raw_args[0], mode),
-            e(raw_args[1], mode)
+            e(raw_args[0], mode)?,
+            e(raw_args[1], mode)?
         )),
 
         // Polymorphic Pair / Bool.pick helpers (with or without erased type args)
-        ("Pair.fst", 3) => Some(format!("({}).0", e(raw_args[2], mode))),
-        ("Pair.snd", 3) => Some(format!("({}).1", e(raw_args[2], mode))),
+        ("Pair.fst", 3) => Some(format!("({}).0", e(raw_args[2], mode)?)),
+        ("Pair.snd", 3) => Some(format!("({}).1", e(raw_args[2], mode)?)),
         ("Bool.pick", 3) => Some(format!(
             "if {} {{ {} }} else {{ {} }}",
-            e(raw_args[0], mode),
-            e(raw_args[1], mode),
-            e(raw_args[2], mode)
+            e(raw_args[0], mode)?,
+            e(raw_args[1], mode)?,
+            e(raw_args[2], mode)?
         )),
         ("Bool.pick", 4) => Some(format!(
             "if {} {{ {} }} else {{ {} }}",
-            e(raw_args[1], mode),
-            e(raw_args[2], mode),
-            e(raw_args[3], mode)
+            e(raw_args[1], mode)?,
+            e(raw_args[2], mode)?,
+            e(raw_args[3], mode)?
         )),
         _ => None,
-    }
+    })
 }
 
 fn split_case_arms(arms_str: &str) -> Vec<String> {
@@ -2325,7 +2427,157 @@ def one_liner(n: Nat) -> Nat: Nat.add(n, 1n)
         assert!(!summary.rust_source.contains("add_zero_eq"));
         assert!(summary
             .rust_source
-            .contains("#[allow(unused_variables, unused_parens)]"));
+            .contains("#[allow(unused_variables, unused_parens, clippy::let_and_return)]"));
+    }
+
+    #[test]
+    fn lowers_nested_successor_patterns_and_rejects_unsupported_patterns() {
+        let src = r#"
+import Base
+
+type Box is Data:
+  Wrap{x: Nat}
+
+def minus_two(n: Nat) -> Nat:
+  match n:
+    case 0n:
+      0n
+    case 1n:
+      0n
+    case 1n+1n+q:
+      q
+
+def px_net_span_match(a: Nat, b: Nat, span: Nat) -> Bool:
+  match span:
+    case 0n:
+      True{}
+    case 1n:
+      Nat.is_eq(a, b)
+    case 1n+1n+q:
+      Nat.is_le(a, Nat.add(b, 1n+1n+q))
+
+def nested_const_and_three(n: Nat) -> Nat:
+  match n:
+    case 0n:
+      0n
+    case 1n+1n+0n:
+      10n
+    case 2n+1n+q:
+      q
+
+def nested_data_binder(+m: Nat) -> Nat:
+  match m:
+    case 0n: 0n
+    case 1n: 0n
+    case 1n+1n++q: Nat.add(q, q)
+
+def nested_in_box(b: Box) -> Nat:
+  match b:
+    case Wrap{0n}: 0n
+    case Wrap{1n}: 0n
+    case Wrap{1n+1n+1n+_}: 42n
+
+def nested_multi(x: Nat, y: Nat) -> Nat:
+  match x y:
+    case 0n _: 0n
+    case 1n _: 0n
+    case 1n+1n+q 1n+p: Nat.add(q, p)
+"#;
+        let summary = emit_verified_rust(src, 0).expect("nested successor patterns should emit");
+        assert!(summary
+            .rust_source
+            .contains("__rb_n0 @ 2_u64..=u64::MAX => { let q = __rb_n0 - 2_u64; q }"));
+        assert!(summary.rust_source.contains("2_u64 => 10_u64,"));
+        assert!(summary
+            .rust_source
+            .contains("__rb_n0 @ 3_u64..=u64::MAX => { let q = __rb_n0 - 3_u64; q }"));
+        assert!(summary
+            .rust_source
+            .contains("Box::Wrap(3_u64..=u64::MAX) => 42_u64,"));
+        assert!(summary.rust_source.contains("(__rb_n0 @ 2_u64..=u64::MAX, __rb_n1 @ 1_u64..=u64::MAX) => { let q = __rb_n0 - 2_u64; let p = __rb_n1 - 1_u64;"));
+        assert!(!summary.rust_source.contains("1n+1n+q"));
+
+        // Unsupported patterns must fail cleanly with E_EMIT_UNSUPPORTED_PATTERN instead of emitting unparseable Rust.
+        let bad_add = "def bad(n: Nat) -> Nat:\\n  match n:\\n    case a+b: a\\n";
+        let err = emit_verified_rust(bad_add, 0).expect_err("a+b pattern must be rejected");
+        assert!(err.contains("E_EMIT_UNSUPPORTED_PATTERN"), "got: {err}");
+
+        let bad_tail = "def bad2(n: Nat) -> Nat:\\n  match n:\\n    case 1n+Foo{}: 0n\\n";
+        let err2 = emit_verified_rust(bad_tail, 0).expect_err("1n+Foo{} pattern must be rejected");
+        assert!(err2.contains("E_EMIT_UNSUPPORTED_PATTERN"), "got: {err2}");
+    }
+
+    #[test]
+    fn differential_nested_successor_matches_bend_and_compiles_with_rustc() {
+        let bend_src = r#"import Base
+
+def minus_two(n: Nat) -> Nat:
+  match n:
+    case 0n:
+      0n
+    case 1n:
+      0n
+    case 1n+1n+q:
+      q
+
+def px_net_span_match(a: Nat, b: Nat, span: Nat) -> Bool:
+  match span:
+    case 0n:
+      True{}
+    case 1n:
+      Nat.is_eq(a, b)
+    case 1n+1n+q:
+      Nat.is_le(a, Nat.add(b, 1n+1n+q))
+"#;
+        let dir = std::env::temp_dir().join(format!("rb_nested_succ_diff_{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let bend_path = dir.join("nested.bend");
+        std::fs::write(&bend_path, bend_src).unwrap();
+
+        let bend_bin = crate::resolve_bend_bin(
+            std::env::var("BEND_BIN").ok(),
+            std::env::var_os("PATH"),
+            std::env::var_os("HOME").map(std::path::PathBuf::from),
+        );
+        if let Ok(out) = std::process::Command::new(&bend_bin)
+            .arg(&bend_path)
+            .arg("--check-only")
+            .output()
+        {
+            assert!(
+                out.status.success(),
+                "bend --check-only failed: {}{}",
+                String::from_utf8_lossy(&out.stdout),
+                String::from_utf8_lossy(&out.stderr)
+            );
+        }
+
+        let summary = emit_verified_rust(bend_src, 0).expect("emit nested succ");
+        let rs_path = dir.join("test.rs");
+        let bin_path = dir.join("test_bin");
+        let harness = format!(
+            "{}\\nfn main() {{\\n    assert_eq!(minus_two(0), 0);\\n    assert_eq!(minus_two(1), 0);\\n    assert_eq!(minus_two(2), 0);\\n    assert_eq!(minus_two(5), 3);\\n    assert!(px_net_span_match(10, 20, 0));\\n    assert!(px_net_span_match(7, 7, 1));\\n    assert!(!px_net_span_match(7, 8, 1));\\n    assert!(px_net_span_match(5, 3, 2));\\n    assert!(!px_net_span_match(10, 3, 2));\\n}}\\n",
+            summary.rust_source
+        );
+        std::fs::write(&rs_path, harness).unwrap();
+        let rustc = std::env::var("RUSTC").unwrap_or_else(|_| "rustc".to_string());
+        let compile = std::process::Command::new(&rustc)
+            .args(["--edition", "2021", "-o"])
+            .arg(&bin_path)
+            .arg(&rs_path)
+            .output()
+            .expect("rustc must run");
+        assert!(
+            compile.status.success(),
+            "rustc failed: {}",
+            String::from_utf8_lossy(&compile.stderr)
+        );
+        let run = std::process::Command::new(&bin_path)
+            .output()
+            .expect("run compiled binary");
+        assert!(run.status.success(), "runtime assertions failed");
+        let _ = std::fs::remove_dir_all(&dir);
     }
 }
 `;
@@ -2984,6 +3236,15 @@ type OrderState is Data:
 def deposit(bal: Nat, amt: Nat) -> Nat:
   Nat.add(bal, amt)
 
+def minus_two(n: Nat) -> Nat:
+  match n:
+    case 0n:
+      0n
+    case 1n:
+      0n
+    case 1n+1n+q:
+      q
+
 # Multi-line parameter lists are valid Bend 2 and emit like single-line headers.
 def can_reuse_prefix(
   +snap_pos: Nat,
@@ -3061,11 +3322,15 @@ fn main() {
 
 #[cfg(test)]
 mod tests {
-    use super::verified::{can_reuse_prefix, cancel_order, deposit, OrderState};
+    use super::verified::{can_reuse_prefix, cancel_order, deposit, minus_two, OrderState};
 
     #[test]
     fn verified_module_runs_with_zero_runtime_proof_overhead() {
         assert_eq!(deposit(100, 25), 125);
+        assert_eq!(minus_two(0), 0);
+        assert_eq!(minus_two(1), 0);
+        assert_eq!(minus_two(2), 0);
+        assert_eq!(minus_two(5), 3);
         assert_eq!(cancel_order(OrderState::Paid(50)), OrderState::Cancelled);
         assert!(can_reuse_prefix(4, 8, 16));
         assert!(!can_reuse_prefix(9, 8, 16));

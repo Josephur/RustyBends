@@ -18,11 +18,15 @@ fn main() {
 
 #[cfg(test)]
 mod tests {
-    use super::verified::{can_reuse_prefix, cancel_order, deposit, OrderState};
+    use super::verified::{can_reuse_prefix, cancel_order, deposit, minus_two, OrderState};
 
     #[test]
     fn verified_module_runs_with_zero_runtime_proof_overhead() {
         assert_eq!(deposit(100, 25), 125);
+        assert_eq!(minus_two(0), 0);
+        assert_eq!(minus_two(1), 0);
+        assert_eq!(minus_two(2), 0);
+        assert_eq!(minus_two(5), 3);
         assert_eq!(cancel_order(OrderState::Paid(50)), OrderState::Cancelled);
         assert!(can_reuse_prefix(4, 8, 16));
         assert!(!can_reuse_prefix(9, 8, 16));
