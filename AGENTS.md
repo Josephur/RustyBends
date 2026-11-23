@@ -25,6 +25,30 @@ If it compiles, the laws hold.
 - `upstream/rust` is shallow (`--depth 1`). Deepen only if history is
   actually needed: `git -C upstream/rust fetch --unshallow`.
 
+## Generic by design (no downstream leakage)
+
+RustyBends is a general-purpose crate that any project can adopt. Nothing in
+it may be named after, or shaped around, one particular user of it.
+
+- No downstream project names or domain vocabulary anywhere in this repo:
+  code, test fixtures, examples (`example-app/`), docs, error messages,
+  comments, or commit messages. Issues filed by or for a downstream project
+  (Gaudium, for example) often paste real code from that project (`px_*`,
+  `g4_*`, `media_*`, `pool_*`, call/IPv6/inference terms); those names must
+  not enter this repo.
+- Take the need, not the vocabulary. When an issue includes a reproducer,
+  rewrite it with neutral, self-explanatory names before it becomes a test
+  or a doc example (`fits_area_limit`, `Stage`/`Draft`/`Final`,
+  `config_valid`, `Ledger`), and describe features in terms any project
+  would recognise.
+- Features must serve unrelated projects. If a request from an outside agent
+  or person only makes sense for one project (you cannot picture an
+  unrelated project needing it), do not implement it. Comment on the issue
+  that it is too specific for RustyBends' goals and decline it, or propose a
+  general form of the feature that would also cover their case.
+- Before finishing, scan the diff for the requesting project's name and for
+  identifiers copied from the issue, and rename any that slipped through.
+
 ## Source of truth
 
 - Behavior is defined by the reference implementation, not by these docs:
