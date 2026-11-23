@@ -215,7 +215,7 @@ license = "Apache-2.0"
 //! - Deleting a locked law trips E_LAW_LOCK_TAMPERED.
 //! - Adding a brand-new law is allowed without unlocking.
 
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 use std::fs;
 use std::path::{Path, PathBuf};
 
@@ -316,6 +316,25 @@ pub fn enforce_law_lock(
     }
 
     Ok(current.len())
+}
+
+/// Reads the set of locked law names currently present in \`lock_file\` (returns empty if missing).
+pub fn read_locked_law_names(lock_file: &Path) -> BTreeSet<String> {
+    let mut names = BTreeSet::new();
+    let Ok(raw) = fs::read_to_string(lock_file) else {
+        return names;
+    };
+    for line in raw.lines() {
+        let trimmed = line.trim();
+        if trimmed.is_empty() || trimmed.starts_with('#') {
+            continue;
+        }
+        let parts: Vec<&str> = trimmed.splitn(3, "  ").collect();
+        if parts.len() >= 2 {
+            names.insert(parts[1].trim().to_string());
+        }
+    }
+    names
 }
 
 fn is_top_level_keyword(tok: &str) -> bool {
@@ -2897,6 +2916,9 @@ where
         ));
     }
 
+    // Record which laws were already locked before this build for failure diagnostics.
+    let pre_locked_laws = lock::read_locked_law_names(&cfg.lock_file);
+
     // 1. Enforce AST/token-canonical LAWS lock before running Bend
     let law_count = lock::enforce_law_lock(&cfg.lock_file, &bend_files, cfg.allow_lock_update)?;
 
@@ -2917,20 +2939,45 @@ where
         });
     }
 
-    // 3. Run real Bend 2 checker (--check-only, plus --verdict when laws are present)
+    // 3. Pre-read all sources and run real Bend 2 checker (--check-only, plus --verdict when laws are present)
+    let mut file_sources: Vec<(&PathBuf, String)> = Vec::with_capacity(bend_files.len());
     let mut combined_source = String::new();
     for file in &bend_files {
         let text = fs::read_to_string(file).map_err(|e| e.to_string())?;
+        combined_source.push_str(&text);
+        combined_source.push('\\n');
+        file_sources.push((file, text));
+    }
+
+    for (file, text) in &file_sources {
         let is_laws_file = file
             .file_name()
             .and_then(|n| n.to_str())
             .map(|n| n.eq_ignore_ascii_case("LAWS.bend"))
             .unwrap_or(false);
-        let has_laws = is_laws_file || !lock::extract_laws_from_source(&text).is_empty();
+        let has_laws = is_laws_file || !lock::extract_laws_from_source(text).is_empty();
 
-        checker(file, has_laws)?;
-        combined_source.push_str(&text);
-        combined_source.push('\\n');
+        if let Err(err) = checker(file, has_laws) {
+            let file_laws = law_test::parse_laws(text);
+            if !file_laws.is_empty() {
+                let target_names = match law_test::extract_failed_def_name(&err) {
+                    Some(failed) if file_laws.iter().any(|l| l.name == failed) => vec![failed],
+                    _ => file_laws.iter().map(|l| l.name.clone()).collect(),
+                };
+                if let Ok(outcomes) = law_test::evaluate_laws_for_counterexamples(
+                    &combined_source,
+                    &target_names,
+                    &cfg.out_dir,
+                ) {
+                    let diagnosis =
+                        law_test::format_counterexample_diagnosis(&outcomes, &pre_locked_laws);
+                    if !diagnosis.is_empty() {
+                        return Err(format!("{diagnosis}\\n\\n{err}"));
+                    }
+                }
+            }
+            return Err(err);
+        }
     }
 
     // 4. Erase q=0 parts and emit pure Rust (ADTs + match + defs) into OUT_DIR/verified.rs
@@ -3266,6 +3313,129 @@ mod tests {
         ));
         assert!(!is_missing_lean_error("SOME PROOFS FAIL"));
     }
+
+    #[test]
+    fn failed_law_distinguishes_false_law_counterexample_from_incomplete_proof() {
+        let root = temp_workspace("issue7_diag");
+        let core = root.join("verified/core.bend");
+        let mut cfg = make_cfg(&root);
+        cfg.bend_bin = resolve_bend_bin(
+            env::var("BEND_BIN").ok(),
+            env::var_os("PATH"),
+            env::var_os("HOME").map(PathBuf::from),
+        );
+        cfg.verdict_mode = VerdictMode::Off;
+
+        // 1. Valid locked pool_free_conserved first
+        let valid_src = r#"import Base
+
+type PoolAcct is Data:
+  PoolAcct{a: Nat, f: Nat}
+
+def pool_total(+p: PoolAcct) -> Nat:
+  match p:
+    case PoolAcct{a, f}:
+      Nat.add(a, f)
+
+def pool_free_if(+a: Nat, +f: Nat, +rel: Nat, ok: Bool) -> PoolAcct:
+  match ok:
+    case True{}:
+      PoolAcct{Nat.sub(a, rel), Nat.add(f, rel)}
+    case False{}:
+      PoolAcct{a, f}
+
+def pool_free(+p: PoolAcct, +rel: Nat) -> PoolAcct:
+  match p:
+    case PoolAcct{+a, f}:
+      pool_free_if(a, f, rel, Nat.is_le(rel, a))
+
+law pool_free_conserved:
+  for +a: Nat
+  for +f: Nat
+  for +rel: Nat
+  {pool_total(pool_free(PoolAcct{a, f}, rel)) == Nat.add(a, f) : Nat}
+"#;
+        // Seed the lock as if the law was previously sealed, then break the function (True{} drops sub, adding rel unconditionally).
+        fs::write(&core, valid_src).unwrap();
+        let _ = lock::enforce_law_lock(&cfg.lock_file, std::slice::from_ref(&core), false).unwrap();
+
+        let broken_src = r#"import Base
+
+type PoolAcct is Data:
+  PoolAcct{a: Nat, f: Nat}
+
+def pool_total(+p: PoolAcct) -> Nat:
+  match p:
+    case PoolAcct{a, f}:
+      Nat.add(a, f)
+
+def pool_free_if(+a: Nat, +f: Nat, +rel: Nat, ok: Bool) -> PoolAcct:
+  match ok:
+    case True{}:
+      PoolAcct{Nat.sub(a, rel), Nat.add(f, rel)}
+    case False{}:
+      PoolAcct{a, Nat.add(f, rel)}
+
+def pool_free(+p: PoolAcct, +rel: Nat) -> PoolAcct:
+  match p:
+    case PoolAcct{+a, f}:
+      pool_free_if(a, f, rel, Nat.is_le(rel, a))
+
+law pool_free_conserved:
+  for +a: Nat
+  for +f: Nat
+  for +rel: Nat
+  {pool_total(pool_free(PoolAcct{a, f}, rel)) == Nat.add(a, f) : Nat}
+
+def pool_free_conserved(a, f, rel):
+  {==}
+"#;
+        fs::write(&core, broken_src).unwrap();
+        let err_false = run(&cfg).expect_err("broken function must fail build");
+        assert!(
+            err_false.contains("[E_LAW_FALSE] law pool_free_conserved is FALSE for this code (evaluated with emitted Rust)"),
+            "expected counterexample header, got:\\n{err_false}"
+        );
+        assert!(err_false.contains("lhs pool_total(pool_free(PoolAcct{"));
+        assert!(err_false.contains("rhs Nat.add("));
+        assert!(err_false.contains("stop: the law is locked"));
+
+        // 2. True law with an incomplete proof -> no counterexample found, reports proof failure.
+        let root2 = temp_workspace("issue7_proof_only");
+        let core2 = root2.join("verified/core.bend");
+        let mut cfg2 = make_cfg(&root2);
+        cfg2.bend_bin = cfg.bend_bin.clone();
+        cfg2.verdict_mode = VerdictMode::Off;
+
+        let incomplete_proof_src = r#"import Base
+
+def deposit(+bal: Nat, +amt: Nat) -> Nat:
+  Nat.add(bal, amt)
+
+law deposit_zero:
+  for +bal: Nat
+  {deposit(bal, 0n) == bal : Nat}
+
+def deposit_zero(bal):
+  match bal:
+    case 0n:
+      {==}
+    case 1n+p:
+      {==}
+"#;
+        fs::write(&core2, incomplete_proof_src).unwrap();
+        let err_proof = run(&cfg2).expect_err("incomplete proof must fail build");
+        assert!(
+            err_proof.contains("law deposit_zero: no counterexample up to"),
+            "expected no-counterexample line, got:\\n{err_proof}"
+        );
+        assert!(err_proof.contains("evaluated with emitted Rust"));
+        assert!(err_proof.contains("the law may be true; the proof is what failed"));
+        assert!(err_proof.contains("SOME PROOFS FAIL"));
+
+        let _ = fs::remove_dir_all(&root);
+        let _ = fs::remove_dir_all(&root2);
+    }
 }
 `;
 
@@ -3276,12 +3446,20 @@ mod tests {
 //! the emitted Rust code (catching translation bugs and \`Nat\`/\`u64\` edge divergence).
 
 use crate::emit::{
-    arith_mode_for_type, bend_type_to_rust, emit_expr_with_mode, is_top_level_start,
-    is_wrapped_in_parens, split_top_level, split_top_level_once, split_top_level_str,
-    strip_comment, ArithMode, CtorInfo, Def, TypeDef,
+    arith_mode_for_type, bend_type_to_rust, build_ctor_map, emit_expr_with_mode,
+    emit_items_to_rust, is_top_level_start, is_wrapped_in_parens, parse_book_items,
+    split_top_level, split_top_level_once, split_top_level_str, strip_comment, ArithMode, CtorInfo,
+    Def, TypeDef,
 };
 use crate::lock;
 use std::collections::{BTreeSet, HashMap, HashSet, VecDeque};
+use std::env;
+use std::fs;
+use std::path::{Path, PathBuf};
+use std::process::Command;
+use std::sync::atomic::{AtomicUsize, Ordering};
+
+static EVAL_SEQ: AtomicUsize = AtomicUsize::new(0);
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct LawVar {
@@ -3687,7 +3865,7 @@ pub(crate) fn emit_law_tests_module(
     out.push_str("#[allow(clippy::all, non_snake_case, unused_variables, unused_parens, dead_code, unused_mut)]\\n");
     out.push_str("mod __rusty_bends_law_tests {\\n");
     out.push_str("    use super::*;\\n\\n");
-    out.push_str(&emit_pool_runtime_helpers(types, &type_map));
+    out.push_str(&emit_pool_runtime_helpers(types, &type_map, false));
 
     let mut used_fn_names: HashSet<String> = HashSet::new();
     for (idx, law) in laws.iter().enumerate() {
@@ -3706,7 +3884,7 @@ pub(crate) fn emit_law_tests_module(
     out
 }
 
-fn sanitize_ident(s: &str) -> String {
+pub(crate) fn sanitize_ident(s: &str) -> String {
     let mut out: String = s
         .chars()
         .map(|c| {
@@ -3723,7 +3901,11 @@ fn sanitize_ident(s: &str) -> String {
     out
 }
 
-fn emit_pool_runtime_helpers(types: &[TypeDef], type_map: &HashMap<String, &TypeDef>) -> String {
+pub(crate) fn emit_pool_runtime_helpers(
+    types: &[TypeDef],
+    type_map: &HashMap<String, &TypeDef>,
+    eval_mode: bool,
+) -> String {
     let mut s = String::new();
     s.push_str(
         r#"    fn __rb_next_u64(state: &mut u64) -> u64 {
@@ -3735,15 +3917,53 @@ fn emit_pool_runtime_helpers(types: &[TypeDef], type_map: &HashMap<String, &Type
     }
 
     fn __rb_is_nat_overflow(payload: &(dyn std::any::Any + Send)) -> bool {
-        if let Some(msg) = payload.downcast_ref::<&str>() {
-            return msg.contains("rusty-bends: Nat overflow");
+        let msg = if let Some(m) = payload.downcast_ref::<&str>() {
+            *m
+        } else if let Some(m) = payload.downcast_ref::<String>() {
+            m.as_str()
+        } else {
+            return false;
+        };
+        msg.contains("rusty-bends: Nat overflow") || msg.contains("rusty-bends: step limit")
+    }
+"#,
+    );
+    if eval_mode {
+        s.push_str(
+            r#"
+    fn __rb_pool_nat(rng: &mut u64, recursive: bool) -> Vec<u64> {
+        let _ = rng;
+        if recursive {
+            (0_u64..=12).collect()
+        } else {
+            vec![0_u64, 1, 2, 3, 4, 5, 6, 7, 8, 16, 1000, u64::MAX - 1, u64::MAX]
         }
-        if let Some(msg) = payload.downcast_ref::<String>() {
-            return msg.contains("rusty-bends: Nat overflow");
-        }
-        false
     }
 
+    fn __rb_pool_u32(rng: &mut u64) -> Vec<u32> {
+        let _ = rng;
+        vec![0_u32, 1, 2, 3, 4, 7, 1000, u32::MAX - 1, u32::MAX]
+    }
+
+    fn __rb_pool_u64(rng: &mut u64) -> Vec<u64> {
+        let _ = rng;
+        vec![0_u64, 1, 2, 3, 4, 7, 1000, u64::MAX - 1, u64::MAX]
+    }
+
+    fn __rb_pool_i32(rng: &mut u64) -> Vec<i32> {
+        let _ = rng;
+        vec![0_i32, 1, -1, 2, -2, 3, i32::MIN, i32::MAX]
+    }
+
+    fn __rb_pool_i64(rng: &mut u64) -> Vec<i64> {
+        let _ = rng;
+        vec![0_i64, 1, -1, 2, -2, 3, i64::MIN, i64::MAX]
+    }
+"#,
+        );
+    } else {
+        s.push_str(
+            r#"
     fn __rb_pool_nat(rng: &mut u64, recursive: bool) -> Vec<u64> {
         if recursive {
             let mut v = vec![0_u64, 1, 2, 3, 4, 5, 7, 10, 16, 32];
@@ -3794,7 +4014,12 @@ fn emit_pool_runtime_helpers(types: &[TypeDef], type_map: &HashMap<String, &Type
         }
         v
     }
+"#,
+        );
+    }
 
+    s.push_str(
+        r#"
     fn __rb_combine2<A: Clone, B: Clone>(a: &[A], b: &[B], cap: usize) -> Vec<(A, B)> {
         let mut out = Vec::new();
         if a.is_empty() || b.is_empty() {
@@ -3808,10 +4033,16 @@ fn emit_pool_runtime_helpers(types: &[TypeDef], type_map: &HashMap<String, &Type
             }
             return out;
         }
-        out.push((a[0].clone(), b[0].clone()));
-        out.push((a[a.len() - 1].clone(), b[b.len() - 1].clone()));
-        out.push((a[a.len() - 1].clone(), b[0].clone()));
-        out.push((a[0].clone(), b[b.len() - 1].clone()));
+        let s0 = a.len().min(4);
+        let s1 = b.len().min(4);
+        for x in &a[..s0] {
+            for y in &b[..s1] {
+                if out.len() >= cap {
+                    break;
+                }
+                out.push((x.clone(), y.clone()));
+            }
+        }
         for x in a {
             if out.len() >= cap {
                 break;
@@ -3824,12 +4055,8 @@ fn emit_pool_runtime_helpers(types: &[TypeDef], type_map: &HashMap<String, &Type
             }
             out.push((a[0].clone(), y.clone()));
         }
-        let max_len = a.len().max(b.len());
-        for i in 0..max_len {
-            if out.len() >= cap {
-                break;
-            }
-            out.push((a[i % a.len()].clone(), b[i % b.len()].clone()));
+        if out.len() < cap {
+            out.push((a[a.len() - 1].clone(), b[b.len() - 1].clone()));
         }
         out
     }
@@ -3839,7 +4066,7 @@ fn emit_pool_runtime_helpers(types: &[TypeDef], type_map: &HashMap<String, &Type
 
     let empty_params = HashSet::new();
     for td in types {
-        s.push_str(&emit_adt_pool_fn(td, type_map, &empty_params));
+        s.push_str(&emit_adt_pool_fn(td, type_map, &empty_params, eval_mode));
         s.push('\\n');
     }
     s
@@ -3849,6 +4076,7 @@ fn emit_adt_pool_fn(
     td: &TypeDef,
     type_map: &HashMap<String, &TypeDef>,
     type_params: &HashSet<String>,
+    eval_mode: bool,
 ) -> String {
     let mut s = format!(
         "    fn __rb_pool_adt_{}(rng: &mut u64, depth: usize, recursive: bool) -> Vec<{}> {{\\n",
@@ -3903,20 +4131,32 @@ fn emit_adt_pool_fn(
                 .join(" && ");
             s.push_str(&format!("{indent}if {non_empty_guard} {{\\n"));
             let inner_indent = format!("{indent}    ");
+            // Small combinations first so counterexamples stay minimal
+            let small_cap = if v.field_types.len() == 2 { 4 } else { 2 };
+            let mut loop_ind = inner_indent.clone();
+            for fi in 0..v.field_types.len() {
+                s.push_str(&format!(
+                    "{loop_ind}for __s{fi} in &__f{fi}[..__f{fi}.len().min({small_cap})] {{\\n"
+                ));
+                loop_ind.push_str("    ");
+            }
+            let small_args = (0..v.field_types.len())
+                .map(|fi| format!("__s{fi}.clone()"))
+                .collect::<Vec<_>>()
+                .join(", ");
+            s.push_str(&format!(
+                "{loop_ind}out.push({}::{}({small_args}));\\n",
+                td.name, v.name
+            ));
+            for _ in 0..v.field_types.len() {
+                loop_ind.truncate(loop_ind.len() - 4);
+                s.push_str(&format!("{loop_ind}}}\\n"));
+            }
             let max_expr = (0..v.field_types.len()).fold("0usize".to_string(), |acc, fi| {
                 format!("{acc}.max(__f{fi}.len())")
             });
             s.push_str(&format!(
                 "{inner_indent}let __limit = ({max_expr}).min(24);\\n"
-            ));
-            // Always cover edge corners across first two fields and uniform edge tuple
-            let edge_args = (0..v.field_types.len())
-                .map(|fi| format!("__f{fi}[__f{fi}.len() - 1].clone()"))
-                .collect::<Vec<_>>()
-                .join(", ");
-            s.push_str(&format!(
-                "{inner_indent}out.push({}::{}({edge_args}));\\n",
-                td.name, v.name
             ));
             s.push_str(&format!("{inner_indent}for __i in 0..__limit {{\\n"));
             let args_sweep = (0..v.field_types.len())
@@ -3928,16 +4168,28 @@ fn emit_adt_pool_fn(
                 td.name, v.name
             ));
             s.push_str(&format!("{inner_indent}}}\\n"));
-            s.push_str(&format!("{inner_indent}for _ in 0..4 {{\\n"));
-            let args_rng = (0..v.field_types.len())
-                .map(|fi| format!("__f{fi}[(__rb_next_u64(rng) as usize) % __f{fi}.len()].clone()"))
+            let edge_args = (0..v.field_types.len())
+                .map(|fi| format!("__f{fi}[__f{fi}.len() - 1].clone()"))
                 .collect::<Vec<_>>()
                 .join(", ");
             s.push_str(&format!(
-                "{inner_indent}    out.push({}::{}({args_rng}));\\n",
+                "{inner_indent}out.push({}::{}({edge_args}));\\n",
                 td.name, v.name
             ));
-            s.push_str(&format!("{inner_indent}}}\\n"));
+            if !eval_mode {
+                s.push_str(&format!("{inner_indent}for _ in 0..4 {{\\n"));
+                let args_rng = (0..v.field_types.len())
+                    .map(|fi| {
+                        format!("__f{fi}[(__rb_next_u64(rng) as usize) % __f{fi}.len()].clone()")
+                    })
+                    .collect::<Vec<_>>()
+                    .join(", ");
+                s.push_str(&format!(
+                    "{inner_indent}    out.push({}::{}({args_rng}));\\n",
+                    td.name, v.name
+                ));
+                s.push_str(&format!("{inner_indent}}}\\n"));
+            }
             s.push_str(&format!("{indent}}}\\n"));
         }
         if has_adt_field {
@@ -4322,6 +4574,640 @@ fn escape_rust_str(s: &str) -> String {
     s.replace('\\\\', "\\\\\\\\").replace('"', "\\\\\\"")
 }
 
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Counterexample {
+    pub law_name: String,
+    pub bindings: Vec<(String, String)>,
+    pub lhs_display: String,
+    pub rhs_display: String,
+    pub lhs_val: String,
+    pub rhs_val: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum LawEvalOutcome {
+    Counterexample(Counterexample),
+    NoCounterexample {
+        law_name: String,
+        checked: usize,
+        bounds: String,
+    },
+    Skipped {
+        law_name: String,
+        reason: String,
+    },
+}
+
+pub(crate) struct TempEvalDir(pub(crate) PathBuf);
+
+impl Drop for TempEvalDir {
+    fn drop(&mut self) {
+        let _ = fs::remove_dir_all(&self.0);
+    }
+}
+
+pub(crate) fn create_temp_eval_dir(base_dir: &Path, tag: &str) -> Result<TempEvalDir, String> {
+    fs::create_dir_all(base_dir).map_err(|e| e.to_string())?;
+    let n = EVAL_SEQ.fetch_add(1, Ordering::SeqCst);
+    let path = base_dir.join(format!(".rb_{tag}_{}_{n}", std::process::id()));
+    let _ = fs::remove_dir_all(&path);
+    fs::create_dir_all(&path).map_err(|e| e.to_string())?;
+    Ok(TempEvalDir(path))
+}
+
+/// Extracts the failing definition/law name from Bend CLI error output (\`Location: <name>\`).
+pub fn extract_failed_def_name(bend_err: &str) -> Option<String> {
+    for line in bend_err.lines() {
+        let trimmed = line.trim();
+        if let Some(after) = trimmed.strip_prefix("Location:") {
+            let rest = after.trim();
+            if !rest.is_empty() {
+                if let Some(tok) = rest.split_whitespace().next() {
+                    let clean = tok.rsplit(':').next().unwrap_or(tok);
+                    if !clean.is_empty() {
+                        return Some(clean.to_string());
+                    }
+                }
+            }
+        }
+    }
+    None
+}
+
+/// Evaluates \`target_law_names\` (or all laws in \`combined_source\` if empty) on concrete inputs
+/// using the emitted Rust (compiled with \`rustc\` under a 10,000-step recursion guard).
+pub fn evaluate_laws_for_counterexamples(
+    combined_source: &str,
+    target_law_names: &[String],
+    out_dir: &Path,
+) -> Result<Vec<LawEvalOutcome>, String> {
+    let (types, defs) = parse_book_items(combined_source)?;
+    let ctor_map = build_ctor_map(&types);
+    let all_laws = parse_laws(combined_source);
+
+    let targets: Vec<&ParsedLaw> = if target_law_names.is_empty() {
+        all_laws.iter().collect()
+    } else {
+        all_laws
+            .iter()
+            .filter(|l| target_law_names.iter().any(|t| t == &l.name))
+            .collect()
+    };
+
+    if targets.is_empty() {
+        return Ok(Vec::new());
+    }
+
+    let def_map: HashMap<String, &Def> = defs.iter().map(|d| (d.name.clone(), d)).collect();
+    let type_map: HashMap<String, &TypeDef> = types.iter().map(|t| (t.name.clone(), t)).collect();
+
+    let runtime = emit_items_to_rust(&types, &defs, &ctor_map, 0, Some(10_000))?;
+    let mut outcomes: Vec<LawEvalOutcome> = Vec::new();
+    let mut runnable: Vec<(&ParsedLaw, String)> = Vec::new();
+    let mut law_by_name: HashMap<String, &ParsedLaw> = HashMap::new();
+
+    for law in targets {
+        law_by_name.insert(law.name.clone(), law);
+        match emit_eval_law_checker(
+            &format!("__rb_eval_law_{}", sanitize_ident(&law.name)),
+            law,
+            &defs,
+            &def_map,
+            &type_map,
+            &ctor_map,
+            false,
+        ) {
+            Ok(code) => runnable.push((law, code)),
+            Err(reason) => outcomes.push(LawEvalOutcome::Skipped {
+                law_name: law.name.clone(),
+                reason,
+            }),
+        }
+    }
+
+    if runnable.is_empty() {
+        return Ok(outcomes);
+    }
+
+    let mut program = String::new();
+    program.push_str("#![allow(clippy::all, non_snake_case, unused_variables, unused_parens, dead_code, unused_mut)]\\n");
+    program.push_str(&runtime.rust_source);
+    program.push('\\n');
+    program.push_str(&emit_pool_runtime_helpers(&types, &type_map, true));
+    for (_, code) in &runnable {
+        program.push_str(code);
+        program.push('\\n');
+    }
+    program.push_str("fn main() {\\n");
+    for (law, _) in &runnable {
+        let fn_name = format!("__rb_eval_law_{}", sanitize_ident(&law.name));
+        program.push_str(&format!("    {fn_name}();\\n"));
+    }
+    program.push_str("}\\n");
+
+    let eval_dir = create_temp_eval_dir(out_dir, "eval")?;
+    let rs_path = eval_dir.0.join("eval.rs");
+    let bin_path = eval_dir.0.join("eval_bin");
+    fs::write(&rs_path, program).map_err(|e| e.to_string())?;
+
+    let rustc = env::var("RUSTC").unwrap_or_else(|_| "rustc".to_string());
+    let compile = Command::new(&rustc)
+        .args(["--edition", "2021", "-A", "warnings", "-o"])
+        .arg(&bin_path)
+        .arg(&rs_path)
+        .output()
+        .map_err(|e| format!("failed to invoke '{rustc}' for counterexample search: {e}"))?;
+    if !compile.status.success() {
+        return Err(format!(
+            "rustc failed compiling counterexample harness:\\n{}",
+            String::from_utf8_lossy(&compile.stderr)
+        ));
+    }
+
+    let run = Command::new(&bin_path)
+        .output()
+        .map_err(|e| format!("failed to run counterexample binary: {e}"))?;
+    if !run.status.success() {
+        return Err(format!(
+            "counterexample binary exited with failure:\\n{}{}",
+            String::from_utf8_lossy(&run.stdout),
+            String::from_utf8_lossy(&run.stderr)
+        ));
+    }
+
+    let stdout = String::from_utf8_lossy(&run.stdout);
+    let mut parsed = parse_eval_protocol(&stdout, &law_by_name);
+    outcomes.append(&mut parsed);
+    Ok(outcomes)
+}
+
+/// Emits a standalone Rust function that evaluates \`law\` across small and edge inputs and prints
+/// either \`CE_BEGIN ... CE_END\` (or \`CAUGHT\` in mutation mode) or \`NONE\\t...\`.
+pub(crate) fn emit_eval_law_checker(
+    fn_name: &str,
+    law: &ParsedLaw,
+    defs: &[Def],
+    def_map: &HashMap<String, &Def>,
+    type_map: &HashMap<String, &TypeDef>,
+    ctor_map: &HashMap<String, CtorInfo>,
+    compact_mutant_mode: bool,
+) -> Result<String, String> {
+    if let Some(reason) = &law.unsupported_reason {
+        return Err(reason.clone());
+    }
+
+    let type_param_set: HashSet<String> = law
+        .vars
+        .iter()
+        .filter(|v| v.is_type_param)
+        .map(|v| v.name.clone())
+        .collect();
+    let runtime_vars: Vec<&LawVar> = law.vars.iter().filter(|v| !v.is_type_param).collect();
+
+    for v in &runtime_vars {
+        if !can_generate_pool(&v.ty, type_map, &type_param_set) {
+            return Err(format!("unsupported variable type '{}'", v.ty));
+        }
+    }
+
+    let default_mode = arith_mode_for_type(&law.eq_ty, ArithMode::NatChecked);
+    let lhs_rs = emit_expr_with_mode(&law.lhs, def_map, ctor_map, default_mode)?;
+    let rhs_rs = emit_expr_with_mode(&law.rhs, def_map, ctor_map, default_mode)?;
+
+    let mut hyp_pairs = Vec::new();
+    for h in &law.hypotheses {
+        let h_mode = arith_mode_for_type(&h.ty, ArithMode::NatChecked);
+        let hl = emit_expr_with_mode(&h.lhs, def_map, ctor_map, h_mode)?;
+        let hr = emit_expr_with_mode(&h.rhs, def_map, ctor_map, h_mode)?;
+        hyp_pairs.push((hl, hr));
+    }
+
+    let cone = law_dependency_cone(law, defs);
+    let recursive = cone_is_recursive(&cone, defs);
+    let bounds_desc = if runtime_vars.is_empty() {
+        "ground term".to_string()
+    } else if recursive {
+        "Nat in 0..=12, Bool in {false, true}, ADT depth <= 2".to_string()
+    } else {
+        "Nat in [0..=8, 16, 1000, u64::MAX-1, u64::MAX], Bool in {false, true}, ADT depth <= 2"
+            .to_string()
+    };
+
+    let mut hyp_checks = String::new();
+    for (hl, hr) in &hyp_pairs {
+        hyp_checks.push_str(&format!("if ({hl}) != ({hr}) {{ return None; }} "));
+    }
+    let eval_expr = format!(
+        "std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {{ __rb_reset_steps(); {hyp_checks}Some(({lhs_rs}, {rhs_rs})) }}))"
+    );
+
+    let mut s = String::new();
+    let ret_sig = if compact_mutant_mode {
+        " -> Option<String>"
+    } else {
+        ""
+    };
+    s.push_str(&format!("fn {fn_name}(){ret_sig} {{\\n"));
+
+    if runtime_vars.is_empty() {
+        s.push_str(&format!("    match {eval_expr} {{\\n"));
+        s.push_str("        Ok(Some((__lhs, __rhs))) if __lhs != __rhs => {\\n");
+        if compact_mutant_mode {
+            s.push_str("            return Some(format!(\\"lhs={:?}, rhs={:?}\\", __lhs, __rhs));\\n");
+        } else {
+            s.push_str("            println!(\\"CE_BEGIN\\");\\n");
+            s.push_str(&format!(
+                "            println!(\\"LAW {{}}\\", \\"{}\\");\\n",
+                escape_rust_str(&law.name)
+            ));
+            s.push_str("            println!(\\"LHS {:?}\\", __lhs);\\n");
+            s.push_str("            println!(\\"RHS {:?}\\", __rhs);\\n");
+            s.push_str("            println!(\\"CE_END\\");\\n");
+        }
+        s.push_str("        }\\n");
+        s.push_str("        Ok(Some(_)) => {\\n");
+        if compact_mutant_mode {
+            s.push_str("            return None;\\n");
+        } else {
+            s.push_str(&format!(
+                "            println!(\\"NONE\\\\t{{}}\\\\t1\\\\t{{}}\\", \\"{}\\", \\"{}\\");\\n",
+                escape_rust_str(&law.name),
+                escape_rust_str(&bounds_desc)
+            ));
+        }
+        s.push_str("        }\\n");
+        s.push_str("        _ => {\\n");
+        if compact_mutant_mode {
+            s.push_str("            return None;\\n");
+        } else {
+            s.push_str(&format!(
+                "            println!(\\"NONE\\\\t{{}}\\\\t0\\\\t{{}}\\", \\"{}\\", \\"{}\\");\\n",
+                escape_rust_str(&law.name),
+                escape_rust_str(&bounds_desc)
+            ));
+        }
+        s.push_str("        }\\n");
+        s.push_str("    }\\n");
+        s.push_str("}\\n");
+        return Ok(s);
+    }
+
+    let seed = 0x517c_c1b7_2722_0a95_u64
+        ^ u64::from_str_radix(&lock::fnv1a_hex(law.name.as_bytes()), 16).unwrap_or(0);
+    s.push_str(&format!("    let mut __rng_val: u64 = {seed}_u64;\\n"));
+    s.push_str("    let rng = &mut __rng_val;\\n");
+    for (vi, v) in runtime_vars.iter().enumerate() {
+        let pool_expr = emit_pool_expr(
+            &v.ty,
+            type_map,
+            &type_param_set,
+            if recursive { "true" } else { "false" },
+            "2",
+        );
+        s.push_str(&format!("    let __p{vi} = {pool_expr};\\n"));
+    }
+    s.push_str("    let mut __checked: usize = 0;\\n");
+    s.push_str("    let mut __found_ce = false;\\n");
+    s.push_str("    let mut __ce_summary: Option<String> = None;\\n");
+    s.push_str("    let __try_case = |__checked: &mut usize, __ce_out: &mut Option<String>");
+    for (vi, v) in runtime_vars.iter().enumerate() {
+        let rty = bend_type_to_rust_with_u64_params(&v.ty, &type_param_set);
+        s.push_str(&format!(", __arg{vi}: &{rty}"));
+    }
+    s.push_str("| -> bool {\\n");
+    for (vi, v) in runtime_vars.iter().enumerate() {
+        s.push_str(&format!("        let {} = __arg{vi}.clone();\\n", v.name));
+    }
+    s.push_str(&format!("        match {eval_expr} {{\\n"));
+    s.push_str("            Err(__p) if __rb_is_nat_overflow(&*__p) => false,\\n");
+    s.push_str("            Err(__p) => std::panic::resume_unwind(__p),\\n");
+    s.push_str("            Ok(None) => false,\\n");
+    s.push_str("            Ok(Some((__lhs, __rhs))) => {\\n");
+    s.push_str("                *__checked += 1;\\n");
+    s.push_str("                if __lhs != __rhs {\\n");
+    if compact_mutant_mode {
+        let bind_fmt = runtime_vars
+            .iter()
+            .map(|v| format!("{}={{:?}}", v.name))
+            .collect::<Vec<_>>()
+            .join(", ");
+        let bind_args = runtime_vars
+            .iter()
+            .map(|v| v.name.as_str())
+            .collect::<Vec<_>>()
+            .join(", ");
+        s.push_str(&format!(
+            "                    *__ce_out = Some(format!(\\"{bind_fmt}: lhs={{:?}}, rhs={{:?}}\\", {bind_args}, __lhs, __rhs));\\n"
+        ));
+    } else {
+        s.push_str("                    let _ = __ce_out;\\n");
+        s.push_str("                    println!(\\"CE_BEGIN\\");\\n");
+        s.push_str(&format!(
+            "                    println!(\\"LAW {{}}\\", \\"{}\\");\\n",
+            escape_rust_str(&law.name)
+        ));
+        for v in &runtime_vars {
+            s.push_str(&format!(
+                "                    println!(\\"BIND {}={{:?}}\\", {});\\n",
+                escape_rust_str(&v.name),
+                v.name
+            ));
+        }
+        s.push_str("                    println!(\\"LHS {:?}\\", __lhs);\\n");
+        s.push_str("                    println!(\\"RHS {:?}\\", __rhs);\\n");
+        s.push_str("                    println!(\\"CE_END\\");\\n");
+    }
+    s.push_str("                    true\\n");
+    s.push_str("                } else {\\n");
+    s.push_str("                    false\\n");
+    s.push_str("                }\\n");
+    s.push_str("            }\\n");
+    s.push_str("        }\\n");
+    s.push_str("    };\\n");
+
+    // Phase 1: small combinations first so minimal counterexamples (e.g. a=3, f=0, rel=4) appear first.
+    let small_cap = if runtime_vars.len() <= 3 {
+        6
+    } else if runtime_vars.len() == 4 {
+        4
+    } else {
+        2
+    };
+    let mut indent = "    ".to_string();
+    for vi in 0..runtime_vars.len() {
+        s.push_str(&format!(
+            "{indent}for __v{vi} in &__p{vi}[..__p{vi}.len().min({small_cap})] {{\\n"
+        ));
+        indent.push_str("    ");
+    }
+    let small_call = (0..runtime_vars.len())
+        .map(|vi| format!("__v{vi}"))
+        .collect::<Vec<_>>()
+        .join(", ");
+    s.push_str(&format!(
+        "{indent}if __try_case(&mut __checked, &mut __ce_summary, {small_call}) {{ __found_ce = true; break; }}\\n"
+    ));
+    for vi in (0..runtime_vars.len()).rev() {
+        indent.truncate(indent.len() - 4);
+        s.push_str(&format!("{indent}}}\\n"));
+        if vi > 0 {
+            s.push_str(&format!("{indent}if __found_ce {{ break; }}\\n"));
+        }
+    }
+
+    // Phase 2: full Cartesian product (up to 8192) or sweeps + seeded PRNG samples
+    let lens_prod = runtime_vars
+        .iter()
+        .enumerate()
+        .map(|(vi, _)| format!("__p{vi}.len()"))
+        .fold("1usize".to_string(), |acc, x| {
+            format!("{acc}.saturating_mul({x})")
+        });
+    s.push_str("    if !__found_ce {\\n");
+    s.push_str(&format!("        let __total = {lens_prod};\\n"));
+    s.push_str("        if __total <= 8192 {\\n");
+    let mut ind2 = "            ".to_string();
+    for vi in 0..runtime_vars.len() {
+        s.push_str(&format!("{ind2}for __v{vi} in &__p{vi} {{\\n"));
+        ind2.push_str("    ");
+    }
+    let full_call = (0..runtime_vars.len())
+        .map(|vi| format!("__v{vi}"))
+        .collect::<Vec<_>>()
+        .join(", ");
+    s.push_str(&format!(
+        "{ind2}if __try_case(&mut __checked, &mut __ce_summary, {full_call}) {{ __found_ce = true; break; }}\\n"
+    ));
+    for vi in (0..runtime_vars.len()).rev() {
+        ind2.truncate(ind2.len() - 4);
+        s.push_str(&format!("{ind2}}}\\n"));
+        if vi > 0 {
+            s.push_str(&format!("{ind2}if __found_ce {{ break; }}\\n"));
+        }
+    }
+    s.push_str("        } else {\\n");
+    for vi in 0..runtime_vars.len() {
+        s.push_str("            if !__found_ce {\\n");
+        s.push_str(&format!(
+            "                for (__idx, __val) in __p{vi}.iter().enumerate() {{\\n"
+        ));
+        let args_zero = (0..runtime_vars.len())
+            .map(|k| {
+                if k == vi {
+                    "__val".to_string()
+                } else {
+                    format!("&__p{k}[0]")
+                }
+            })
+            .collect::<Vec<_>>()
+            .join(", ");
+        s.push_str(&format!(
+            "                    if __try_case(&mut __checked, &mut __ce_summary, {args_zero}) {{ __found_ce = true; break; }}\\n"
+        ));
+        let args_diag = (0..runtime_vars.len())
+            .map(|k| {
+                if k == vi {
+                    "__val".to_string()
+                } else {
+                    format!("&__p{k}[(__idx + {k}) % __p{k}.len()]")
+                }
+            })
+            .collect::<Vec<_>>()
+            .join(", ");
+        s.push_str(&format!(
+            "                    if __try_case(&mut __checked, &mut __ce_summary, {args_diag}) {{ __found_ce = true; break; }}\\n"
+        ));
+        s.push_str("                }\\n");
+        s.push_str("            }\\n");
+    }
+    s.push_str("            if !__found_ce {\\n");
+    s.push_str("                for _ in 0..2048 {\\n");
+    let args_sample = (0..runtime_vars.len())
+        .map(|k| format!("&__p{k}[(__rb_next_u64(rng) as usize) % __p{k}.len()]"))
+        .collect::<Vec<_>>()
+        .join(", ");
+    s.push_str(&format!(
+        "                    if __try_case(&mut __checked, &mut __ce_summary, {args_sample}) {{ __found_ce = true; break; }}\\n"
+    ));
+    s.push_str("                }\\n");
+    s.push_str("            }\\n");
+    s.push_str("        }\\n");
+    s.push_str("    }\\n");
+
+    if compact_mutant_mode {
+        s.push_str("    __ce_summary\\n");
+    } else {
+        s.push_str("    if !__found_ce {\\n");
+        s.push_str(&format!(
+            "        println!(\\"NONE\\\\t{{}}\\\\t{{}}\\\\t{{}}\\", \\"{}\\", __checked, \\"{}\\");\\n",
+            escape_rust_str(&law.name),
+            escape_rust_str(&bounds_desc)
+        ));
+        s.push_str("    }\\n");
+    }
+    s.push_str("}\\n");
+    Ok(s)
+}
+
+fn parse_eval_protocol(
+    stdout: &str,
+    law_by_name: &HashMap<String, &ParsedLaw>,
+) -> Vec<LawEvalOutcome> {
+    let mut outcomes = Vec::new();
+    let mut in_ce = false;
+    let mut cur_law = String::new();
+    let mut cur_binds: Vec<(String, String)> = Vec::new();
+    let mut cur_lhs = String::new();
+    let mut cur_rhs = String::new();
+
+    for line in stdout.lines() {
+        if line == "CE_BEGIN" {
+            in_ce = true;
+            cur_law.clear();
+            cur_binds.clear();
+            cur_lhs.clear();
+            cur_rhs.clear();
+            continue;
+        }
+        if line == "CE_END" && in_ce {
+            in_ce = false;
+            let (lhs_raw, rhs_raw) = law_by_name
+                .get(&cur_law)
+                .map(|l| (l.lhs.as_str(), l.rhs.as_str()))
+                .unwrap_or(("", ""));
+            outcomes.push(LawEvalOutcome::Counterexample(Counterexample {
+                law_name: cur_law.clone(),
+                bindings: cur_binds.clone(),
+                lhs_display: substitute_bindings(lhs_raw, &cur_binds),
+                rhs_display: substitute_bindings(rhs_raw, &cur_binds),
+                lhs_val: cur_lhs.clone(),
+                rhs_val: cur_rhs.clone(),
+            }));
+            continue;
+        }
+        if in_ce {
+            if let Some(name) = line.strip_prefix("LAW ") {
+                cur_law = name.trim().to_string();
+            } else if let Some(bind) = line.strip_prefix("BIND ") {
+                if let Some((k, v)) = bind.split_once('=') {
+                    cur_binds.push((k.trim().to_string(), v.trim().to_string()));
+                }
+            } else if let Some(val) = line.strip_prefix("LHS ") {
+                cur_lhs = val.trim().to_string();
+            } else if let Some(val) = line.strip_prefix("RHS ") {
+                cur_rhs = val.trim().to_string();
+            }
+            continue;
+        }
+        if let Some(rest) = line.strip_prefix("NONE\\t") {
+            let parts: Vec<&str> = rest.splitn(3, '\\t').collect();
+            if parts.len() == 3 {
+                outcomes.push(LawEvalOutcome::NoCounterexample {
+                    law_name: parts[0].to_string(),
+                    checked: parts[1].parse().unwrap_or(0),
+                    bounds: parts[2].to_string(),
+                });
+            }
+        }
+    }
+    outcomes
+}
+
+fn substitute_bindings(expr: &str, bindings: &[(String, String)]) -> String {
+    let bind_map: HashMap<&str, &str> = bindings
+        .iter()
+        .map(|(k, v)| (k.as_str(), v.as_str()))
+        .collect();
+    let chars: Vec<char> = expr.chars().collect();
+    let mut out = String::with_capacity(expr.len());
+    let mut i = 0usize;
+
+    while i < chars.len() {
+        if chars[i].is_ascii_alphabetic() || chars[i] == '_' {
+            let prev_is_dot_or_ident = i > 0
+                && (chars[i - 1] == '.'
+                    || chars[i - 1].is_ascii_alphanumeric()
+                    || chars[i - 1] == '_');
+            let start = i;
+            i += 1;
+            while i < chars.len() && (chars[i].is_ascii_alphanumeric() || chars[i] == '_') {
+                i += 1;
+            }
+            let ident: String = chars[start..i].iter().collect();
+            let next_is_dot = i < chars.len() && chars[i] == '.';
+            if !prev_is_dot_or_ident && !next_is_dot {
+                if let Some(val) = bind_map.get(ident.as_str()) {
+                    out.push_str(val);
+                    continue;
+                }
+            }
+            out.push_str(&ident);
+            continue;
+        }
+        out.push(chars[i]);
+        i += 1;
+    }
+
+    out
+}
+
+/// Formats counterexample or proof-only failure diagnostics for display before the Bend error.
+pub fn format_counterexample_diagnosis(
+    outcomes: &[LawEvalOutcome],
+    locked_laws: &BTreeSet<String>,
+) -> String {
+    let counterexamples: Vec<&Counterexample> = outcomes
+        .iter()
+        .filter_map(|o| match o {
+            LawEvalOutcome::Counterexample(ce) => Some(ce),
+            _ => None,
+        })
+        .collect();
+
+    if !counterexamples.is_empty() {
+        return counterexamples
+            .iter()
+            .map(|ce| {
+                let binds = if ce.bindings.is_empty() {
+                    "(ground expression)".to_string()
+                } else {
+                    ce.bindings
+                        .iter()
+                        .map(|(k, v)| format!("{k} = {v}"))
+                        .collect::<Vec<_>>()
+                        .join(", ")
+                };
+                let width = ce.lhs_display.len().max(ce.rhs_display.len());
+                let hint = if locked_laws.contains(&ce.law_name) {
+                    "fix the function (or, if the change is meant to break this law, stop: the law is locked)"
+                } else {
+                    "fix the function (or revise the unlocked law if the specification changed)"
+                };
+                format!(
+                    "[E_LAW_FALSE] law {} is FALSE for this code (evaluated with emitted Rust):\\n  {binds}\\n  lhs {:<width$} = {}\\n  rhs {:<width$} = {}\\n{hint}",
+                    ce.law_name, ce.lhs_display, ce.lhs_val, ce.rhs_display, ce.rhs_val
+                )
+            })
+            .collect::<Vec<_>>()
+            .join("\\n\\n");
+    }
+
+    outcomes
+        .iter()
+        .filter_map(|o| match o {
+            LawEvalOutcome::NoCounterexample {
+                law_name,
+                checked,
+                bounds,
+            } => Some(format!(
+                "law {law_name}: no counterexample up to {bounds} ({checked} cases checked, evaluated with emitted Rust): the law may be true; the proof is what failed"
+            )),
+            _ => None,
+        })
+        .collect::<Vec<_>>()
+        .join("\\n")
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -4555,6 +5441,51 @@ law rec_id_same:
             String::from_utf8_lossy(&run.stdout),
             String::from_utf8_lossy(&run.stderr)
         );
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn evaluates_broken_law_counterexample_directly() {
+        let broken_src = r#"import Base
+
+type PoolAcct is Data:
+  PoolAcct{a: Nat, f: Nat}
+
+def pool_total(+p: PoolAcct) -> Nat:
+  match p:
+    case PoolAcct{a, f}:
+      Nat.add(a, f)
+
+def pool_free_if(+a: Nat, +f: Nat, +rel: Nat, ok: Bool) -> PoolAcct:
+  match ok:
+    case True{}:
+      PoolAcct{Nat.sub(a, rel), Nat.add(f, rel)}
+    case False{}:
+      PoolAcct{a, Nat.add(f, rel)}
+
+def pool_free(+p: PoolAcct, +rel: Nat) -> PoolAcct:
+  match p:
+    case PoolAcct{+a, f}:
+      pool_free_if(a, f, rel, Nat.is_le(rel, a))
+
+law pool_free_conserved:
+  for +a: Nat
+  for +f: Nat
+  for +rel: Nat
+  {pool_total(pool_free(PoolAcct{a, f}, rel)) == Nat.add(a, f) : Nat}
+
+def pool_free_conserved(a, f, rel):
+  {==}
+"#;
+        let dir = tmp_dir("direct_ce");
+        let outcomes = evaluate_laws_for_counterexamples(
+            broken_src,
+            &["pool_free_conserved".to_string()],
+            &dir,
+        )
+        .expect("counterexample evaluation must succeed");
+        assert_eq!(outcomes.len(), 1);
+        assert!(matches!(outcomes[0], LawEvalOutcome::Counterexample(_)));
         let _ = fs::remove_dir_all(&dir);
     }
 }

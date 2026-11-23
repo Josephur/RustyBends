@@ -241,6 +241,9 @@ where
         ));
     }
 
+    // Record which laws were already locked before this build for failure diagnostics.
+    let pre_locked_laws = lock::read_locked_law_names(&cfg.lock_file);
+
     // 1. Enforce AST/token-canonical LAWS lock before running Bend
     let law_count = lock::enforce_law_lock(&cfg.lock_file, &bend_files, cfg.allow_lock_update)?;
 
@@ -261,20 +264,45 @@ where
         });
     }
 
-    // 3. Run real Bend 2 checker (--check-only, plus --verdict when laws are present)
+    // 3. Pre-read all sources and run real Bend 2 checker (--check-only, plus --verdict when laws are present)
+    let mut file_sources: Vec<(&PathBuf, String)> = Vec::with_capacity(bend_files.len());
     let mut combined_source = String::new();
     for file in &bend_files {
         let text = fs::read_to_string(file).map_err(|e| e.to_string())?;
+        combined_source.push_str(&text);
+        combined_source.push('\n');
+        file_sources.push((file, text));
+    }
+
+    for (file, text) in &file_sources {
         let is_laws_file = file
             .file_name()
             .and_then(|n| n.to_str())
             .map(|n| n.eq_ignore_ascii_case("LAWS.bend"))
             .unwrap_or(false);
-        let has_laws = is_laws_file || !lock::extract_laws_from_source(&text).is_empty();
+        let has_laws = is_laws_file || !lock::extract_laws_from_source(text).is_empty();
 
-        checker(file, has_laws)?;
-        combined_source.push_str(&text);
-        combined_source.push('\n');
+        if let Err(err) = checker(file, has_laws) {
+            let file_laws = law_test::parse_laws(text);
+            if !file_laws.is_empty() {
+                let target_names = match law_test::extract_failed_def_name(&err) {
+                    Some(failed) if file_laws.iter().any(|l| l.name == failed) => vec![failed],
+                    _ => file_laws.iter().map(|l| l.name.clone()).collect(),
+                };
+                if let Ok(outcomes) = law_test::evaluate_laws_for_counterexamples(
+                    &combined_source,
+                    &target_names,
+                    &cfg.out_dir,
+                ) {
+                    let diagnosis =
+                        law_test::format_counterexample_diagnosis(&outcomes, &pre_locked_laws);
+                    if !diagnosis.is_empty() {
+                        return Err(format!("{diagnosis}\n\n{err}"));
+                    }
+                }
+            }
+            return Err(err);
+        }
     }
 
     // 4. Erase q=0 parts and emit pure Rust (ADTs + match + defs) into OUT_DIR/verified.rs
@@ -609,5 +637,128 @@ mod tests {
             "Error: BendTT infrastructure: --verdict needs Lean v4.34.0"
         ));
         assert!(!is_missing_lean_error("SOME PROOFS FAIL"));
+    }
+
+    #[test]
+    fn failed_law_distinguishes_false_law_counterexample_from_incomplete_proof() {
+        let root = temp_workspace("issue7_diag");
+        let core = root.join("verified/core.bend");
+        let mut cfg = make_cfg(&root);
+        cfg.bend_bin = resolve_bend_bin(
+            env::var("BEND_BIN").ok(),
+            env::var_os("PATH"),
+            env::var_os("HOME").map(PathBuf::from),
+        );
+        cfg.verdict_mode = VerdictMode::Off;
+
+        // 1. Valid locked pool_free_conserved first
+        let valid_src = r#"import Base
+
+type PoolAcct is Data:
+  PoolAcct{a: Nat, f: Nat}
+
+def pool_total(+p: PoolAcct) -> Nat:
+  match p:
+    case PoolAcct{a, f}:
+      Nat.add(a, f)
+
+def pool_free_if(+a: Nat, +f: Nat, +rel: Nat, ok: Bool) -> PoolAcct:
+  match ok:
+    case True{}:
+      PoolAcct{Nat.sub(a, rel), Nat.add(f, rel)}
+    case False{}:
+      PoolAcct{a, f}
+
+def pool_free(+p: PoolAcct, +rel: Nat) -> PoolAcct:
+  match p:
+    case PoolAcct{+a, f}:
+      pool_free_if(a, f, rel, Nat.is_le(rel, a))
+
+law pool_free_conserved:
+  for +a: Nat
+  for +f: Nat
+  for +rel: Nat
+  {pool_total(pool_free(PoolAcct{a, f}, rel)) == Nat.add(a, f) : Nat}
+"#;
+        // Seed the lock as if the law was previously sealed, then break the function (True{} drops sub, adding rel unconditionally).
+        fs::write(&core, valid_src).unwrap();
+        let _ = lock::enforce_law_lock(&cfg.lock_file, std::slice::from_ref(&core), false).unwrap();
+
+        let broken_src = r#"import Base
+
+type PoolAcct is Data:
+  PoolAcct{a: Nat, f: Nat}
+
+def pool_total(+p: PoolAcct) -> Nat:
+  match p:
+    case PoolAcct{a, f}:
+      Nat.add(a, f)
+
+def pool_free_if(+a: Nat, +f: Nat, +rel: Nat, ok: Bool) -> PoolAcct:
+  match ok:
+    case True{}:
+      PoolAcct{Nat.sub(a, rel), Nat.add(f, rel)}
+    case False{}:
+      PoolAcct{a, Nat.add(f, rel)}
+
+def pool_free(+p: PoolAcct, +rel: Nat) -> PoolAcct:
+  match p:
+    case PoolAcct{+a, f}:
+      pool_free_if(a, f, rel, Nat.is_le(rel, a))
+
+law pool_free_conserved:
+  for +a: Nat
+  for +f: Nat
+  for +rel: Nat
+  {pool_total(pool_free(PoolAcct{a, f}, rel)) == Nat.add(a, f) : Nat}
+
+def pool_free_conserved(a, f, rel):
+  {==}
+"#;
+        fs::write(&core, broken_src).unwrap();
+        let err_false = run(&cfg).expect_err("broken function must fail build");
+        assert!(
+            err_false.contains("[E_LAW_FALSE] law pool_free_conserved is FALSE for this code (evaluated with emitted Rust)"),
+            "expected counterexample header, got:\n{err_false}"
+        );
+        assert!(err_false.contains("lhs pool_total(pool_free(PoolAcct{"));
+        assert!(err_false.contains("rhs Nat.add("));
+        assert!(err_false.contains("stop: the law is locked"));
+
+        // 2. True law with an incomplete proof -> no counterexample found, reports proof failure.
+        let root2 = temp_workspace("issue7_proof_only");
+        let core2 = root2.join("verified/core.bend");
+        let mut cfg2 = make_cfg(&root2);
+        cfg2.bend_bin = cfg.bend_bin.clone();
+        cfg2.verdict_mode = VerdictMode::Off;
+
+        let incomplete_proof_src = r#"import Base
+
+def deposit(+bal: Nat, +amt: Nat) -> Nat:
+  Nat.add(bal, amt)
+
+law deposit_zero:
+  for +bal: Nat
+  {deposit(bal, 0n) == bal : Nat}
+
+def deposit_zero(bal):
+  match bal:
+    case 0n:
+      {==}
+    case 1n+p:
+      {==}
+"#;
+        fs::write(&core2, incomplete_proof_src).unwrap();
+        let err_proof = run(&cfg2).expect_err("incomplete proof must fail build");
+        assert!(
+            err_proof.contains("law deposit_zero: no counterexample up to"),
+            "expected no-counterexample line, got:\n{err_proof}"
+        );
+        assert!(err_proof.contains("evaluated with emitted Rust"));
+        assert!(err_proof.contains("the law may be true; the proof is what failed"));
+        assert!(err_proof.contains("SOME PROOFS FAIL"));
+
+        let _ = fs::remove_dir_all(&root);
+        let _ = fs::remove_dir_all(&root2);
     }
 }

@@ -10,7 +10,7 @@
 //! - Deleting a locked law trips E_LAW_LOCK_TAMPERED.
 //! - Adding a brand-new law is allowed without unlocking.
 
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 use std::fs;
 use std::path::{Path, PathBuf};
 
@@ -111,6 +111,25 @@ pub fn enforce_law_lock(
     }
 
     Ok(current.len())
+}
+
+/// Reads the set of locked law names currently present in `lock_file` (returns empty if missing).
+pub fn read_locked_law_names(lock_file: &Path) -> BTreeSet<String> {
+    let mut names = BTreeSet::new();
+    let Ok(raw) = fs::read_to_string(lock_file) else {
+        return names;
+    };
+    for line in raw.lines() {
+        let trimmed = line.trim();
+        if trimmed.is_empty() || trimmed.starts_with('#') {
+            continue;
+        }
+        let parts: Vec<&str> = trimmed.splitn(3, "  ").collect();
+        if parts.len() >= 2 {
+            names.insert(parts[1].trim().to_string());
+        }
+    }
+    names
 }
 
 fn is_top_level_keyword(tok: &str) -> bool {
