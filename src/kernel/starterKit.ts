@@ -216,6 +216,8 @@ def cancel_idempotent(s):
 - **Counterexample vs proof-failure diagnosis:** when \`bend --check-only\` fails on a law, \`rusty-bends-build\` evaluates the emitted Rust on concrete inputs first and reports \`[E_LAW_FALSE]\` with aligned \`lhs\`/\`rhs\` values if the law is false, or notes \`"no counterexample up to ...: the law may be true; the proof is what failed"\` if no counterexample exists.
 - **Mutation checking before sealing (\`E_LAW_VACUOUS\`):** every unlocked/new law is checked against small mutants of the live functions in its dependency cone (\`True{}\`/\`False{}\` swap, \`Nat.is_le\`/\`Nat.is_lt\` swap, \`Nat.add\`/\`Nat.sub\` swap, \`Bool.and\`/\`Bool.or\` operand drop, returning a constructor argument unchanged, swapping match arms) and fails with \`[E_LAW_VACUOUS]\` if it catches none. Bound and safety laws are covered too: \`NatBound\` pushes a \`Nat\` result past a bound (\`+ 1n\`, \`- 1n\`, \`0n\`), \`SiblingCtor\` replaces a returned constructor with its sibling constructors, \`BoolConst\` replaces a \`Bool\` variable with \`True{}\` / \`False{}\`, and \`FlipCmp\` loosens comparisons (\`Nat.is_le\` <-> \`Nat.is_ge\`, \`Nat.is_lt\` <-> \`Nat.is_gt\`). \`ReturnCtor\` replaces a returned variable or function call (e.g. a fallthrough \`case st _: st\`) with each constructor of the return type, and \`NatLit\` changes \`Nat\` literals (\`k\` -> \`0n\`, \`k + 1\`, \`k - 1\`, at most 8 sites per function). Each reported mutant ends with its operator, e.g. \`caught by f: result -> Nat.add(result, 1n) [NatBound]\`. Run \`RUSTY_BENDS_MUTATE=all cargo check\` to report caught/survived status for already-locked laws without failing.
 - **Unevaluable new laws (\`E_LAW_UNCHECKED\`):** a new law the checker cannot evaluate (\`exs\`, a \`where\` refinement, an unparsable clause, or a goal without \`==\`) fails the build, naming the reason and the supported forms. If it truly cannot be sampled, add \`# unchecked: <why>\` in the comment block directly above \`law <name>:\`; the marker is stored in \`rusty-bends.lock\` and shown as \`[unchecked: <why>]\` by the law listing. Locked laws only warn.
+- **Mutants that do not compile (\`E_MUTANT_BUILD\`):** a mutant the generated Rust cannot build was never tested, so it never counts as a survivor. The build stops with \`[E_MUTANT_BUILD]\`, naming the mutant and the first rustc error; that is a RustyBends bug to report, not a weak law.
+- **Names that are Rust keywords:** any Bend name may be used, including ones Rust reserves (\`as\`, \`in\`, \`fn\`, \`ref\`, \`mut\`, \`dyn\`, \`loop\`, \`move\`, \`self\`, \`crate\`, \`super\`, ...). The emitted Rust spells them \`r#as\`, \`r#in\`, ... and, where Rust allows no raw form, \`__rb_self\`, \`__rb_crate\`, \`__rb_super\`, \`__rb_Self\`. Call them from Rust by those names, e.g. \`verified::r#loop(2, 3)\`.
 
 ## 5. Mandatory Rules for AI Agents
 
@@ -1493,7 +1495,13 @@ pub(crate) fn emit_items_to_rust(
 
         let rust_params = live_params
             .iter()
-            .map(|p| format!("{}: {}", p.name, bend_type_to_rust(&p.ty, &type_param_set)))
+            .map(|p| {
+                format!(
+                    "{}: {}",
+                    rust_ident(&p.name),
+                    bend_type_to_rust(&p.ty, &type_param_set)
+                )
+            })
             .collect::<Vec<_>>()
             .join(", ");
 
@@ -1519,9 +1527,9 @@ pub(crate) fn emit_items_to_rust(
 
         // Variants to emit: the public function (total when marked), plus a private
         // \`Option\` shadow when an unmarked def is called from a total function.
-        let mut variants = vec![(def.name.clone(), def.total, true)];
+        let mut variants = vec![(rust_ident(&def.name), def.total, true)];
         if !def.total && total_cone.contains(&def.name) {
-            variants.push((total_fn_name(def), true, false));
+            variants.push((rust_ident(&total_fn_name(def)), true, false));
         }
         for (fn_name, total, public) in variants {
             let ops = RefCell::new(Vec::new());
@@ -2245,6 +2253,43 @@ enum NatPattern {
     Succ { offset: u64, var: String },
 }
 
+/// Rust strict, reserved and edition-reserved keywords. A Bend name that equals one of
+/// these is legal in Bend but must never be emitted as a bare Rust identifier.
+/// \`true\`/\`false\` are left out: they are Bend literals too and must stay literals.
+const RUST_KEYWORDS: &[&str] = &[
+    "as", "async", "await", "break", "const", "continue", "crate", "dyn", "else", "enum", "extern",
+    "fn", "for", "gen", "if", "impl", "in", "let", "loop", "match", "mod", "move", "mut", "pub",
+    "ref", "return", "self", "Self", "static", "struct", "super", "trait", "try", "type", "unsafe",
+    "use", "where", "while", "abstract", "become", "box", "do", "final", "macro", "override",
+    "priv", "typeof", "unsized", "virtual", "yield",
+];
+
+/// Keywords that cannot be written as raw identifiers (\`r#self\` is rejected by rustc).
+const NON_RAW_KEYWORDS: &[&str] = &["self", "Self", "super", "crate"];
+
+/// Maps a Bend identifier to a Rust identifier that cannot clash with a Rust keyword:
+/// \`as\` becomes \`r#as\`, and \`self\`/\`Self\`/\`super\`/\`crate\` become \`__rb_self\` and so on.
+/// Every place that turns a Bend value name (def, parameter, binder, law variable) into
+/// Rust source must go through this (or [\`rust_path\`]).
+pub(crate) fn rust_ident(name: &str) -> String {
+    if NON_RAW_KEYWORDS.contains(&name) {
+        format!("__rb_{name}")
+    } else if RUST_KEYWORDS.contains(&name) {
+        format!("r#{name}")
+    } else {
+        name.to_string()
+    }
+}
+
+/// Like [\`rust_ident\`] for a dotted Bend path (\`Mod.name\` -> \`Mod::name\`), escaping each
+/// segment.
+pub(crate) fn rust_path(path: &str) -> String {
+    path.split('.')
+        .map(rust_ident)
+        .collect::<Vec<_>>()
+        .join("::")
+}
+
 fn is_valid_rust_ident_or_wildcard(s: &str) -> bool {
     if s == "_" {
         return true;
@@ -2537,7 +2582,7 @@ fn emit_single_pattern(
                         .bound_vars
                         .push((var.clone(), Some("Nat".to_string())));
                 }
-                Ok(var)
+                Ok(rust_ident(&var))
             }
             NatPattern::Succ { offset, var } if var == "_" => {
                 Ok(format!("{offset}_u64..=u64::MAX"))
@@ -2548,7 +2593,7 @@ fn emit_single_pattern(
                 let tmp = format!("__rb_n{idx}");
                 state
                     .bindings
-                    .push(format!("let {var} = {tmp} - {offset}_u64;"));
+                    .push(format!("let {} = {tmp} - {offset}_u64;", rust_ident(&var)));
                 state.bound_vars.push((var, Some("Nat".to_string())));
                 Ok(format!("{tmp} @ {offset}_u64..=u64::MAX"))
             }
@@ -2595,7 +2640,9 @@ fn emit_single_pattern(
             } else if is_plain_binder_ident(rhs, ctors) {
                 let box_tmp = format!("__rb_box{}", state.box_counter);
                 state.box_counter += 1;
-                state.bindings.push(format!("let {rhs} = *{box_tmp};"));
+                state
+                    .bindings
+                    .push(format!("let {} = *{box_tmp};", rust_ident(rhs)));
                 state.bound_vars.push((rhs.to_string(), field_ty));
                 fields.push(box_tmp);
             } else {
@@ -2642,6 +2689,7 @@ fn emit_single_pattern(
         state
             .bound_vars
             .push((clean.to_string(), expected_ty.map(str::to_string)));
+        return Ok(rust_ident(clean));
     }
     Ok(resolve_ctor_path(clean, ctors))
 }
@@ -2691,10 +2739,7 @@ fn clean_let_binding(raw: &str) -> String {
             .collect::<Vec<_>>();
         return format!("({})", parts.join(", "));
     }
-    t.trim_start_matches('+')
-        .trim_start_matches('-')
-        .trim()
-        .to_string()
+    rust_ident(t.trim_start_matches('+').trim_start_matches('-').trim())
 }
 
 fn extract_let_bound_names(raw: &str) -> Vec<String> {
@@ -3346,7 +3391,7 @@ fn emit_expr_with_ctx(expr: &str, ctx: &EmitCtx<'_>, mode: ArithMode) -> Result<
                 if ctx.total && ctx.total_cone.contains(callee) {
                     return Ok(format!(
                         "{}({})?",
-                        total_fn_name(def).replace('.', "::"),
+                        rust_path(&total_fn_name(def)),
                         emitted_args.join(", ")
                     ));
                 }
@@ -3354,7 +3399,7 @@ fn emit_expr_with_ctx(expr: &str, ctx: &EmitCtx<'_>, mode: ArithMode) -> Result<
                     // A total function called from panicking code keeps panicking semantics.
                     return Ok(format!(
                         "{}({}){}",
-                        callee.replace('.', "::"),
+                        rust_path(callee),
                         emitted_args.join(", "),
                         ctx.overflow(&format!("call {callee}"))
                     ));
@@ -3362,7 +3407,7 @@ fn emit_expr_with_ctx(expr: &str, ctx: &EmitCtx<'_>, mode: ArithMode) -> Result<
             }
             return Ok(format!(
                 "{}({})",
-                callee.replace('.', "::"),
+                rust_path(callee),
                 emitted_args.join(", ")
             ));
         }
@@ -3383,9 +3428,12 @@ fn emit_expr_with_ctx(expr: &str, ctx: &EmitCtx<'_>, mode: ArithMode) -> Result<
     }
 
     if ctx.clone_vars.contains(s) {
-        return Ok(format!("{s}.clone()"));
+        return Ok(format!("{}.clone()", rust_ident(s)));
     }
 
+    if s.split('.').all(is_valid_rust_ident_or_wildcard) {
+        return Ok(rust_path(s));
+    }
     Ok(s.replace('.', "::"))
 }
 
@@ -6217,7 +6265,7 @@ def chunk_in_bounds(t, chunks, per, h):
 use crate::emit::{
     arith_mode_for_type, bend_type_to_rust, collect_law_source_slices, emit_expr_with_mode,
     emit_items_to_rust, is_top_level_start, is_wrapped_in_parens, parse_book_items,
-    parse_list_elem_type, split_top_level_once, split_top_level_str, split_type_args,
+    parse_list_elem_type, rust_ident, split_top_level_once, split_top_level_str, split_type_args,
     strip_comment, type_contains_non_copy, ArithMode, Def, TypeDef, TypeEnv,
 };
 use crate::lock;
@@ -7278,7 +7326,7 @@ fn emit_single_law_test(
         .join(", ");
     let var_args_fmt = runtime_vars
         .iter()
-        .map(|v| v.name.as_str())
+        .map(|v| rust_ident(&v.name))
         .collect::<Vec<_>>()
         .join(", ");
 
@@ -7296,7 +7344,7 @@ fn emit_single_law_test(
     for (vi, v) in runtime_vars.iter().enumerate() {
         s.push_str(&format!(
             "            let {} = __arg{vi}.clone();\\n",
-            v.name
+            rust_ident(&v.name)
         ));
     }
     let eval_block = emit_eval_closure(&hyp_pairs, &lhs_rs, &rhs_rs);
@@ -7747,7 +7795,10 @@ pub(crate) fn emit_eval_law_checker(
     }
     s.push_str("| -> bool {\\n");
     for (vi, v) in runtime_vars.iter().enumerate() {
-        s.push_str(&format!("        let {} = __arg{vi}.clone();\\n", v.name));
+        s.push_str(&format!(
+            "        let {} = __arg{vi}.clone();\\n",
+            rust_ident(&v.name)
+        ));
     }
     s.push_str(&format!("        match {eval_expr} {{\\n"));
     s.push_str("            Err(__p) if __rb_is_nat_overflow(&*__p) => false,\\n");
@@ -7764,7 +7815,7 @@ pub(crate) fn emit_eval_law_checker(
             .join(", ");
         let bind_args = runtime_vars
             .iter()
-            .map(|v| v.name.as_str())
+            .map(|v| rust_ident(&v.name))
             .collect::<Vec<_>>()
             .join(", ");
         s.push_str(&format!(
@@ -7781,7 +7832,7 @@ pub(crate) fn emit_eval_law_checker(
             s.push_str(&format!(
                 "                    println!(\\"BIND {}={{:?}}\\", {});\\n",
                 escape_rust_str(&v.name),
-                v.name
+                rust_ident(&v.name)
             ));
         }
         s.push_str("                    println!(\\"LHS {:?}\\", __lhs);\\n");
@@ -8359,6 +8410,149 @@ def release_conserves_total(a, f, rel):
         assert!(matches!(outcomes[0], LawEvalOutcome::Counterexample(_)));
         let _ = fs::remove_dir_all(&dir);
     }
+
+    /// Bend names that are legal in Bend 2 but are Rust keywords (issue #16).
+    const KEYWORD_NAMES_SRC: &str = r#"import Base
+
+type Slot is Data:
+  Slot{kind: Nat, ref: Nat}
+
+def loop(as: Nat, in: Nat) -> Nat:
+  Nat.add(as, in)
+
+def pick(s: Slot) -> Nat:
+  match s:
+    case Slot{dyn, ref}:
+      loop(dyn, ref)
+
+def dec(fn: Nat) -> Nat:
+  match fn:
+    case 0n:
+      0n
+    case 1n+move:
+      move
+
+def own(self: Nat, crate: Nat) -> Nat:
+  Nat.add(self, crate)
+
+law pick_is_loop:
+  for mut: Nat
+  for ref: Nat
+  {pick(Slot{mut, ref}) == loop(mut, ref) : Nat}
+
+def pick_is_loop(mut, ref):
+  {==}
+
+law dec_succ:
+  for fn: Nat
+  {dec(1n+fn) == fn : Nat}
+
+def dec_succ(fn):
+  {==}
+
+law own_is_loop:
+  for self: Nat
+  for super: Nat
+  {own(self, super) == loop(self, super) : Nat}
+
+def own_is_loop(self, super):
+  {==}
+"#;
+
+    #[test]
+    fn rust_keyword_names_compile_in_emitted_code_and_law_tests() {
+        let dir = tmp_dir("keyword_names");
+        let bend_file = dir.join("keywords.bend");
+        fs::write(&bend_file, KEYWORD_NAMES_SRC).unwrap();
+
+        // Differential check: the reference checker accepts these names.
+        let bend_bin = crate::resolve_bend_bin(
+            env::var("BEND_BIN").ok(),
+            env::var_os("PATH"),
+            env::var_os("HOME").map(PathBuf::from),
+        );
+        if let Ok(out) = Command::new(&bend_bin)
+            .arg(&bend_file)
+            .arg("--check-only")
+            .output()
+        {
+            assert!(
+                out.status.success(),
+                "bend --check-only failed: {}{}",
+                String::from_utf8_lossy(&out.stdout),
+                String::from_utf8_lossy(&out.stderr)
+            );
+        }
+
+        let summary = emit_verified_rust(KEYWORD_NAMES_SRC, 3).expect("emit keyword names");
+        let src = &summary.rust_source;
+        for expected in [
+            "pub fn r#loop(r#as: u64, r#in: u64)",
+            "pub fn dec(r#fn: u64)",
+            "pub fn own(__rb_self: u64, __rb_crate: u64)",
+            "let r#mut = __arg0.clone();",
+            "let __rb_super = __arg1.clone();",
+        ] {
+            assert!(src.contains(expected), "missing \`{expected}\` in:\\n{src}");
+        }
+
+        let program = format!(
+            "{src}\\n#[cfg(test)]\\n#[test]\\nfn keyword_named_functions_run() {{\\n    assert_eq!(r#loop(2, 3), 5);\\n    assert_eq!(pick(Slot::Slot(4, 5)), 9);\\n    assert_eq!(dec(7), 6);\\n    assert_eq!(own(1, 2), 3);\\n}}\\n"
+        );
+        let rs = dir.join("keywords.rs");
+        let bin = dir.join("keywords_bin");
+        fs::write(&rs, program).unwrap();
+        let rustc = env::var("RUSTC").unwrap_or_else(|_| "rustc".to_string());
+        let compile = Command::new(&rustc)
+            .args(["--edition", "2021", "--test", "-o"])
+            .arg(&bin)
+            .arg(&rs)
+            .output()
+            .expect("rustc must run");
+        assert!(
+            compile.status.success(),
+            "keyword names must compile: {}",
+            String::from_utf8_lossy(&compile.stderr)
+        );
+        let run = Command::new(&bin).output().expect("run test binary");
+        let out = String::from_utf8_lossy(&run.stdout);
+        assert!(run.status.success(), "law tests must pass:\\n{out}");
+        for law in ["law_pick_is_loop", "law_dec_succ", "law_own_is_loop"] {
+            assert!(
+                out.contains(&format!("{law} ... ok")),
+                "{law} must run:\\n{out}"
+            );
+        }
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn rust_keyword_law_variable_reports_counterexample() {
+        let broken = r#"import Base
+
+def keep(as: Nat) -> Nat:
+  Nat.add(as, 1n)
+
+law keep_same:
+  for as: Nat
+  {keep(as) == as : Nat}
+"#;
+        let dir = tmp_dir("keyword_ce");
+        let outcomes = evaluate_laws_for_counterexamples(broken, &["keep_same".to_string()], &dir)
+            .expect("counterexample evaluation must compile with a keyword variable");
+        assert_eq!(outcomes.len(), 1);
+        match &outcomes[0] {
+            LawEvalOutcome::Counterexample(ce) => {
+                let text = format!("{ce:?}");
+                assert!(
+                    text.contains("as"),
+                    "binding must keep its Bend name: {text}"
+                );
+            }
+            other => panic!("expected a counterexample, got {other:?}"),
+        }
+        let _ = fs::remove_dir_all(&dir);
+    }
 }
 `;
 
@@ -8529,7 +8723,15 @@ pub fn run_mutation_checks(
                 from_cache: true,
             }
         } else {
-            let r = check_single_law(law, &cone, &ctx)?;
+            let r = match check_single_law(law, &cone, &ctx) {
+                Ok(r) => r,
+                // Locked laws are only reported under MutateMode::All, never failed.
+                Err(e) if is_locked && e.starts_with("[E_MUTANT_BUILD]") => {
+                    warnings.push(format!("RustyBends mutate [{}]: {e}", law.name));
+                    continue;
+                }
+                Err(e) => return Err(e),
+            };
             if let Some((ref desc, ref ce)) = r.caught_by {
                 cache.insert(cone_key, (desc.clone(), ce.clone()));
                 cache_dirty = true;
@@ -8716,10 +8918,11 @@ fn evaluate_mutants_batch(
     match run_mutant_harness(law, mutants, types, cone_defs, type_map, type_env, out_dir) {
         Ok(res) => Ok(res),
         Err(_) => {
-            // If one mutant produced a Rust compile/type error inside a combined module,
-            // fall back to checking each mutant individually and skip invalid mutants.
+            // The combined module failed; check each mutant on its own so one bad mutant
+            // cannot hide a catch by another.
+            let mut build_failures = Vec::new();
             for m in mutants {
-                if let Ok(Some(hit)) = run_mutant_harness(
+                match run_mutant_harness(
                     law,
                     std::slice::from_ref(m),
                     types,
@@ -8728,11 +8931,45 @@ fn evaluate_mutants_batch(
                     type_env,
                     out_dir,
                 ) {
-                    return Ok(Some(hit));
+                    Ok(Some(hit)) => return Ok(Some(hit)),
+                    Ok(None) | Err(HarnessError::Run) => {}
+                    Err(HarnessError::Compile(stderr)) => {
+                        build_failures.push((m.description.clone(), stderr))
+                    }
                 }
+            }
+            // A mutant that does not compile was never tested. Counting it as a survivor
+            // would turn a tool bug into a false E_LAW_VACUOUS verdict, so report it.
+            if let Some((desc, stderr)) = build_failures.first() {
+                let first_error = stderr
+                    .lines()
+                    .find(|l| l.trim_start().starts_with("error"))
+                    .unwrap_or("(no rustc error line)")
+                    .trim();
+                return Err(format!(
+                    "[E_MUTANT_BUILD] Law '{}': {} of {} mutants did not compile, so the law could not be mutation-checked. This is a RustyBends bug, not a problem with the law; please report it.\\nFirst failing mutant: {desc}\\nrustc: {first_error}",
+                    law.name,
+                    build_failures.len(),
+                    mutants.len()
+                ));
             }
             Ok(None)
         }
+    }
+}
+
+/// Why a mutant harness produced no verdict.
+enum HarnessError {
+    /// rustc rejected the generated program (carries its stderr).
+    Compile(String),
+    /// Anything else: emitting, writing, launching or running the program. A mutant
+    /// that crashes its binary is treated as not caught, as before.
+    Run,
+}
+
+impl From<String> for HarnessError {
+    fn from(_: String) -> Self {
+        HarnessError::Run
     }
 }
 
@@ -8744,7 +8981,7 @@ fn run_mutant_harness(
     type_map: &HashMap<String, &TypeDef>,
     type_env: &TypeEnv,
     out_dir: &Path,
-) -> Result<Option<(String, String)>, String> {
+) -> Result<Option<(String, String)>, HarnessError> {
     let mut program = String::new();
     program.push_str("#![allow(clippy::all, non_snake_case, unused_variables, unused_parens, dead_code, unused_mut)]\\n");
 
@@ -8809,7 +9046,7 @@ fn run_mutant_harness(
     let eval_dir = create_temp_eval_dir(out_dir, "mut")?;
     let rs_path = eval_dir.0.join("mutate.rs");
     let bin_path = eval_dir.0.join("mutate_bin");
-    fs::write(&rs_path, program).map_err(|e| e.to_string())?;
+    fs::write(&rs_path, program).map_err(|_| HarnessError::Run)?;
 
     let rustc = env::var("RUSTC").unwrap_or_else(|_| "rustc".to_string());
     let compile = Command::new(&rustc)
@@ -8819,9 +9056,8 @@ fn run_mutant_harness(
         .output()
         .map_err(|e| format!("failed to invoke '{rustc}' for mutation testing: {e}"))?;
     if !compile.status.success() {
-        return Err(format!(
-            "rustc failed compiling mutant harness:\\n{}",
-            String::from_utf8_lossy(&compile.stderr)
+        return Err(HarnessError::Compile(
+            String::from_utf8_lossy(&compile.stderr).into_owned(),
         ));
     }
 
@@ -8829,11 +9065,7 @@ fn run_mutant_harness(
         .output()
         .map_err(|e| format!("failed to run mutant binary: {e}"))?;
     if !run.status.success() {
-        return Err(format!(
-            "mutant binary exited with failure:\\n{}{}",
-            String::from_utf8_lossy(&run.stdout),
-            String::from_utf8_lossy(&run.stderr)
-        ));
+        return Err(HarnessError::Run);
     }
 
     let stdout = String::from_utf8_lossy(&run.stdout);
@@ -10467,6 +10699,10 @@ law empty_tautology:
         run_mutant_harness(
             law, &mutants, &types, &cone_defs, &type_map, &type_env, out_dir,
         )
+        .map_err(|e| match e {
+            HarnessError::Compile(stderr) => format!("mutant harness did not compile:\\n{stderr}"),
+            HarnessError::Run => "mutant harness failed to run".to_string(),
+        })
     }
 
     /// Operators that existed before Issue #15 (legacy + bound-pushing).
@@ -10885,6 +11121,65 @@ law inc_zero:
             "warnings: {:?}",
             summary.warnings
         );
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn rust_keyword_names_are_mutation_checked_not_vacuous() {
+        // Exact reproducer from issue #16: \`as\` is a Rust keyword.
+        let dir = tmp_dir("keyword_vacuous");
+        let core = dir.join("core.bend");
+        let src = r#"import Base
+
+def keep(as: Nat) -> Nat:
+  as
+
+# promise: keep returns its input.
+law keep_same:
+  for as: Nat
+  {keep(as) == as : Nat}
+
+def keep_same(as):
+  {==}
+"#;
+        fs::write(&core, src).unwrap();
+        let report = lock::check_law_lock(&dir.join("rusty-bends.lock"), &[core], false).unwrap();
+        let summary = run_mutation_checks(src, &report, MutateMode::NewOnly, &dir.join("o"))
+            .expect("a keyword-named law must not be reported vacuous");
+        let (desc, _) = summary.reports[0].caught_by.clone().expect("caught");
+        assert!(desc.ends_with("[NatBound]"), "caught by: {desc}");
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn mutant_that_does_not_compile_is_a_tool_error_not_a_survivor() {
+        let dir = tmp_dir("mutant_build");
+        let src = r#"import Base
+
+def keep(+n: Nat) -> Nat:
+  n
+
+law keep_same:
+  for +n: Nat
+  {keep(n) == n : Nat}
+"#;
+        let laws = parse_laws(src);
+        let law = &laws[0];
+        let (types, defs) = parse_book_items(src).unwrap();
+        let type_env = TypeEnv::build(&types, &defs, &collect_law_source_slices(&laws));
+        let type_map: HashMap<String, &TypeDef> =
+            types.iter().map(|t| (t.name.clone(), t)).collect();
+        // \`True{}\` emits a Rust \`bool\` where a \`u64\` is expected, so rustc rejects it.
+        let bad = Mutant {
+            operator: "Test".to_string(),
+            description: "keep: body -> True{} [Test]".to_string(),
+            def_name: "keep".to_string(),
+            mutated_body: "True{}".to_string(),
+        };
+        let err = evaluate_mutants_batch(law, &[bad], &types, &defs, &type_map, &type_env, &dir)
+            .expect_err("an uncompilable mutant must not count as a survivor");
+        assert!(err.contains("[E_MUTANT_BUILD]"), "{err}");
+        assert!(err.contains("keep: body -> True{} [Test]"), "{err}");
         let _ = fs::remove_dir_all(&dir);
     }
 }

@@ -165,7 +165,15 @@ pub fn run_mutation_checks(
                 from_cache: true,
             }
         } else {
-            let r = check_single_law(law, &cone, &ctx)?;
+            let r = match check_single_law(law, &cone, &ctx) {
+                Ok(r) => r,
+                // Locked laws are only reported under MutateMode::All, never failed.
+                Err(e) if is_locked && e.starts_with("[E_MUTANT_BUILD]") => {
+                    warnings.push(format!("RustyBends mutate [{}]: {e}", law.name));
+                    continue;
+                }
+                Err(e) => return Err(e),
+            };
             if let Some((ref desc, ref ce)) = r.caught_by {
                 cache.insert(cone_key, (desc.clone(), ce.clone()));
                 cache_dirty = true;
@@ -352,10 +360,11 @@ fn evaluate_mutants_batch(
     match run_mutant_harness(law, mutants, types, cone_defs, type_map, type_env, out_dir) {
         Ok(res) => Ok(res),
         Err(_) => {
-            // If one mutant produced a Rust compile/type error inside a combined module,
-            // fall back to checking each mutant individually and skip invalid mutants.
+            // The combined module failed; check each mutant on its own so one bad mutant
+            // cannot hide a catch by another.
+            let mut build_failures = Vec::new();
             for m in mutants {
-                if let Ok(Some(hit)) = run_mutant_harness(
+                match run_mutant_harness(
                     law,
                     std::slice::from_ref(m),
                     types,
@@ -364,11 +373,45 @@ fn evaluate_mutants_batch(
                     type_env,
                     out_dir,
                 ) {
-                    return Ok(Some(hit));
+                    Ok(Some(hit)) => return Ok(Some(hit)),
+                    Ok(None) | Err(HarnessError::Run) => {}
+                    Err(HarnessError::Compile(stderr)) => {
+                        build_failures.push((m.description.clone(), stderr))
+                    }
                 }
+            }
+            // A mutant that does not compile was never tested. Counting it as a survivor
+            // would turn a tool bug into a false E_LAW_VACUOUS verdict, so report it.
+            if let Some((desc, stderr)) = build_failures.first() {
+                let first_error = stderr
+                    .lines()
+                    .find(|l| l.trim_start().starts_with("error"))
+                    .unwrap_or("(no rustc error line)")
+                    .trim();
+                return Err(format!(
+                    "[E_MUTANT_BUILD] Law '{}': {} of {} mutants did not compile, so the law could not be mutation-checked. This is a RustyBends bug, not a problem with the law; please report it.\nFirst failing mutant: {desc}\nrustc: {first_error}",
+                    law.name,
+                    build_failures.len(),
+                    mutants.len()
+                ));
             }
             Ok(None)
         }
+    }
+}
+
+/// Why a mutant harness produced no verdict.
+enum HarnessError {
+    /// rustc rejected the generated program (carries its stderr).
+    Compile(String),
+    /// Anything else: emitting, writing, launching or running the program. A mutant
+    /// that crashes its binary is treated as not caught, as before.
+    Run,
+}
+
+impl From<String> for HarnessError {
+    fn from(_: String) -> Self {
+        HarnessError::Run
     }
 }
 
@@ -380,7 +423,7 @@ fn run_mutant_harness(
     type_map: &HashMap<String, &TypeDef>,
     type_env: &TypeEnv,
     out_dir: &Path,
-) -> Result<Option<(String, String)>, String> {
+) -> Result<Option<(String, String)>, HarnessError> {
     let mut program = String::new();
     program.push_str("#![allow(clippy::all, non_snake_case, unused_variables, unused_parens, dead_code, unused_mut)]\n");
 
@@ -445,7 +488,7 @@ fn run_mutant_harness(
     let eval_dir = create_temp_eval_dir(out_dir, "mut")?;
     let rs_path = eval_dir.0.join("mutate.rs");
     let bin_path = eval_dir.0.join("mutate_bin");
-    fs::write(&rs_path, program).map_err(|e| e.to_string())?;
+    fs::write(&rs_path, program).map_err(|_| HarnessError::Run)?;
 
     let rustc = env::var("RUSTC").unwrap_or_else(|_| "rustc".to_string());
     let compile = Command::new(&rustc)
@@ -455,9 +498,8 @@ fn run_mutant_harness(
         .output()
         .map_err(|e| format!("failed to invoke '{rustc}' for mutation testing: {e}"))?;
     if !compile.status.success() {
-        return Err(format!(
-            "rustc failed compiling mutant harness:\n{}",
-            String::from_utf8_lossy(&compile.stderr)
+        return Err(HarnessError::Compile(
+            String::from_utf8_lossy(&compile.stderr).into_owned(),
         ));
     }
 
@@ -465,11 +507,7 @@ fn run_mutant_harness(
         .output()
         .map_err(|e| format!("failed to run mutant binary: {e}"))?;
     if !run.status.success() {
-        return Err(format!(
-            "mutant binary exited with failure:\n{}{}",
-            String::from_utf8_lossy(&run.stdout),
-            String::from_utf8_lossy(&run.stderr)
-        ));
+        return Err(HarnessError::Run);
     }
 
     let stdout = String::from_utf8_lossy(&run.stdout);
@@ -2103,6 +2141,10 @@ law empty_tautology:
         run_mutant_harness(
             law, &mutants, &types, &cone_defs, &type_map, &type_env, out_dir,
         )
+        .map_err(|e| match e {
+            HarnessError::Compile(stderr) => format!("mutant harness did not compile:\n{stderr}"),
+            HarnessError::Run => "mutant harness failed to run".to_string(),
+        })
     }
 
     /// Operators that existed before Issue #15 (legacy + bound-pushing).
@@ -2521,6 +2563,65 @@ law inc_zero:
             "warnings: {:?}",
             summary.warnings
         );
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn rust_keyword_names_are_mutation_checked_not_vacuous() {
+        // Exact reproducer from issue #16: `as` is a Rust keyword.
+        let dir = tmp_dir("keyword_vacuous");
+        let core = dir.join("core.bend");
+        let src = r#"import Base
+
+def keep(as: Nat) -> Nat:
+  as
+
+# promise: keep returns its input.
+law keep_same:
+  for as: Nat
+  {keep(as) == as : Nat}
+
+def keep_same(as):
+  {==}
+"#;
+        fs::write(&core, src).unwrap();
+        let report = lock::check_law_lock(&dir.join("rusty-bends.lock"), &[core], false).unwrap();
+        let summary = run_mutation_checks(src, &report, MutateMode::NewOnly, &dir.join("o"))
+            .expect("a keyword-named law must not be reported vacuous");
+        let (desc, _) = summary.reports[0].caught_by.clone().expect("caught");
+        assert!(desc.ends_with("[NatBound]"), "caught by: {desc}");
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn mutant_that_does_not_compile_is_a_tool_error_not_a_survivor() {
+        let dir = tmp_dir("mutant_build");
+        let src = r#"import Base
+
+def keep(+n: Nat) -> Nat:
+  n
+
+law keep_same:
+  for +n: Nat
+  {keep(n) == n : Nat}
+"#;
+        let laws = parse_laws(src);
+        let law = &laws[0];
+        let (types, defs) = parse_book_items(src).unwrap();
+        let type_env = TypeEnv::build(&types, &defs, &collect_law_source_slices(&laws));
+        let type_map: HashMap<String, &TypeDef> =
+            types.iter().map(|t| (t.name.clone(), t)).collect();
+        // `True{}` emits a Rust `bool` where a `u64` is expected, so rustc rejects it.
+        let bad = Mutant {
+            operator: "Test".to_string(),
+            description: "keep: body -> True{} [Test]".to_string(),
+            def_name: "keep".to_string(),
+            mutated_body: "True{}".to_string(),
+        };
+        let err = evaluate_mutants_batch(law, &[bad], &types, &defs, &type_map, &type_env, &dir)
+            .expect_err("an uncompilable mutant must not count as a survivor");
+        assert!(err.contains("[E_MUTANT_BUILD]"), "{err}");
+        assert!(err.contains("keep: body -> True{} [Test]"), "{err}");
         let _ = fs::remove_dir_all(&dir);
     }
 }

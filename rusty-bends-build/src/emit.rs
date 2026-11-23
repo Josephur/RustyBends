@@ -475,7 +475,13 @@ pub(crate) fn emit_items_to_rust(
 
         let rust_params = live_params
             .iter()
-            .map(|p| format!("{}: {}", p.name, bend_type_to_rust(&p.ty, &type_param_set)))
+            .map(|p| {
+                format!(
+                    "{}: {}",
+                    rust_ident(&p.name),
+                    bend_type_to_rust(&p.ty, &type_param_set)
+                )
+            })
             .collect::<Vec<_>>()
             .join(", ");
 
@@ -501,9 +507,9 @@ pub(crate) fn emit_items_to_rust(
 
         // Variants to emit: the public function (total when marked), plus a private
         // `Option` shadow when an unmarked def is called from a total function.
-        let mut variants = vec![(def.name.clone(), def.total, true)];
+        let mut variants = vec![(rust_ident(&def.name), def.total, true)];
         if !def.total && total_cone.contains(&def.name) {
-            variants.push((total_fn_name(def), true, false));
+            variants.push((rust_ident(&total_fn_name(def)), true, false));
         }
         for (fn_name, total, public) in variants {
             let ops = RefCell::new(Vec::new());
@@ -1227,6 +1233,43 @@ enum NatPattern {
     Succ { offset: u64, var: String },
 }
 
+/// Rust strict, reserved and edition-reserved keywords. A Bend name that equals one of
+/// these is legal in Bend but must never be emitted as a bare Rust identifier.
+/// `true`/`false` are left out: they are Bend literals too and must stay literals.
+const RUST_KEYWORDS: &[&str] = &[
+    "as", "async", "await", "break", "const", "continue", "crate", "dyn", "else", "enum", "extern",
+    "fn", "for", "gen", "if", "impl", "in", "let", "loop", "match", "mod", "move", "mut", "pub",
+    "ref", "return", "self", "Self", "static", "struct", "super", "trait", "try", "type", "unsafe",
+    "use", "where", "while", "abstract", "become", "box", "do", "final", "macro", "override",
+    "priv", "typeof", "unsized", "virtual", "yield",
+];
+
+/// Keywords that cannot be written as raw identifiers (`r#self` is rejected by rustc).
+const NON_RAW_KEYWORDS: &[&str] = &["self", "Self", "super", "crate"];
+
+/// Maps a Bend identifier to a Rust identifier that cannot clash with a Rust keyword:
+/// `as` becomes `r#as`, and `self`/`Self`/`super`/`crate` become `__rb_self` and so on.
+/// Every place that turns a Bend value name (def, parameter, binder, law variable) into
+/// Rust source must go through this (or [`rust_path`]).
+pub(crate) fn rust_ident(name: &str) -> String {
+    if NON_RAW_KEYWORDS.contains(&name) {
+        format!("__rb_{name}")
+    } else if RUST_KEYWORDS.contains(&name) {
+        format!("r#{name}")
+    } else {
+        name.to_string()
+    }
+}
+
+/// Like [`rust_ident`] for a dotted Bend path (`Mod.name` -> `Mod::name`), escaping each
+/// segment.
+pub(crate) fn rust_path(path: &str) -> String {
+    path.split('.')
+        .map(rust_ident)
+        .collect::<Vec<_>>()
+        .join("::")
+}
+
 fn is_valid_rust_ident_or_wildcard(s: &str) -> bool {
     if s == "_" {
         return true;
@@ -1519,7 +1562,7 @@ fn emit_single_pattern(
                         .bound_vars
                         .push((var.clone(), Some("Nat".to_string())));
                 }
-                Ok(var)
+                Ok(rust_ident(&var))
             }
             NatPattern::Succ { offset, var } if var == "_" => {
                 Ok(format!("{offset}_u64..=u64::MAX"))
@@ -1530,7 +1573,7 @@ fn emit_single_pattern(
                 let tmp = format!("__rb_n{idx}");
                 state
                     .bindings
-                    .push(format!("let {var} = {tmp} - {offset}_u64;"));
+                    .push(format!("let {} = {tmp} - {offset}_u64;", rust_ident(&var)));
                 state.bound_vars.push((var, Some("Nat".to_string())));
                 Ok(format!("{tmp} @ {offset}_u64..=u64::MAX"))
             }
@@ -1577,7 +1620,9 @@ fn emit_single_pattern(
             } else if is_plain_binder_ident(rhs, ctors) {
                 let box_tmp = format!("__rb_box{}", state.box_counter);
                 state.box_counter += 1;
-                state.bindings.push(format!("let {rhs} = *{box_tmp};"));
+                state
+                    .bindings
+                    .push(format!("let {} = *{box_tmp};", rust_ident(rhs)));
                 state.bound_vars.push((rhs.to_string(), field_ty));
                 fields.push(box_tmp);
             } else {
@@ -1624,6 +1669,7 @@ fn emit_single_pattern(
         state
             .bound_vars
             .push((clean.to_string(), expected_ty.map(str::to_string)));
+        return Ok(rust_ident(clean));
     }
     Ok(resolve_ctor_path(clean, ctors))
 }
@@ -1673,10 +1719,7 @@ fn clean_let_binding(raw: &str) -> String {
             .collect::<Vec<_>>();
         return format!("({})", parts.join(", "));
     }
-    t.trim_start_matches('+')
-        .trim_start_matches('-')
-        .trim()
-        .to_string()
+    rust_ident(t.trim_start_matches('+').trim_start_matches('-').trim())
 }
 
 fn extract_let_bound_names(raw: &str) -> Vec<String> {
@@ -2328,7 +2371,7 @@ fn emit_expr_with_ctx(expr: &str, ctx: &EmitCtx<'_>, mode: ArithMode) -> Result<
                 if ctx.total && ctx.total_cone.contains(callee) {
                     return Ok(format!(
                         "{}({})?",
-                        total_fn_name(def).replace('.', "::"),
+                        rust_path(&total_fn_name(def)),
                         emitted_args.join(", ")
                     ));
                 }
@@ -2336,7 +2379,7 @@ fn emit_expr_with_ctx(expr: &str, ctx: &EmitCtx<'_>, mode: ArithMode) -> Result<
                     // A total function called from panicking code keeps panicking semantics.
                     return Ok(format!(
                         "{}({}){}",
-                        callee.replace('.', "::"),
+                        rust_path(callee),
                         emitted_args.join(", "),
                         ctx.overflow(&format!("call {callee}"))
                     ));
@@ -2344,7 +2387,7 @@ fn emit_expr_with_ctx(expr: &str, ctx: &EmitCtx<'_>, mode: ArithMode) -> Result<
             }
             return Ok(format!(
                 "{}({})",
-                callee.replace('.', "::"),
+                rust_path(callee),
                 emitted_args.join(", ")
             ));
         }
@@ -2365,9 +2408,12 @@ fn emit_expr_with_ctx(expr: &str, ctx: &EmitCtx<'_>, mode: ArithMode) -> Result<
     }
 
     if ctx.clone_vars.contains(s) {
-        return Ok(format!("{s}.clone()"));
+        return Ok(format!("{}.clone()", rust_ident(s)));
     }
 
+    if s.split('.').all(is_valid_rust_ident_or_wildcard) {
+        return Ok(rust_path(s));
+    }
     Ok(s.replace('.', "::"))
 }
 

@@ -7,7 +7,7 @@
 use crate::emit::{
     arith_mode_for_type, bend_type_to_rust, collect_law_source_slices, emit_expr_with_mode,
     emit_items_to_rust, is_top_level_start, is_wrapped_in_parens, parse_book_items,
-    parse_list_elem_type, split_top_level_once, split_top_level_str, split_type_args,
+    parse_list_elem_type, rust_ident, split_top_level_once, split_top_level_str, split_type_args,
     strip_comment, type_contains_non_copy, ArithMode, Def, TypeDef, TypeEnv,
 };
 use crate::lock;
@@ -1068,7 +1068,7 @@ fn emit_single_law_test(
         .join(", ");
     let var_args_fmt = runtime_vars
         .iter()
-        .map(|v| v.name.as_str())
+        .map(|v| rust_ident(&v.name))
         .collect::<Vec<_>>()
         .join(", ");
 
@@ -1086,7 +1086,7 @@ fn emit_single_law_test(
     for (vi, v) in runtime_vars.iter().enumerate() {
         s.push_str(&format!(
             "            let {} = __arg{vi}.clone();\n",
-            v.name
+            rust_ident(&v.name)
         ));
     }
     let eval_block = emit_eval_closure(&hyp_pairs, &lhs_rs, &rhs_rs);
@@ -1537,7 +1537,10 @@ pub(crate) fn emit_eval_law_checker(
     }
     s.push_str("| -> bool {\n");
     for (vi, v) in runtime_vars.iter().enumerate() {
-        s.push_str(&format!("        let {} = __arg{vi}.clone();\n", v.name));
+        s.push_str(&format!(
+            "        let {} = __arg{vi}.clone();\n",
+            rust_ident(&v.name)
+        ));
     }
     s.push_str(&format!("        match {eval_expr} {{\n"));
     s.push_str("            Err(__p) if __rb_is_nat_overflow(&*__p) => false,\n");
@@ -1554,7 +1557,7 @@ pub(crate) fn emit_eval_law_checker(
             .join(", ");
         let bind_args = runtime_vars
             .iter()
-            .map(|v| v.name.as_str())
+            .map(|v| rust_ident(&v.name))
             .collect::<Vec<_>>()
             .join(", ");
         s.push_str(&format!(
@@ -1571,7 +1574,7 @@ pub(crate) fn emit_eval_law_checker(
             s.push_str(&format!(
                 "                    println!(\"BIND {}={{:?}}\", {});\n",
                 escape_rust_str(&v.name),
-                v.name
+                rust_ident(&v.name)
             ));
         }
         s.push_str("                    println!(\"LHS {:?}\", __lhs);\n");
@@ -2147,6 +2150,149 @@ def release_conserves_total(a, f, rel):
         .expect("counterexample evaluation must succeed");
         assert_eq!(outcomes.len(), 1);
         assert!(matches!(outcomes[0], LawEvalOutcome::Counterexample(_)));
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    /// Bend names that are legal in Bend 2 but are Rust keywords (issue #16).
+    const KEYWORD_NAMES_SRC: &str = r#"import Base
+
+type Slot is Data:
+  Slot{kind: Nat, ref: Nat}
+
+def loop(as: Nat, in: Nat) -> Nat:
+  Nat.add(as, in)
+
+def pick(s: Slot) -> Nat:
+  match s:
+    case Slot{dyn, ref}:
+      loop(dyn, ref)
+
+def dec(fn: Nat) -> Nat:
+  match fn:
+    case 0n:
+      0n
+    case 1n+move:
+      move
+
+def own(self: Nat, crate: Nat) -> Nat:
+  Nat.add(self, crate)
+
+law pick_is_loop:
+  for mut: Nat
+  for ref: Nat
+  {pick(Slot{mut, ref}) == loop(mut, ref) : Nat}
+
+def pick_is_loop(mut, ref):
+  {==}
+
+law dec_succ:
+  for fn: Nat
+  {dec(1n+fn) == fn : Nat}
+
+def dec_succ(fn):
+  {==}
+
+law own_is_loop:
+  for self: Nat
+  for super: Nat
+  {own(self, super) == loop(self, super) : Nat}
+
+def own_is_loop(self, super):
+  {==}
+"#;
+
+    #[test]
+    fn rust_keyword_names_compile_in_emitted_code_and_law_tests() {
+        let dir = tmp_dir("keyword_names");
+        let bend_file = dir.join("keywords.bend");
+        fs::write(&bend_file, KEYWORD_NAMES_SRC).unwrap();
+
+        // Differential check: the reference checker accepts these names.
+        let bend_bin = crate::resolve_bend_bin(
+            env::var("BEND_BIN").ok(),
+            env::var_os("PATH"),
+            env::var_os("HOME").map(PathBuf::from),
+        );
+        if let Ok(out) = Command::new(&bend_bin)
+            .arg(&bend_file)
+            .arg("--check-only")
+            .output()
+        {
+            assert!(
+                out.status.success(),
+                "bend --check-only failed: {}{}",
+                String::from_utf8_lossy(&out.stdout),
+                String::from_utf8_lossy(&out.stderr)
+            );
+        }
+
+        let summary = emit_verified_rust(KEYWORD_NAMES_SRC, 3).expect("emit keyword names");
+        let src = &summary.rust_source;
+        for expected in [
+            "pub fn r#loop(r#as: u64, r#in: u64)",
+            "pub fn dec(r#fn: u64)",
+            "pub fn own(__rb_self: u64, __rb_crate: u64)",
+            "let r#mut = __arg0.clone();",
+            "let __rb_super = __arg1.clone();",
+        ] {
+            assert!(src.contains(expected), "missing `{expected}` in:\n{src}");
+        }
+
+        let program = format!(
+            "{src}\n#[cfg(test)]\n#[test]\nfn keyword_named_functions_run() {{\n    assert_eq!(r#loop(2, 3), 5);\n    assert_eq!(pick(Slot::Slot(4, 5)), 9);\n    assert_eq!(dec(7), 6);\n    assert_eq!(own(1, 2), 3);\n}}\n"
+        );
+        let rs = dir.join("keywords.rs");
+        let bin = dir.join("keywords_bin");
+        fs::write(&rs, program).unwrap();
+        let rustc = env::var("RUSTC").unwrap_or_else(|_| "rustc".to_string());
+        let compile = Command::new(&rustc)
+            .args(["--edition", "2021", "--test", "-o"])
+            .arg(&bin)
+            .arg(&rs)
+            .output()
+            .expect("rustc must run");
+        assert!(
+            compile.status.success(),
+            "keyword names must compile: {}",
+            String::from_utf8_lossy(&compile.stderr)
+        );
+        let run = Command::new(&bin).output().expect("run test binary");
+        let out = String::from_utf8_lossy(&run.stdout);
+        assert!(run.status.success(), "law tests must pass:\n{out}");
+        for law in ["law_pick_is_loop", "law_dec_succ", "law_own_is_loop"] {
+            assert!(
+                out.contains(&format!("{law} ... ok")),
+                "{law} must run:\n{out}"
+            );
+        }
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn rust_keyword_law_variable_reports_counterexample() {
+        let broken = r#"import Base
+
+def keep(as: Nat) -> Nat:
+  Nat.add(as, 1n)
+
+law keep_same:
+  for as: Nat
+  {keep(as) == as : Nat}
+"#;
+        let dir = tmp_dir("keyword_ce");
+        let outcomes = evaluate_laws_for_counterexamples(broken, &["keep_same".to_string()], &dir)
+            .expect("counterexample evaluation must compile with a keyword variable");
+        assert_eq!(outcomes.len(), 1);
+        match &outcomes[0] {
+            LawEvalOutcome::Counterexample(ce) => {
+                let text = format!("{ce:?}");
+                assert!(
+                    text.contains("as"),
+                    "binding must keep its Bend name: {text}"
+                );
+            }
+            other => panic!("expected a counterexample, got {other:?}"),
+        }
         let _ = fs::remove_dir_all(&dir);
     }
 }
