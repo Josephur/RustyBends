@@ -23,7 +23,7 @@ On each build, for every `.bend` file in the verified directory:
    kernel check of the proofs) according to `BEND_VERDICT`. When a proof fails, it evaluates
    the emitted Rust on concrete inputs to distinguish a false law (`E_LAW_FALSE` with concrete
    `lhs` vs `rhs` values) from an incomplete proof.
-3. **Law lock, `# promise:` gate (`E_LAW_NO_PROMISE`), and mutation check (`E_LAW_VACUOUS`).** It compares every `law` with the token-canonical copy in
+3. **Law lock, `# promise:` gate (`E_LAW_NO_PROMISE`), and mutation check (`E_LAW_VACUOUS`, `E_LAW_UNCHECKED`).** It compares every `law` with the token-canonical copy in
    `rusty-bends.lock`. A locked law that was edited, weakened or deleted fails the build
    with `E_LAW_LOCK_TAMPERED`. Every new unlocked law must carry a plain-English
    `# promise:` comment directly above `law <name>:` (`E_LAW_NO_PROMISE` otherwise;
@@ -31,7 +31,9 @@ On each build, for every `.bend` file in the verified directory:
    each law's hash, so wording edits are reported in build output without tripping
    `E_LAW_LOCK_TAMPERED`. Before any new law is accepted or sealed, `rusty-bends-build`
    mutates the live functions the law depends on and checks that concrete evaluation catches at
-   least one broken mutant (`E_LAW_VACUOUS` otherwise). Building with `RUSTY_BENDS_UPDATE_LAWS=1`
+   least one broken mutant (`E_LAW_VACUOUS` otherwise). A new law the checker cannot evaluate (`exs`, a goal
+   without `==`, ...) fails with `E_LAW_UNCHECKED` unless an `# unchecked: <why>` comment sits
+   above it; the marker is recorded in the lock and shown in the law listing. Building with `RUSTY_BENDS_UPDATE_LAWS=1`
    rewrites the whole lock from the current sources once proofs and mutation checks pass:
    build once without it first, and review the lock's diff (it should only add lines).
 4. **Erasure, emission, and per-law tests.** It drops laws, proof `def`s, equality lemmas and
@@ -127,7 +129,7 @@ Import it in any file under `verified/` with `import nat_lemmas.bend as L`. Ever
 | `BENDTT` | When set, `--verdict` counts as available even if `lean` is not in `~/.elan/bin` or on `PATH`. |
 | `RUSTY_BENDS_UPDATE_LAWS` | `1` rewrites `rusty-bends.lock` from the current laws (once proofs & mutation checks pass), skipping the tamper check. Review the lock's diff before committing. |
 | `RUSTY_BENDS_MUTATE` | `all`: also runs the mutation check over locked laws and prints caught/survived diagnostics without failing the build. |
-| `RUSTY_BENDS_LIST_LAWS` | `1`: prints each law as `name: promise` during builds so reviewers can read plain-English guarantees without reading Bend 2 syntax (also available via `cargo run -p rusty-bends-build --bin rusty-bends-laws -- [dir]`). |
+| `RUSTY_BENDS_LIST_LAWS` | `1`: prints each law as `name: promise` during builds so reviewers can read plain-English guarantees without reading Bend 2 syntax (also available via `cargo run -p rusty-bends-build --bin rusty-bends-laws -- [dir]`). Laws with an `# unchecked:` marker show `[unchecked: <why>]`. |
 
 ## Repository layout
 

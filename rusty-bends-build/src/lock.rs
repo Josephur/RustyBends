@@ -21,6 +21,17 @@ pub struct CanonicalLaw {
     pub hash: String,
     pub promise: Option<String>,
     pub harm: Option<String>,
+    /// `# unchecked: <reason>` marker: the author accepts that the mutation checker cannot
+    /// evaluate this law (Issue #14). Stored in the lock next to the promise for reviewers.
+    pub unchecked: Option<String>,
+}
+
+/// Plain-English doc fields read from the comment block directly above a `law`.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct LawDocs {
+    pub promise: Option<String>,
+    pub harm: Option<String>,
+    pub unchecked: Option<String>,
 }
 
 /// Extracts all `law` blocks across the provided `.bend` files in canonical token form.
@@ -70,13 +81,18 @@ pub fn extract_laws_from_source(source: &str) -> Vec<CanonicalLaw> {
                 .collect::<Vec<_>>()
                 .join(" ");
             let hash = fnv1a_hex(canonical_sig.as_bytes());
-            let (promise, harm) = docs.get(&name).cloned().unwrap_or((None, None));
+            let LawDocs {
+                promise,
+                harm,
+                unchecked,
+            } = docs.get(&name).cloned().unwrap_or_default();
             laws.push(CanonicalLaw {
                 name,
                 canonical_sig,
                 hash,
                 promise,
                 harm,
+                unchecked,
             });
             continue;
         }
@@ -104,11 +120,10 @@ fn append_doc_field(slot: &mut Option<String>, raw: &str) {
     }
 }
 
-/// Extracts `# promise:` and `# harm:` lines from the contiguous comment block immediately above
-/// each top-level `law <name>` declaration. Blank or non-comment lines break the block.
-pub fn extract_law_doc_comments(
-    source: &str,
-) -> BTreeMap<String, (Option<String>, Option<String>)> {
+/// Extracts `# promise:`, `# harm:`, and `# unchecked:` lines from the contiguous comment block
+/// immediately above each top-level `law <name>` declaration. Blank or non-comment lines break
+/// the block.
+pub fn extract_law_doc_comments(source: &str) -> BTreeMap<String, LawDocs> {
     let mut docs = BTreeMap::new();
     let lines: Vec<&str> = source.lines().collect();
 
@@ -147,6 +162,7 @@ pub fn extract_law_doc_comments(
 
         let mut promise: Option<String> = None;
         let mut harm: Option<String> = None;
+        let mut unchecked: Option<String> = None;
         for &comment_line in &lines[start..idx] {
             let trimmed = comment_line.trim();
             let body = if let Some(rest) = trimmed.strip_prefix('#') {
@@ -166,10 +182,22 @@ pub fn extract_law_doc_comments(
                 .is_some_and(|p| p.eq_ignore_ascii_case("harm:"))
             {
                 append_doc_field(&mut harm, &body[5..]);
+            } else if body
+                .get(..10)
+                .is_some_and(|p| p.eq_ignore_ascii_case("unchecked:"))
+            {
+                append_doc_field(&mut unchecked, &body[10..]);
             }
         }
 
-        docs.insert(name.to_string(), (promise, harm));
+        docs.insert(
+            name.to_string(),
+            LawDocs {
+                promise,
+                harm,
+                unchecked,
+            },
+        );
     }
 
     docs
@@ -195,6 +223,9 @@ fn serialize_lock_entries(current: &BTreeMap<String, CanonicalLaw>) -> String {
         if let Some(ref h) = law.harm {
             lines.push(format!("# harm {}: {h}", law.name));
         }
+        if let Some(ref u) = law.unchecked {
+            lines.push(format!("# unchecked {}: {u}", law.name));
+        }
     }
     if lines.is_empty() {
         String::new()
@@ -204,11 +235,18 @@ fn serialize_lock_entries(current: &BTreeMap<String, CanonicalLaw>) -> String {
 }
 
 /// Formats a sorted `name: promise` listing suitable for PR descriptions and build output.
+/// Laws carrying an `# unchecked:` marker get a trailing `[unchecked: <reason>]` tag.
 pub fn format_law_list(laws: &BTreeMap<String, CanonicalLaw>) -> String {
     laws.values()
-        .map(|law| match &law.promise {
-            Some(p) => format!("{}: {p}", law.name),
-            None => format!("{}: (no promise)", law.name),
+        .map(|law| {
+            let base = match &law.promise {
+                Some(p) => format!("{}: {p}", law.name),
+                None => format!("{}: (no promise)", law.name),
+            };
+            match &law.unchecked {
+                Some(u) => format!("{base} [unchecked: {u}]"),
+                None => base,
+            }
         })
         .collect::<Vec<_>>()
         .join("\n")

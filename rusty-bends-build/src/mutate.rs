@@ -8,6 +8,10 @@
 //!
 //! `RUSTY_BENDS_MUTATE=all` additionally runs over already-locked laws and emits
 //! one diagnostic line per law (`CAUGHT` or `SURVIVED`) without failing on them.
+//!
+//! A new law the checker cannot evaluate at all (unsupported clause, `exs`, a goal
+//! without `==`) fails with `[E_LAW_UNCHECKED]` unless it carries an explicit
+//! `# unchecked: <reason>` marker (Issue #14). Locked laws only warn.
 
 use crate::emit::{
     collect_law_source_slices, emit_items_to_rust, leading_indent, parse_book_items,
@@ -26,6 +30,9 @@ use std::path::Path;
 use std::process::Command;
 
 const MAX_MUTANTS_PER_LAW: usize = 48;
+
+/// Law shapes the mutation checker (and the generated per-law tests) can evaluate.
+const SUPPORTED_LAW_FORMS: &str = "Supported forms: zero or more 'for x: T' binders (T = Nat, Bool, U32/U64/I32/I64, a user ADT, List<T>, or a tuple of these), optional '{a == b : T} ->' hypotheses, and an equality goal '{lhs == rhs : T}'. Not supported: 'exs' (existential), 'where' refinements, goals without '=='.";
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum MutateMode {
@@ -157,14 +164,27 @@ pub fn run_mutation_checks(
             r
         };
 
+        let unchecked_marker = lock_report
+            .current
+            .get(&law.name)
+            .and_then(|l| l.unchecked.as_deref());
+
         if is_locked && mode == MutateMode::All {
             warnings.push(format_locked_law_line(&report));
         } else if !is_locked {
             if let Some(ref reason) = report.skipped_reason {
-                warnings.push(format!(
-                    "RustyBends mutate [{}]: SKIPPED ({reason})",
-                    report.law_name
-                ));
+                match unchecked_marker {
+                    Some(marker) => warnings.push(format!(
+                        "RustyBends mutate [{}]: UNCHECKED ({reason}); accepted by '# unchecked: {marker}'",
+                        report.law_name
+                    )),
+                    None => {
+                        return Err(format!(
+                            "[E_LAW_UNCHECKED] New law '{}' cannot be mutation-checked: {reason}.\nHint: {SUPPORTED_LAW_FORMS}\nRewrite '{}' in a supported form, or, if it truly cannot be evaluated, add '# unchecked: <why>' directly above 'law {}:' so reviewers see the exemption (it is stored in rusty-bends.lock and shown by RUSTY_BENDS_LIST_LAWS=1).",
+                            report.law_name, report.law_name, report.law_name
+                        ));
+                    }
+                }
             } else if report.caught_by.is_none() {
                 let cone_str = if report.cone.is_empty() {
                     "none".to_string()
@@ -180,6 +200,14 @@ pub fn run_mutation_checks(
                     "[E_LAW_VACUOUS] Law '{}' is vacuous: it caught 0 mutants across [{cone_str}] (survived {} mutants: {ops_str}).\nHint: Strengthen '{}' so it fails when its target function is broken.",
                     report.law_name, report.total_mutants, report.law_name
                 ));
+            }
+            if report.skipped_reason.is_none() {
+                if let Some(marker) = unchecked_marker {
+                    warnings.push(format!(
+                        "RustyBends mutate [{}]: '# unchecked: {marker}' is unnecessary; the law is mutation-checkable, so remove the marker.",
+                        report.law_name
+                    ));
+                }
             }
         }
 
@@ -1460,6 +1488,108 @@ law empty_tautology:
             summary.warnings
         );
 
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    const EXS_LAW_SRC: &str = r#"import Base
+
+def double(+n: Nat) -> Nat:
+  Nat.add(n, n)
+
+# promise: some input doubles to four
+law double_hits_four:
+  exs n: Nat
+  {double(n) == 4n : Nat}
+"#;
+
+    #[test]
+    fn new_unevaluable_law_fails_with_e_law_unchecked() {
+        let dir = tmp_dir("unchecked_fail");
+        let core = dir.join("core.bend");
+        let lock_file = dir.join("rusty-bends.lock");
+        fs::write(&core, EXS_LAW_SRC).unwrap();
+        let report = lock::check_law_lock(&lock_file, std::slice::from_ref(&core), true).unwrap();
+        let err = run_mutation_checks(EXS_LAW_SRC, &report, MutateMode::NewOnly, &dir.join("o"))
+            .expect_err("an unevaluable new law must not be sealable without a marker");
+        assert!(err.contains("[E_LAW_UNCHECKED]"), "got: {err}");
+        assert!(err.contains("double_hits_four"), "got: {err}");
+        assert!(err.contains("exs"), "reason must be named: {err}");
+        assert!(
+            err.contains("Supported forms"),
+            "supported forms listed: {err}"
+        );
+        assert!(err.contains("# unchecked:"), "marker hint: {err}");
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn unchecked_marker_admits_law_and_is_locked_and_listed() {
+        let dir = tmp_dir("unchecked_ok");
+        let core = dir.join("core.bend");
+        let lock_file = dir.join("rusty-bends.lock");
+        let src = EXS_LAW_SRC.replace(
+            "# promise: some input doubles to four\n",
+            "# promise: some input doubles to four\n# unchecked: existential witness is proved by Bend, not sampled\n",
+        );
+        fs::write(&core, &src).unwrap();
+        let report = lock::check_law_lock(&lock_file, std::slice::from_ref(&core), true).unwrap();
+        let summary = run_mutation_checks(&src, &report, MutateMode::NewOnly, &dir.join("o"))
+            .expect("marked law passes");
+        assert!(
+            summary
+                .warnings
+                .iter()
+                .any(|w| w.contains("UNCHECKED")
+                    && w.contains("existential witness is proved by Bend")),
+            "warnings: {:?}",
+            summary.warnings
+        );
+        assert!(report.serialized.contains(
+            "# unchecked double_hits_four: existential witness is proved by Bend, not sampled"
+        ));
+        let listing = lock::format_law_list(&report.current);
+        assert_eq!(
+            listing,
+            "double_hits_four: some input doubles to four [unchecked: existential witness is proved by Bend, not sampled]"
+        );
+
+        // Once sealed, the law is locked and only warns (even with the marker removed).
+        lock::write_law_lock(&lock_file, &report).unwrap();
+        fs::write(&core, EXS_LAW_SRC).unwrap();
+        let locked = lock::check_law_lock(&lock_file, std::slice::from_ref(&core), false).unwrap();
+        assert!(locked.new_names.is_empty());
+        let all = run_mutation_checks(EXS_LAW_SRC, &locked, MutateMode::All, &dir.join("o"))
+            .expect("locked unevaluable laws warn, never fail");
+        assert!(all.warnings.iter().any(|w| w.contains("skipped")));
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn unnecessary_unchecked_marker_is_reported() {
+        let dir = tmp_dir("unchecked_unneeded");
+        let core = dir.join("core.bend");
+        let src = r#"import Base
+
+def inc(+n: Nat) -> Nat:
+  Nat.add(n, 1n)
+
+# promise: incrementing zero yields one
+# unchecked: not really needed
+law inc_zero:
+  {inc(0n) == 1n : Nat}
+"#;
+        fs::write(&core, src).unwrap();
+        let report = lock::check_law_lock(&dir.join("rusty-bends.lock"), &[core], false).unwrap();
+        let summary = run_mutation_checks(src, &report, MutateMode::NewOnly, &dir.join("o"))
+            .expect("checkable law passes");
+        assert!(
+            summary
+                .warnings
+                .iter()
+                .any(|w| w.contains("is unnecessary")),
+            "warnings: {:?}",
+            summary.warnings
+        );
         let _ = fs::remove_dir_all(&dir);
     }
 }
