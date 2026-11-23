@@ -52,19 +52,15 @@ pub struct EmitSummary {
 }
 
 #[derive(Debug, Clone)]
-struct CtorInfo {
-    type_name: String,
-    variant_name: String,
-    arity: usize,
+pub(crate) struct CtorInfo {
+    pub(crate) type_name: String,
+    pub(crate) variant_name: String,
+    pub(crate) arity: usize,
 }
 
-/// Parses Bend v1 'type' and 'def' items from verified source, erases all q=0 parts and laws,
-/// and emits zero-dependency Rust ready for include!(concat!(env!("OUT_DIR"), "/verified.rs")).
-pub fn emit_verified_rust(source: &str, laws_verified: usize) -> Result<EmitSummary, String> {
-    let (types, defs) = parse_book_items(source)?;
-    let def_map: HashMap<String, &Def> = defs.iter().map(|d| (d.name.clone(), d)).collect();
+pub(crate) fn build_ctor_map(types: &[TypeDef]) -> HashMap<String, CtorInfo> {
     let mut ctor_map: HashMap<String, CtorInfo> = HashMap::new();
-    for td in &types {
+    for td in types {
         for v in &td.variants {
             let info = CtorInfo {
                 type_name: td.name.clone(),
@@ -75,12 +71,55 @@ pub fn emit_verified_rust(source: &str, laws_verified: usize) -> Result<EmitSumm
             ctor_map.entry(v.name.clone()).or_insert(info);
         }
     }
+    ctor_map
+}
 
+/// Parses Bend v1 'type' and 'def' items from verified source, erases all q=0 parts and laws,
+/// and emits zero-dependency Rust (plus generated `#[cfg(test)]` per-law checks) ready for
+/// `include!(concat!(env!("OUT_DIR"), "/verified.rs"))`.
+pub fn emit_verified_rust(source: &str, laws_verified: usize) -> Result<EmitSummary, String> {
+    let (types, defs) = parse_book_items(source)?;
+    let ctor_map = build_ctor_map(&types);
+    let mut summary = emit_items_to_rust(&types, &defs, &ctor_map, laws_verified, None)?;
+
+    let laws = crate::law_test::parse_laws(source);
+    if !laws.is_empty() {
+        let test_mod = crate::law_test::emit_law_tests_module(&laws, &types, &defs, &ctor_map);
+        if !test_mod.is_empty() {
+            summary.rust_source.push('\n');
+            summary.rust_source.push_str(&test_mod);
+        }
+    }
+
+    Ok(summary)
+}
+
+/// Emits pure runtime Rust only (without `#[cfg(test)]` law harnesses).
+pub fn emit_runtime_only(source: &str, laws_verified: usize) -> Result<EmitSummary, String> {
+    let (types, defs) = parse_book_items(source)?;
+    let ctor_map = build_ctor_map(&types);
+    emit_items_to_rust(&types, &defs, &ctor_map, laws_verified, None)
+}
+
+pub(crate) fn emit_items_to_rust(
+    types: &[TypeDef],
+    defs: &[Def],
+    ctor_map: &HashMap<String, CtorInfo>,
+    laws_verified: usize,
+    step_limit: Option<usize>,
+) -> Result<EmitSummary, String> {
+    let def_map: HashMap<String, &Def> = defs.iter().map(|d| (d.name.clone(), d)).collect();
     let mut dead_params_erased = 0usize;
     let mut blocks = Vec::new();
     let empty_set = HashSet::new();
 
-    for td in &types {
+    if let Some(limit) = step_limit {
+        blocks.push(format!(
+            "std::thread_local! {{\n    static __RB_STEPS: std::cell::Cell<usize> = const {{ std::cell::Cell::new(0) }};\n}}\n\nfn __rb_reset_steps() {{\n    __RB_STEPS.with(|c| c.set(0));\n}}\n\nfn __rb_tick() {{\n    __RB_STEPS.with(|c| {{\n        let next = c.get().saturating_add(1);\n        c.set(next);\n        if next > {limit} {{\n            panic!(\"rusty-bends: step limit\");\n        }}\n    }});\n}}"
+        ));
+    }
+
+    for td in types {
         let mut variants_rs = Vec::new();
         for v in &td.variants {
             if v.field_types.is_empty() {
@@ -101,7 +140,7 @@ pub fn emit_verified_rust(source: &str, laws_verified: usize) -> Result<EmitSumm
         ));
     }
 
-    for def in &defs {
+    for def in defs {
         let mut type_params = Vec::new();
         let mut type_param_set = HashSet::new();
         let mut live_params = Vec::new();
@@ -130,12 +169,17 @@ pub fn emit_verified_rust(source: &str, laws_verified: usize) -> Result<EmitSumm
             .collect::<Vec<_>>()
             .join(", ");
 
-        let default_mode = arith_mode_for_type(&def.ret, ArithMode::Saturating);
-        let body_expr = emit_expr_with_mode(&def.body, &def_map, &ctor_map, default_mode)?;
+        let default_mode = arith_mode_for_type(&def.ret, ArithMode::NatChecked);
+        let body_expr = emit_expr_with_mode(&def.body, &def_map, ctor_map, default_mode)?;
         let ret_ty = infer_return_type(&def.body, &def.ret, &type_param_set);
+        let guard_prefix = if step_limit.is_some() {
+            "__rb_tick();\n    "
+        } else {
+            ""
+        };
 
         blocks.push(format!(
-            "#[inline]\n#[allow(unused_variables, unused_parens, clippy::let_and_return)]\npub fn {name}{generics}({rust_params}) -> {ret_ty} {{\n    {body_expr}\n}}",
+            "#[inline]\n#[allow(unused_variables, unused_parens, clippy::let_and_return, clippy::double_parens, clippy::unnecessary_cast)]\npub fn {name}{generics}({rust_params}) -> {ret_ty} {{\n    {guard_prefix}{body_expr}\n}}",
             name = def.name
         ));
     }
@@ -354,7 +398,7 @@ fn parse_variant(raw: &str) -> Result<Variant, String> {
     Ok(Variant { name, field_types })
 }
 
-fn is_top_level_start(raw_line: &str, trimmed: &str) -> bool {
+pub(crate) fn is_top_level_start(raw_line: &str, trimmed: &str) -> bool {
     let not_indented = !raw_line.starts_with(' ') && !raw_line.starts_with('\t');
     not_indented
         && (trimmed.starts_with("import ")
@@ -364,7 +408,7 @@ fn is_top_level_start(raw_line: &str, trimmed: &str) -> bool {
             || trimmed.starts_with("proof "))
 }
 
-fn strip_comment(line: &str) -> &str {
+pub(crate) fn strip_comment(line: &str) -> &str {
     let mut end = line.len();
     if let Some(pos) = line.find('#') {
         end = end.min(pos);
@@ -486,20 +530,20 @@ fn parse_def_header(header: &str, body: String) -> Result<Def, String> {
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-enum ArithMode {
-    Saturating,
+pub(crate) enum ArithMode {
+    NatChecked,
     Wrapping,
 }
 
-fn arith_mode_for_type(ty: &str, fallback: ArithMode) -> ArithMode {
+pub(crate) fn arith_mode_for_type(ty: &str, fallback: ArithMode) -> ArithMode {
     match ty.trim() {
         "U32" | "U64" | "I32" | "I64" => ArithMode::Wrapping,
-        "Nat" => ArithMode::Saturating,
+        "Nat" => ArithMode::NatChecked,
         _ => fallback,
     }
 }
 
-fn bend_type_to_rust(ty: &str, type_params: &HashSet<String>) -> String {
+pub(crate) fn bend_type_to_rust(ty: &str, type_params: &HashSet<String>) -> String {
     let t = ty.trim();
     if is_wrapped_in_parens(t) {
         let inner = t[1..t.len() - 1].trim();
@@ -934,7 +978,7 @@ fn parse_indented_case_arms(lines: &[&str]) -> Vec<(String, String)> {
     arms
 }
 
-fn emit_expr_with_mode(
+pub(crate) fn emit_expr_with_mode(
     expr: &str,
     defs: &HashMap<String, &Def>,
     ctors: &HashMap<String, CtorInfo>,
@@ -1102,13 +1146,15 @@ fn emit_expr_with_mode(
         }
     }
 
-    // Right-to-left top-level '+' or '-' (saturating for Nat, wrapping for U32/U64/I32/I64)
+    // Right-to-left top-level '+' or '-' (checked add / saturating sub for Nat; wrapping for U32/U64/I32/I64)
     if let Some((op, lhs, rhs)) = split_last_additive(s) {
         let l = emit_expr_with_mode(lhs, defs, ctors, mode)?;
         let r = emit_expr_with_mode(rhs, defs, ctors, mode)?;
         return Ok(match (mode, op) {
-            (ArithMode::Saturating, '+') => format!("({l}).saturating_add({r})"),
-            (ArithMode::Saturating, '-') => format!("({l}).saturating_sub({r})"),
+            (ArithMode::NatChecked, '+') => {
+                format!("({l}).checked_add({r}).expect(\"rusty-bends: Nat overflow\")")
+            }
+            (ArithMode::NatChecked, '-') => format!("({l}).saturating_sub({r})"),
             (ArithMode::Wrapping, '+') => format!("({l}).wrapping_add({r})"),
             (ArithMode::Wrapping, '-') => format!("({l}).wrapping_sub({r})"),
             _ => unreachable!(),
@@ -1120,15 +1166,17 @@ fn emit_expr_with_mode(
         let l = emit_expr_with_mode(lhs, defs, ctors, mode)?;
         let r = emit_expr_with_mode(rhs, defs, ctors, mode)?;
         return Ok(match (mode, op) {
-            (ArithMode::Saturating, '*') => format!("({l}).saturating_mul({r})"),
+            (ArithMode::NatChecked, '*') => {
+                format!("({l}).checked_mul({r}).expect(\"rusty-bends: Nat overflow\")")
+            }
             (ArithMode::Wrapping, '*') => format!("({l}).wrapping_mul({r})"),
-            (ArithMode::Saturating, '/') => {
+            (ArithMode::NatChecked, '/') => {
                 format!("{{ let __a = {l}; let __b = {r}; if __b == 0_u64 {{ 0_u64 }} else {{ __a / __b }} }}")
             }
             (ArithMode::Wrapping, '/') => {
                 format!("{{ let __a = {l}; let __b = {r}; if __b == 0 {{ 0 }} else {{ __a.wrapping_div(__b) }} }}")
             }
-            (ArithMode::Saturating, '%') => {
+            (ArithMode::NatChecked, '%') => {
                 format!("{{ let __a = {l}; let __b = {r}; if __b == 0_u64 {{ __a }} else {{ __a % __b }} }}")
             }
             (ArithMode::Wrapping, '%') => {
@@ -1247,84 +1295,93 @@ fn emit_base_builtin(
     Ok(match (callee, raw_args.len()) {
         // Unary Bool / Nat / Pair helpers
         ("Bool.not", 1) => Some(format!("(!({}))", e(raw_args[0], mode)?)),
-        ("Nat.is_zero", 1) => Some(format!("(({}) == 0_u64)", e(raw_args[0], ArithMode::Saturating)?)),
-        ("Nat.succ", 1) => Some(format!("({}).saturating_add(1_u64)", e(raw_args[0], ArithMode::Saturating)?)),
-        ("Nat.pred", 1) => Some(format!("({}).saturating_sub(1_u64)", e(raw_args[0], ArithMode::Saturating)?)),
+        ("Nat.is_zero", 1) => Some(format!(
+            "(({}) == 0_u64)",
+            e(raw_args[0], ArithMode::NatChecked)?
+        )),
+        ("Nat.succ", 1) => Some(format!(
+            "({}).checked_add(1_u64).expect(\"rusty-bends: Nat overflow\")",
+            e(raw_args[0], ArithMode::NatChecked)?
+        )),
+        ("Nat.pred", 1) => Some(format!(
+            "({}).saturating_sub(1_u64)",
+            e(raw_args[0], ArithMode::NatChecked)?
+        )),
         ("Pair.fst", 1) => Some(format!("({}).0", e(raw_args[0], mode)?)),
         ("Pair.snd", 1) => Some(format!("({}).1", e(raw_args[0], mode)?)),
 
-        // Binary Nat arithmetic (saturating u64 + total div/mod matching Bend 2 base.bend)
+        // Binary Nat arithmetic (checked add/mul, saturating sub, total div/mod matching Bend 2)
         ("Nat.add", 2) => Some(format!(
-            "({}).saturating_add({})",
-            e(raw_args[0], ArithMode::Saturating)?,
-            e(raw_args[1], ArithMode::Saturating)?
+            "({}).checked_add({}).expect(\"rusty-bends: Nat overflow\")",
+            e(raw_args[0], ArithMode::NatChecked)?,
+            e(raw_args[1], ArithMode::NatChecked)?
         )),
         ("Nat.sub", 2) => Some(format!(
             "({}).saturating_sub({})",
-            e(raw_args[0], ArithMode::Saturating)?,
-            e(raw_args[1], ArithMode::Saturating)?
+            e(raw_args[0], ArithMode::NatChecked)?,
+            e(raw_args[1], ArithMode::NatChecked)?
         )),
         ("Nat.mul", 2) => Some(format!(
-            "({}).saturating_mul({})",
-            e(raw_args[0], ArithMode::Saturating)?,
-            e(raw_args[1], ArithMode::Saturating)?
+            "({}).checked_mul({}).expect(\"rusty-bends: Nat overflow\")",
+            e(raw_args[0], ArithMode::NatChecked)?,
+            e(raw_args[1], ArithMode::NatChecked)?
         )),
         ("Nat.div", 2) => Some(format!(
             "{{ let __a = {}; let __b = {}; if __b == 0_u64 {{ 0_u64 }} else {{ __a / __b }} }}",
-            e(raw_args[0], ArithMode::Saturating)?,
-            e(raw_args[1], ArithMode::Saturating)?
+            e(raw_args[0], ArithMode::NatChecked)?,
+            e(raw_args[1], ArithMode::NatChecked)?
         )),
         ("Nat.mod", 2) => Some(format!(
             "{{ let __a = {}; let __b = {}; if __b == 0_u64 {{ __a }} else {{ __a % __b }} }}",
-            e(raw_args[0], ArithMode::Saturating)?,
-            e(raw_args[1], ArithMode::Saturating)?
+            e(raw_args[0], ArithMode::NatChecked)?,
+            e(raw_args[1], ArithMode::NatChecked)?
         )),
         ("Nat.divmod", 2) => Some(format!(
             "{{ let __a = {}; let __b = {}; if __b == 0_u64 {{ (0_u64, __a) }} else {{ (__a / __b, __a % __b) }} }}",
-            e(raw_args[0], ArithMode::Saturating)?,
-            e(raw_args[1], ArithMode::Saturating)?
+            e(raw_args[0], ArithMode::NatChecked)?,
+            e(raw_args[1], ArithMode::NatChecked)?
         )),
         ("Nat.min", 2) => Some(format!(
             "({}).min({})",
-            e(raw_args[0], ArithMode::Saturating)?,
-            e(raw_args[1], ArithMode::Saturating)?
+            e(raw_args[0], ArithMode::NatChecked)?,
+            e(raw_args[1], ArithMode::NatChecked)?
         )),
         ("Nat.max", 2) => Some(format!(
             "({}).max({})",
-            e(raw_args[0], ArithMode::Saturating)?,
-            e(raw_args[1], ArithMode::Saturating)?
+            e(raw_args[0], ArithMode::NatChecked)?,
+            e(raw_args[1], ArithMode::NatChecked)?
         )),
 
         // Binary Nat comparisons
         ("Nat.is_le" | "Nat.le" | "Nat.lte", 2) => Some(format!(
             "(({}) <= ({}))",
-            e(raw_args[0], ArithMode::Saturating)?,
-            e(raw_args[1], ArithMode::Saturating)?
+            e(raw_args[0], ArithMode::NatChecked)?,
+            e(raw_args[1], ArithMode::NatChecked)?
         )),
         ("Nat.is_lt" | "Nat.lt", 2) => Some(format!(
             "(({}) < ({}))",
-            e(raw_args[0], ArithMode::Saturating)?,
-            e(raw_args[1], ArithMode::Saturating)?
+            e(raw_args[0], ArithMode::NatChecked)?,
+            e(raw_args[1], ArithMode::NatChecked)?
         )),
         ("Nat.is_ge" | "Nat.ge" | "Nat.gte", 2) => Some(format!(
             "(({}) >= ({}))",
-            e(raw_args[0], ArithMode::Saturating)?,
-            e(raw_args[1], ArithMode::Saturating)?
+            e(raw_args[0], ArithMode::NatChecked)?,
+            e(raw_args[1], ArithMode::NatChecked)?
         )),
         ("Nat.is_gt" | "Nat.gt", 2) => Some(format!(
             "(({}) > ({}))",
-            e(raw_args[0], ArithMode::Saturating)?,
-            e(raw_args[1], ArithMode::Saturating)?
+            e(raw_args[0], ArithMode::NatChecked)?,
+            e(raw_args[1], ArithMode::NatChecked)?
         )),
         ("Nat.is_eq" | "Nat.eq" | "Nat.equal", 2) => Some(format!(
             "(({}) == ({}))",
-            e(raw_args[0], ArithMode::Saturating)?,
-            e(raw_args[1], ArithMode::Saturating)?
+            e(raw_args[0], ArithMode::NatChecked)?,
+            e(raw_args[1], ArithMode::NatChecked)?
         )),
         ("Nat.is_ne" | "Nat.ne", 2) => Some(format!(
             "(({}) != ({}))",
-            e(raw_args[0], ArithMode::Saturating)?,
-            e(raw_args[1], ArithMode::Saturating)?
+            e(raw_args[0], ArithMode::NatChecked)?,
+            e(raw_args[1], ArithMode::NatChecked)?
         )),
 
         // Binary Bool logic
@@ -1443,7 +1500,7 @@ fn split_keyword<'a>(s: &'a str, needle: &str) -> Option<(&'a str, &'a str)> {
     None
 }
 
-fn split_top_level_str<'a>(s: &'a str, op: &str) -> Option<(&'a str, &'a str)> {
+pub(crate) fn split_top_level_str<'a>(s: &'a str, op: &str) -> Option<(&'a str, &'a str)> {
     let mut depth = 0i32;
     let bytes = s.as_bytes();
     for i in 0..bytes.len() {
@@ -1471,7 +1528,7 @@ fn is_valid_path_ident(s: &str) -> bool {
             .all(|c| c.is_ascii_alphanumeric() || c == '_' || c == '.')
 }
 
-fn is_wrapped_in_parens(s: &str) -> bool {
+pub(crate) fn is_wrapped_in_parens(s: &str) -> bool {
     if !(s.starts_with('(') && s.ends_with(')')) {
         return false;
     }
@@ -1491,7 +1548,7 @@ fn is_wrapped_in_parens(s: &str) -> bool {
     depth == 0
 }
 
-fn unwrap_outer_parens(s: &str) -> &str {
+pub(crate) fn unwrap_outer_parens(s: &str) -> &str {
     let mut cur = s.trim();
     while is_wrapped_in_parens(cur) {
         cur = cur[1..cur.len() - 1].trim();
@@ -1499,7 +1556,7 @@ fn unwrap_outer_parens(s: &str) -> &str {
     cur
 }
 
-fn split_top_level(s: &str, delim: char) -> Vec<&str> {
+pub(crate) fn split_top_level(s: &str, delim: char) -> Vec<&str> {
     let mut parts = Vec::new();
     let mut depth = 0i32;
     let mut start = 0;
@@ -1518,7 +1575,7 @@ fn split_top_level(s: &str, delim: char) -> Vec<&str> {
     parts
 }
 
-fn split_top_level_once(s: &str, delim: char) -> Option<(&str, &str)> {
+pub(crate) fn split_top_level_once(s: &str, delim: char) -> Option<(&str, &str)> {
     let mut depth = 0i32;
     for (idx, ch) in s.char_indices() {
         match ch {
@@ -1584,7 +1641,7 @@ mod tests {
     }
 
     #[test]
-    fn emits_saturating_nat_math_and_erases_laws() {
+    fn emits_checked_nat_math_and_erases_laws() {
         let src = r#"
 def deposit(+bal: Nat, +amt: Nat) -> Nat:
   (bal + amt : Nat)
@@ -1599,19 +1656,23 @@ proof deposit_zero:
   refl
 "#;
         let summary = emit_verified_rust(src, 1).expect("emit succeeded");
-        let code_only: String = summary
+        let (runtime_part, tests_part) = summary
             .rust_source
+            .split_once("#[cfg(test)]")
+            .expect("expected generated #[cfg(test)] law module");
+        let code_only: String = runtime_part
             .lines()
             .filter(|l| !l.trim_start().starts_with("//"))
             .collect::<Vec<_>>()
             .join("\n");
         assert_eq!(summary.defs_emitted, 2);
         assert!(code_only.contains("pub fn deposit(bal: u64, amt: u64) -> u64"));
-        assert!(code_only.contains("(bal).saturating_add(amt)"));
+        assert!(code_only.contains("(bal).checked_add(amt).expect(\"rusty-bends: Nat overflow\")"));
         assert!(code_only.contains("(gross).saturating_sub(fee)"));
         assert!(!code_only.contains("law "));
         assert!(!code_only.contains("proof "));
         assert!(!code_only.contains("refl"));
+        assert!(tests_part.contains("fn law_deposit_zero()"));
     }
 
     #[test]
@@ -1662,18 +1723,19 @@ proof cancel_idempotent:
     case OrderState.Cancelled => refl
 "#;
         let summary = emit_verified_rust(src, 1).expect("emit succeeded");
+        let (runtime_part, tests_part) = summary
+            .rust_source
+            .split_once("#[cfg(test)]")
+            .expect("expected generated #[cfg(test)] law module");
         assert_eq!(summary.types_emitted, 1);
         assert_eq!(summary.defs_emitted, 1);
-        assert!(summary.rust_source.contains("pub enum OrderState"));
-        assert!(summary.rust_source.contains("Paid(u64),"));
-        assert!(summary
-            .rust_source
-            .contains("OrderState::Draft => OrderState::Cancelled,"));
-        assert!(summary
-            .rust_source
-            .contains("OrderState::Paid(amt) => OrderState::Cancelled,"));
-        assert!(!summary.rust_source.contains("cancel_idempotent"));
-        assert!(!summary.rust_source.contains("refl"));
+        assert!(runtime_part.contains("pub enum OrderState"));
+        assert!(runtime_part.contains("Paid(u64),"));
+        assert!(runtime_part.contains("OrderState::Draft => OrderState::Cancelled,"));
+        assert!(runtime_part.contains("OrderState::Paid(amt) => OrderState::Cancelled,"));
+        assert!(!runtime_part.contains("cancel_idempotent"));
+        assert!(!runtime_part.contains("refl"));
+        assert!(tests_part.contains("fn law_cancel_idempotent()"));
     }
 
     #[test]
@@ -1740,24 +1802,26 @@ def cancel_idempotent(s):
     case Cancelled{}: {==}
 "#;
         let summary = emit_verified_rust(src, 2).expect("real bend2 emit succeeded");
+        let (runtime_part, tests_part) = summary
+            .rust_source
+            .split_once("#[cfg(test)]")
+            .expect("expected generated #[cfg(test)] law module");
         assert_eq!(summary.types_emitted, 1);
         assert_eq!(summary.defs_emitted, 2);
-        assert!(summary.rust_source.contains("pub enum OrderState"));
-        assert!(summary.rust_source.contains("Draft,"));
-        assert!(summary.rust_source.contains("Paid(u64),"));
-        assert!(summary.rust_source.contains("(bal).saturating_add(amt)"));
-        assert!(summary
-            .rust_source
-            .contains("OrderState::Draft => OrderState::Cancelled,"));
-        assert!(summary
-            .rust_source
-            .contains("OrderState::Paid(amt) => OrderState::Cancelled,"));
-        assert!(summary
-            .rust_source
-            .contains("OrderState::Shipped(amt) => OrderState::Shipped(amt),"));
-        assert!(!summary.rust_source.contains("deposit_zero"));
-        assert!(!summary.rust_source.contains("cancel_idempotent"));
-        assert!(!summary.rust_source.contains("{==}"));
+        assert!(runtime_part.contains("pub enum OrderState"));
+        assert!(runtime_part.contains("Draft,"));
+        assert!(runtime_part.contains("Paid(u64),"));
+        assert!(
+            runtime_part.contains("(bal).checked_add(amt).expect(\"rusty-bends: Nat overflow\")")
+        );
+        assert!(runtime_part.contains("OrderState::Draft => OrderState::Cancelled,"));
+        assert!(runtime_part.contains("OrderState::Paid(amt) => OrderState::Cancelled,"));
+        assert!(runtime_part.contains("OrderState::Shipped(amt) => OrderState::Shipped(amt),"));
+        assert!(!runtime_part.contains("deposit_zero"));
+        assert!(!runtime_part.contains("cancel_idempotent"));
+        assert!(!runtime_part.contains("{==}"));
+        assert!(tests_part.contains("fn law_deposit_zero()"));
+        assert!(tests_part.contains("fn law_cancel_idempotent()"));
     }
 
     #[test]
@@ -1798,12 +1862,15 @@ def cmp_flags(a: Nat, b: Nat) -> Bool:
     }
 
     #[test]
-    fn emits_wrapping_for_u32_and_saturating_for_nat() {
+    fn emits_wrapping_for_u32_and_checked_for_nat() {
         let src = r#"
 def wrap_u32(a: U32, b: U32) -> U32:
   ((a + b : U32) * (a - b : U32) : U32)
 
-def sat_nat(a: Nat, b: Nat) -> Nat:
+def checked_nat(a: Nat, b: Nat) -> Nat:
+  (a + b : Nat)
+
+def sub_nat(a: Nat, b: Nat) -> Nat:
   (a - b : Nat)
 "#;
         let summary = emit_verified_rust(src, 0).expect("arith mode emit succeeded");
@@ -1815,7 +1882,10 @@ def sat_nat(a: Nat, b: Nat) -> Nat:
             .contains("((a).wrapping_add(b)).wrapping_mul((a).wrapping_sub(b))"));
         assert!(summary
             .rust_source
-            .contains("pub fn sat_nat(a: u64, b: u64) -> u64"));
+            .contains("pub fn checked_nat(a: u64, b: u64) -> u64"));
+        assert!(summary
+            .rust_source
+            .contains("(a).checked_add(b).expect(\"rusty-bends: Nat overflow\")"));
         assert!(summary.rust_source.contains("(a).saturating_sub(b)"));
     }
 
@@ -1925,9 +1995,9 @@ def one_liner(n: Nat) -> Nat: Nat.add(n, 1n)
             .rust_source
             .contains("pub fn one_liner(n: u64) -> u64"));
         assert!(!summary.rust_source.contains("add_zero_eq"));
-        assert!(summary
-            .rust_source
-            .contains("#[allow(unused_variables, unused_parens, clippy::let_and_return)]"));
+        assert!(summary.rust_source.contains(
+            "#[allow(unused_variables, unused_parens, clippy::let_and_return, clippy::double_parens, clippy::unnecessary_cast)]"
+        ));
     }
 
     #[test]

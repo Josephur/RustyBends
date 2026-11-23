@@ -10,6 +10,7 @@
 //! }
 
 pub mod emit;
+pub mod law_test;
 pub mod lock;
 
 use std::env;
@@ -400,7 +401,7 @@ fn collect_bend_files(dir: &Path, out: &mut Vec<PathBuf>) -> Result<(), String> 
 }
 
 fn hash_files(files: &[PathBuf]) -> Result<String, String> {
-    let mut buf = Vec::new();
+    let mut buf = b"rb-cache-v2\0".to_vec();
     for f in files {
         buf.extend_from_slice(f.to_string_lossy().as_bytes());
         buf.push(0);
@@ -463,9 +464,13 @@ mod tests {
 
         assert_eq!(calls, 1);
         let emitted = fs::read_to_string(&out_rs).unwrap();
-        assert!(emitted.contains("pub enum Status"));
-        assert!(emitted.contains("Status::Open => Status::Closed,"));
-        assert!(!emitted.contains("law close_idem"));
+        let (runtime_part, tests_part) = emitted
+            .split_once("#[cfg(test)]")
+            .expect("expected generated #[cfg(test)] law module");
+        assert!(runtime_part.contains("pub enum Status"));
+        assert!(runtime_part.contains("Status::Open => Status::Closed,"));
+        assert!(!runtime_part.contains("law close_idem"));
+        assert!(tests_part.contains("fn law_close_idem()"));
 
         // Second run with unchanged files hits cache (0 checker invocations)
         run_with_checker(&cfg, |_file, _has_laws| {

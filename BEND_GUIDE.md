@@ -87,22 +87,24 @@ def cancel_idempotent(s):
 
 `rusty-bends-build/src/emit.rs` lowers Bend 2 `Base` stdlib calls directly to zero-overhead Rust:
 
-- **`Nat` arithmetic (saturating `u64`, total division — never panics):**
-  - `Nat.add`, `Nat.sub`, `Nat.mul` -> `saturating_add`, `saturating_sub`, `saturating_mul`
+- **`Nat` arithmetic (checked `u64` on growth, saturating subtraction, total division):**
+  - `Nat.add`, `Nat.mul`, `Nat.succ` -> `checked_add` / `checked_mul` (panics with `"rusty-bends: Nat overflow"` on `u64` overflow, so emitted Rust agrees with mathematical `Nat` wherever it returns and never silently saturates past `u64::MAX` into a law-violating state).
+  - `Nat.sub`, `Nat.pred` -> `saturating_sub` (exact match for Peano `0n - x == 0n`).
   - `Nat.div(a, b)` / `Nat.mod(a, b)` / `Nat.divmod(a, b)` -> total div/mod matching Bend 2 (`Nat.div(a, 0n) == 0n`, `Nat.mod(a, 0n) == a`)
-  - `Nat.min`, `Nat.max`, `Nat.succ`, `Nat.pred`, `Nat.is_zero`
+  - `Nat.min`, `Nat.max`, `Nat.is_zero`
   - `Nat.is_le`, `Nat.is_lt`, `Nat.is_ge`, `Nat.is_gt`, `Nat.is_eq`, `Nat.is_ne`
 - **`Bool` & `Pair` helpers:**
   - `Bool.and`, `Bool.or`, `Bool.not`, `Bool.xor`, `Bool.is_eq`, `Bool.is_ne`, `Bool.pick`
   - `A & B` pair types -> `(A, B)`, `Pair.fst`, `Pair.snd`
 - **Fixed-width integers vs `Nat`:**
-  - `(a + b : Nat)` / `(a - b : Nat)` / `(a * b : Nat)` emit **saturating** `u64` ops (exact match for Peano `Nat` non-underflow proofs).
+  - `(a + b : Nat)` / `(a * b : Nat)` emit **checked** `u64` ops (panicking on `u64` overflow), while `(a - b : Nat)` emits `saturating_sub`.
   - `(a + b : U32)` / `U64` / `I32` / `I64` emit **wrapping** ops (`wrapping_add`, `wrapping_sub`, `wrapping_mul`) matching Bend 2's fixed-width integer semantics.
-- **Control flow & patterns:** nested `match`, multi-scrutinee `match a b:`, `case 1n+p:` successor patterns, and multi-line `let` bindings are all supported.
+- **Control flow & patterns:** nested `match`, multi-scrutinee `match a b:`, `case 1n+p:` and nested `case 1n+1n+q:` successor patterns, and multi-line `let` bindings are all supported.
+- **Generated per-law Rust tests:** every `law` also emits a `#[cfg(test)]` Rust test into `OUT_DIR/verified.rs` (run automatically by `cargo test`) that checks the emitted functions across small values, `u64::MAX - 1`, `u64::MAX`, ADT constructors, and deterministic PRNG samples (skipping only checked `Nat` overflow panics).
 
 ## 5. Mandatory Rules for AI Agents
 
-1. **Always type-annotate operators (Bend 2.0.17+).** Write `(a + b : U32)` (wrapping) or `Nat.add(a, b)` / `(a + b : Nat)` (saturating) — never bare `a + b`.
+1. **Always type-annotate operators (Bend 2.0.17+).** Write `(a + b : U32)` (wrapping) or `Nat.add(a, b)` / `(a + b : Nat)` (checked `Nat` add) — never bare `a + b`.
 2. **Use real Bend 2 `law` + proof `def` syntax.** Never invent `proof foo: refl`; write `law foo: for x: T {lhs == rhs : T}` paired with `def foo(x): ... {==}`. Helper lemmas returning `{lhs == rhs : T}` are also erased automatically.
 3. **Run `cargo check` after every edit.** Cargo runs `build.rs` -> `rusty_bends_build::verify_and_emit("verified")`.
 4. **NEVER delete, comment out, or weaken laws in `verified/`.**

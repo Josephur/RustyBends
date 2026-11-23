@@ -26,12 +26,15 @@ On each build, for every `.bend` file in the verified directory:
    with `E_LAW_LOCK_TAMPERED`. Building with `RUSTY_BENDS_UPDATE_LAWS=1` rewrites the whole
    lock from the current sources, so it is how new laws get locked, and it skips the check:
    build once without it first, and review the lock's diff (it should only add lines).
-4. **Erasure and emission.** It drops laws, proof `def`s, equality lemmas and other `q=0`
-   terms, and writes the rest (ADTs as `pub enum`, `match`, functions over `Nat` /
-   fixed-width integers / `Bool` / pairs) to `$OUT_DIR/verified.rs`.
+4. **Erasure, emission, and per-law tests.** It drops laws, proof `def`s, equality lemmas and
+   other `q=0` terms from the runtime output, writes the remaining functions and ADTs
+   (`pub enum`, `match`, `Nat` / fixed-width integers / `Bool` / pairs) to
+   `$OUT_DIR/verified.rs`, and appends generated `#[cfg(test)]` per-law tests so
+   `cargo test` checks the emitted Rust directly.
 
-`Nat` arithmetic is emitted as saturating `u64` with total division, so what the Peano
-proofs state (`0 - x == 0`, `a / 0 == 0`, `a % 0 == a`) is exactly what the Rust does.
+`Nat` arithmetic emits `checked_add` / `checked_mul` (panicking on `u64` overflow so
+emitted Rust agrees with mathematical `Nat` wherever it returns) together with
+`saturating_sub` and total division (`0 - x == 0`, `a / 0 == 0`, `a % 0 == a`).
 
 The crate has no dependencies beyond the Rust standard library.
 
