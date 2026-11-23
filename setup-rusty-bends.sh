@@ -7730,7 +7730,11 @@ use std::fs;
 use std::path::Path;
 use std::process::Command;
 
+/// Budget for the original operator families (selection order unchanged since Issue #6).
 const MAX_MUTANTS_PER_LAW: usize = 48;
+/// Separate budget for the bound-pushing operator families (Issue #12), shared round-robin
+/// so every family is represented even when the legacy families fill their budget.
+const MAX_BOUND_MUTANTS_PER_LAW: usize = 48;
 
 /// Law shapes the mutation checker (and the generated per-law tests) can evaluate.
 const SUPPORTED_LAW_FORMS: &str = "Supported forms: zero or more 'for x: T' binders (T = Nat, Bool, U32/U64/I32/I64, a user ADT, List<T>, or a tuple of these), optional '{a == b : T} ->' hypotheses, and an equality goal '{lhs == rhs : T}'. Not supported: 'exs' (existential), 'where' refinements, goals without '=='.";
@@ -8180,65 +8184,449 @@ fn run_mutant_harness(
     Ok(None)
 }
 
+/// A candidate mutant before selection: `(def, mutated body, description)`.
+type Candidate<'a> = (&'a Def, String, String);
+
 /// Generates small syntactic mutants for all live `Def`s in a law's dependency cone.
+///
+/// Legacy families (BoolFlip, NatCmpArith, DropBoolOperand, ReturnUnchanged, SwapMatchArms)
+/// fill the first `MAX_MUTANTS_PER_LAW` slots in their original order. The bound-pushing
+/// families (NatBound, SiblingCtor, BoolConst, FlipCmp) then take up to
+/// `MAX_BOUND_MUTANTS_PER_LAW` more slots, round-robin across families. Each mutant's
+/// description ends with `[<Operator>]` so reports name the operator that caught a law.
 pub(crate) fn generate_mutants_for_cone(
     cone_defs: &[Def],
     def_map: &HashMap<String, &Def>,
     ctor_map: &HashMap<String, CtorInfo>,
 ) -> Vec<Mutant> {
-    let mut mutants = Vec::new();
     let mut seen: HashSet<(String, String)> = HashSet::new();
-
-    let mut push = |operator: &str, desc: String, def: &Def, body: String| {
-        if mutants.len() >= MAX_MUTANTS_PER_LAW {
-            return;
-        }
+    let mut make = |operator: &str, desc: String, def: &Def, body: String| -> Option<Mutant> {
         let trimmed = body.trim().to_string();
-        if trimmed == def.body.trim() {
-            return;
+        if trimmed == def.body.trim() || !seen.insert((def.name.clone(), trimmed)) {
+            return None;
         }
-        if seen.insert((def.name.clone(), trimmed)) {
-            mutants.push(Mutant {
-                operator: operator.to_string(),
-                description: format!("{}: {desc}", def.name),
-                def_name: def.name.clone(),
-                mutated_body: body,
-            });
-        }
+        Some(Mutant {
+            operator: operator.to_string(),
+            description: format!("{}: {desc} [{operator}]", def.name),
+            def_name: def.name.clone(),
+            mutated_body: body,
+        })
     };
 
+    let mut mutants = Vec::new();
     for def in cone_defs {
         let protected = compute_protected_ranges(&def.body);
-
-        // 1. Bool flip: True{} <-> False{}, true <-> false, Bool.pick branch swap
-        for (body, desc) in mutate_bool_flips(&def.body, &protected) {
-            push("BoolFlip", desc, def, body);
-        }
-
-        // 2. Nat comparison & arithmetic swaps
-        for (body, desc) in mutate_nat_ops(&def.body, &protected) {
-            push("NatCmpArith", desc, def, body);
-        }
-
-        // 3. Drop one operand of Bool.and / Bool.or / && / ||
-        for (body, desc) in mutate_drop_bool_operand(&def.body, &protected) {
-            push("DropBoolOperand", desc, def, body);
-        }
-
-        // 4. Return parameter or matched constructor unchanged
-        for (body, desc) in mutate_return_unchanged(def, ctor_map) {
-            push("ReturnUnchanged", desc, def, body);
-        }
-
-        // 5. Swap two match arms with compatible binders
-        for (body, desc) in mutate_swap_match_arms(def, def_map, ctor_map) {
-            push("SwapMatchArms", desc, def, body);
+        let legacy: Vec<(&str, Vec<(String, String)>)> = vec![
+            // 1. Bool flip: True{} <-> False{}, true <-> false, Bool.pick branch swap
+            ("BoolFlip", mutate_bool_flips(&def.body, &protected)),
+            // 2. Nat comparison & arithmetic swaps
+            ("NatCmpArith", mutate_nat_ops(&def.body, &protected)),
+            // 3. Drop one operand of Bool.and / Bool.or / && / ||
+            (
+                "DropBoolOperand",
+                mutate_drop_bool_operand(&def.body, &protected),
+            ),
+            // 4. Return parameter or matched constructor unchanged
+            ("ReturnUnchanged", mutate_return_unchanged(def, ctor_map)),
+            // 5. Swap two match arms with compatible binders
+            (
+                "SwapMatchArms",
+                mutate_swap_match_arms(def, def_map, ctor_map),
+            ),
+        ];
+        for (op, candidates) in legacy {
+            for (body, desc) in candidates {
+                if mutants.len() >= MAX_MUTANTS_PER_LAW {
+                    break;
+                }
+                if let Some(m) = make(op, desc, def, body) {
+                    mutants.push(m);
+                }
+            }
         }
     }
 
-    drop(push);
-    mutants.truncate(MAX_MUTANTS_PER_LAW);
+    // Bound-pushing families (Issue #12): collected per family, then picked round-robin.
+    let mut families: Vec<(&str, Vec<Candidate<'_>>)> = vec![
+        ("NatBound", Vec::new()),
+        ("SiblingCtor", Vec::new()),
+        ("BoolConst", Vec::new()),
+        ("FlipCmp", Vec::new()),
+    ];
+    for def in cone_defs {
+        let protected = compute_protected_ranges(&def.body);
+        for (body, desc) in mutate_nat_bound(def) {
+            families[0].1.push((def, body, desc));
+        }
+        for (body, desc) in mutate_sibling_ctor(def, ctor_map, &protected) {
+            families[1].1.push((def, body, desc));
+        }
+        for (body, desc) in mutate_bool_const(def, def_map, ctor_map, &protected) {
+            families[2].1.push((def, body, desc));
+        }
+        for (body, desc) in mutate_flip_cmp(&def.body, &protected) {
+            families[3].1.push((def, body, desc));
+        }
+    }
+    let mut cursors = vec![0usize; families.len()];
+    let mut extra = 0usize;
+    while extra < MAX_BOUND_MUTANTS_PER_LAW {
+        let mut progressed = false;
+        for (fi, (op, items)) in families.iter().enumerate() {
+            if extra >= MAX_BOUND_MUTANTS_PER_LAW {
+                break;
+            }
+            while cursors[fi] < items.len() {
+                let (def, body, desc) = &items[cursors[fi]];
+                cursors[fi] += 1;
+                if let Some(m) = make(op, desc.clone(), def, body.clone()) {
+                    mutants.push(m);
+                    extra += 1;
+                    progressed = true;
+                    break;
+                }
+            }
+        }
+        if !progressed {
+            break;
+        }
+    }
+
     mutants
+}
+
+/// Re-indents `body` by four spaces under `let __rb_r =` and returns `<wrap>` applied to the
+/// bound result. The emitter lowers this as a block `{ let __rb_r = <body>; <wrap> }`.
+fn wrap_result(body: &str, wrap: &str) -> String {
+    let mut out = String::from("let __rb_r =\n");
+    for line in body.lines() {
+        if line.trim().is_empty() {
+            continue;
+        }
+        out.push_str("    ");
+        out.push_str(line);
+        out.push('\n');
+    }
+    out.push_str(wrap);
+    out
+}
+
+/// NatBound: pushes a `Nat` result past a bound (`+ 1`, `- 1`, or `0n`) so one-direction
+/// bound laws such as `Nat.is_le(f(l), l) == True{}` are caught.
+fn mutate_nat_bound(def: &Def) -> Vec<(String, String)> {
+    if def.ret.trim() != "Nat" {
+        return Vec::new();
+    }
+    vec![
+        (
+            wrap_result(&def.body, "Nat.add(__rb_r, 1n)"),
+            "result -> Nat.add(result, 1n)".to_string(),
+        ),
+        (
+            wrap_result(&def.body, "Nat.sub(__rb_r, 1n)"),
+            "result -> Nat.sub(result, 1n)".to_string(),
+        ),
+        ("0n".to_string(), "result -> 0n".to_string()),
+    ]
+}
+
+/// Small filler value for a constructor field of type `ty`, used when a sibling constructor's
+/// fields differ from the original's.
+fn filler_value(ty: &str, ctor_map: &HashMap<String, CtorInfo>) -> Option<String> {
+    match ty.trim() {
+        "Nat" => Some("0n".to_string()),
+        "Bool" => Some("False{}".to_string()),
+        other => {
+            let mut nullary: Vec<&CtorInfo> = ctor_map
+                .values()
+                .filter(|c| c.type_name == other && c.arity == 0)
+                .collect();
+            nullary.sort_by(|a, b| a.variant_name.cmp(&b.variant_name));
+            nullary
+                .first()
+                .map(|c| format!("{}.{}{{}}", c.type_name, c.variant_name))
+        }
+    }
+}
+
+fn find_matching_brace(s: &str) -> Option<usize> {
+    let mut depth = 0i32;
+    for (idx, ch) in s.char_indices() {
+        match ch {
+            '{' => depth += 1,
+            '}' => {
+                depth -= 1;
+                if depth == 0 {
+                    return Some(idx);
+                }
+            }
+            _ => {}
+        }
+    }
+    None
+}
+
+/// SiblingCtor: replaces a constructor of the function's return type with each sibling
+/// constructor of the same type (same fields when the shapes match, small filler values
+/// otherwise), so absorbing-state laws like `step(Stopped{}, e) == Stopped{}` are caught.
+fn mutate_sibling_ctor(
+    def: &Def,
+    ctor_map: &HashMap<String, CtorInfo>,
+    protected: &[(usize, usize)],
+) -> Vec<(String, String)> {
+    let ret = def.ret.trim();
+    let mut siblings: Vec<&CtorInfo> = Vec::new();
+    let mut seen_variants = HashSet::new();
+    let mut infos: Vec<&CtorInfo> = ctor_map.values().filter(|c| c.type_name == ret).collect();
+    infos.sort_by(|a, b| a.variant_name.cmp(&b.variant_name));
+    for info in infos {
+        if seen_variants.insert(info.variant_name.clone()) {
+            siblings.push(info);
+        }
+    }
+    if siblings.len() < 2 {
+        return Vec::new();
+    }
+
+    let body = def.body.as_str();
+    let bytes = body.as_bytes();
+    let mut out = Vec::new();
+    let mut i = 0usize;
+    while i < bytes.len() {
+        let starts_ident = (bytes[i].is_ascii_alphabetic() || bytes[i] == b'_')
+            && (i == 0
+                || !(bytes[i - 1].is_ascii_alphanumeric()
+                    || bytes[i - 1] == b'_'
+                    || bytes[i - 1] == b'.'));
+        if !starts_ident || in_protected(i, protected) {
+            i += 1;
+            continue;
+        }
+        let mut end = i;
+        while end < bytes.len()
+            && (bytes[end].is_ascii_alphanumeric() || bytes[end] == b'_' || bytes[end] == b'.')
+        {
+            end += 1;
+        }
+        let name = &body[i..end];
+        let Some(info) = ctor_map.get(name).filter(|c| c.type_name == ret) else {
+            i = end;
+            continue;
+        };
+        if end >= bytes.len() || bytes[end] != b'{' {
+            i = end;
+            continue;
+        }
+        let Some(close_rel) = find_matching_brace(&body[end..]) else {
+            i = end;
+            continue;
+        };
+        let close_abs = end + close_rel;
+        let inner = body[end + 1..close_abs].trim();
+        for sib in &siblings {
+            if sib.variant_name == info.variant_name {
+                continue;
+            }
+            let args = if sib.field_types == info.field_types {
+                Some(inner.to_string())
+            } else {
+                sib.field_types
+                    .iter()
+                    .map(|ft| filler_value(ft, ctor_map))
+                    .collect::<Option<Vec<_>>>()
+                    .map(|v| v.join(", "))
+            };
+            let Some(args) = args else {
+                continue;
+            };
+            let repl = format!("{}.{}{{{args}}}", sib.type_name, sib.variant_name);
+            out.push((
+                replace_span(body, i, close_abs + 1, &repl),
+                format!(
+                    "{name}{{..}} -> {}.{}{{..}}",
+                    sib.type_name, sib.variant_name
+                ),
+            ));
+        }
+        i = close_abs + 1;
+    }
+    out
+}
+
+fn is_bare_var_ident(
+    s: &str,
+    def_map: &HashMap<String, &Def>,
+    ctor_map: &HashMap<String, CtorInfo>,
+) -> bool {
+    !s.is_empty()
+        && s.chars()
+            .next()
+            .is_some_and(|c| c.is_ascii_lowercase() || c == '_')
+        && s.chars().all(|c| c.is_ascii_alphanumeric() || c == '_')
+        && !matches!(s, "true" | "false" | "_")
+        && !def_map.contains_key(s)
+        && !ctor_map.contains_key(s)
+}
+
+/// BoolConst: replaces a `Bool` variable with `True{}` / `False{}`. Applies to every use of a
+/// live `Bool` parameter, and to bare variables in returned positions of a `Bool` function, so
+/// implication laws such as `Bool.or(valid(c), Bool.not(forces(c)))` are caught.
+fn mutate_bool_const(
+    def: &Def,
+    def_map: &HashMap<String, &Def>,
+    ctor_map: &HashMap<String, CtorInfo>,
+    protected: &[(usize, usize)],
+) -> Vec<(String, String)> {
+    let body = def.body.as_str();
+    let bytes = body.as_bytes();
+    let mut targets: BTreeSet<(usize, usize)> = BTreeSet::new();
+
+    // (a) Every use of a live Bool parameter outside pattern/header positions.
+    let bool_params: HashSet<&str> = def
+        .params
+        .iter()
+        .filter(|p| p.q != Quantity::Dead && p.ty.trim() == "Bool")
+        .map(|p| p.name.as_str())
+        .collect();
+    if !bool_params.is_empty() {
+        let mut i = 0usize;
+        while i < bytes.len() {
+            let starts_ident = (bytes[i].is_ascii_alphabetic() || bytes[i] == b'_')
+                && (i == 0
+                    || !(bytes[i - 1].is_ascii_alphanumeric()
+                        || bytes[i - 1] == b'_'
+                        || bytes[i - 1] == b'.'));
+            if !starts_ident {
+                i += 1;
+                continue;
+            }
+            let mut end = i;
+            while end < bytes.len()
+                && (bytes[end].is_ascii_alphanumeric() || bytes[end] == b'_' || bytes[end] == b'.')
+            {
+                end += 1;
+            }
+            let followed_by_call = end < bytes.len() && matches!(bytes[end], b'(' | b'{');
+            if !in_protected(i, protected)
+                && bool_params.contains(&body[i..end])
+                && !followed_by_call
+            {
+                targets.insert((i, end));
+            }
+            i = end;
+        }
+    }
+
+    // (b) Bare variables in returned positions of a Bool function: a whole body line that is
+    // just an identifier, or the inline body of a `case <pat>: <ident>` arm.
+    if def.ret.trim() == "Bool" {
+        let mut offset = 0usize;
+        for raw_line in body.split_inclusive('\n') {
+            let line = raw_line.strip_suffix('\n').unwrap_or(raw_line);
+            let trimmed = line.trim();
+            if !trimmed.is_empty() {
+                let ws = line.len() - line.trim_start().len();
+                if is_bare_var_ident(trimmed, def_map, ctor_map) {
+                    targets.insert((offset + ws, offset + ws + trimmed.len()));
+                } else if let Some(after_case) = line.trim_start().strip_prefix("case ") {
+                    if let Some((_, inline_body)) = split_case_arm(after_case) {
+                        let ib = inline_body.trim();
+                        if is_bare_var_ident(ib, def_map, ctor_map) && line.ends_with(ib) {
+                            let start = offset + line.len() - ib.len();
+                            targets.insert((start, start + ib.len()));
+                        }
+                    }
+                }
+            }
+            offset += raw_line.len();
+        }
+    }
+
+    let mut out = Vec::new();
+    for (start, end) in targets {
+        let var = &body[start..end];
+        for repl in ["True{}", "False{}"] {
+            out.push((
+                replace_span(body, start, end, repl),
+                format!("Bool variable '{var}' -> {repl}"),
+            ));
+        }
+    }
+    out
+}
+
+/// FlipCmp: replaces a comparison with its mirror (`Nat.is_le` <-> `Nat.is_ge`,
+/// `Nat.is_lt` <-> `Nat.is_gt`, `<=` <-> `>=`, `<` <-> `>`). Unlike NatCmpArith's
+/// `<=` -> `<` (which only tightens), this loosens strict refusals like
+/// `ok(1n + m, m) == False{}`.
+fn mutate_flip_cmp(body: &str, protected: &[(usize, usize)]) -> Vec<(String, String)> {
+    let fn_flips: &[(&str, &str)] = &[
+        ("Nat.is_le", "Nat.is_ge"),
+        ("Nat.is_ge", "Nat.is_le"),
+        ("Nat.is_lt", "Nat.is_gt"),
+        ("Nat.is_gt", "Nat.is_lt"),
+        ("Nat.lte", "Nat.gte"),
+        ("Nat.gte", "Nat.lte"),
+        ("Nat.le", "Nat.ge"),
+        ("Nat.ge", "Nat.le"),
+        ("Nat.lt", "Nat.gt"),
+        ("Nat.gt", "Nat.lt"),
+    ];
+    let mut out = Vec::new();
+    let bytes = body.as_bytes();
+    let mut i = 0usize;
+    while i < bytes.len() {
+        if in_protected(i, protected) {
+            i += 1;
+            continue;
+        }
+        let prev_ident = i > 0
+            && (bytes[i - 1].is_ascii_alphanumeric()
+                || bytes[i - 1] == b'_'
+                || bytes[i - 1] == b'.');
+        if !prev_ident {
+            let mut matched = false;
+            for &(from, to) in fn_flips {
+                if body[i..].starts_with(from) {
+                    let end = i + from.len();
+                    let next_ok = end == bytes.len()
+                        || (!bytes[end].is_ascii_alphanumeric()
+                            && bytes[end] != b'_'
+                            && bytes[end] != b'.');
+                    if next_ok {
+                        out.push((replace_span(body, i, end, to), format!("{from} -> {to}")));
+                        i = end;
+                        matched = true;
+                        break;
+                    }
+                }
+            }
+            if matched {
+                continue;
+            }
+        }
+        let two = body.get(i..i + 2).unwrap_or("");
+        if two == "<=" || two == ">=" {
+            let to = if two == "<=" { ">=" } else { "<=" };
+            out.push((replace_span(body, i, i + 2, to), format!("{two} -> {to}")));
+            i += 2;
+            continue;
+        }
+        let prev = if i > 0 { bytes[i - 1] } else { b' ' };
+        let next = bytes.get(i + 1).copied().unwrap_or(b' ');
+        if bytes[i] == b'<' && next != b'=' && next != b'-' && prev.is_ascii_whitespace() {
+            out.push((replace_span(body, i, i + 1, ">"), "< -> >".to_string()));
+        } else if bytes[i] == b'>'
+            && next != b'='
+            && prev != b'-'
+            && prev != b'='
+            && prev.is_ascii_whitespace()
+        {
+            out.push((replace_span(body, i, i + 1, "<"), "> -> <".to_string()));
+        }
+        i += 1;
+    }
+    out
 }
 
 /// Computes byte ranges `(start, end)` in `body` that belong to pattern/header positions
@@ -9190,6 +9578,196 @@ law empty_tautology:
         );
 
         let _ = fs::remove_dir_all(&dir);
+    }
+
+    const LEGACY_OPS: &[&str] = &[
+        "BoolFlip",
+        "NatCmpArith",
+        "DropBoolOperand",
+        "ReturnUnchanged",
+        "SwapMatchArms",
+    ];
+
+    /// Runs only the mutants whose operator is in `ops` against `law_name`. Returns
+    /// `Err` if the harness fails to compile, so a "survived" result is never a build error.
+    fn eval_with_ops(
+        src: &str,
+        law_name: &str,
+        ops: &[&str],
+        out_dir: &Path,
+    ) -> Result<Option<(String, String)>, String> {
+        let laws = parse_laws(src);
+        let law = laws.iter().find(|l| l.name == law_name).expect("law");
+        let (types, defs) = parse_book_items(src)?;
+        let extra = collect_law_source_slices(&laws);
+        let type_env = TypeEnv::build(&types, &defs, &extra);
+        let def_map: HashMap<String, &Def> = defs.iter().map(|d| (d.name.clone(), d)).collect();
+        let type_map: HashMap<String, &TypeDef> =
+            types.iter().map(|t| (t.name.clone(), t)).collect();
+        let cone = law_dependency_cone(law, &defs);
+        let cone_defs: Vec<Def> = cone
+            .iter()
+            .filter_map(|n| def_map.get(n).map(|d| (*d).clone()))
+            .collect();
+        let mutants: Vec<Mutant> =
+            generate_mutants_for_cone(&cone_defs, &def_map, &type_env.ctor_map)
+                .into_iter()
+                .filter(|m| ops.contains(&m.operator.as_str()))
+                .collect();
+        assert!(!mutants.is_empty(), "no {ops:?} mutants for {law_name}");
+        fs::create_dir_all(out_dir).unwrap();
+        run_mutant_harness(
+            law, &mutants, &types, &cone_defs, &type_map, &type_env, out_dir,
+        )
+    }
+
+    fn assert_new_operator_catches(src: &str, law_name: &str, op: &str, tag: &str) {
+        let dir = tmp_dir(tag);
+        let out = dir.join("out");
+        let legacy = eval_with_ops(src, law_name, LEGACY_OPS, &out)
+            .expect("legacy mutant harness must compile");
+        assert!(
+            legacy.is_none(),
+            "{law_name}: expected legacy operators to survive (the Issue #12 gap), got {legacy:?}"
+        );
+        let caught = eval_with_ops(src, law_name, &[op], &out)
+            .expect("new-operator harness must compile")
+            .unwrap_or_else(|| panic!("{law_name}: {op} must catch a mutant"));
+        assert!(
+            caught.0.ends_with(&format!("[{op}]")),
+            "mutant id must name the operator: {caught:?}"
+        );
+
+        // The full gate accepts the new law, naming the catching operator.
+        let core = dir.join("core.bend");
+        fs::write(&core, src).unwrap();
+        let report = lock::check_law_lock(&dir.join("rusty-bends.lock"), &[core], false).unwrap();
+        let summary = run_mutation_checks(src, &report, MutateMode::NewOnly, &out)
+            .expect("law must no longer be vacuous");
+        let (desc, _) = summary.reports[0].caught_by.clone().expect("caught");
+        assert!(
+            ["[NatBound]", "[SiblingCtor]", "[BoolConst]", "[FlipCmp]"]
+                .iter()
+                .any(|t| desc.ends_with(t)),
+            "caught by a new operator: {desc}"
+        );
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn nat_bound_catches_one_direction_bound_law() {
+        let src = r#"import Base
+
+def px_redirect_left(+l: Nat) -> Nat:
+  match l:
+    case 0n:
+      0n
+    case 1n+p:
+      p
+
+# promise: following a redirect never grows the remaining redirect budget
+law px_redirect_budget_never_grows:
+  for +l: Nat
+  {Nat.is_le(px_redirect_left(l), l) == True{} : Bool}
+"#;
+        assert_new_operator_catches(src, "px_redirect_budget_never_grows", "NatBound", "bound");
+    }
+
+    #[test]
+    fn sibling_ctor_catches_absorbing_state_law() {
+        let src = r#"import Base
+
+type Phase is Data:
+  Ringing{n: Nat}
+  Talking{n: Nat}
+  Stopped{}
+
+def call_step(+s: Phase, +ev: Nat) -> Phase:
+  match s:
+    case Ringing{n}:
+      Talking{Nat.add(n, ev)}
+    case Talking{n}:
+      Talking{n}
+    case Stopped{}:
+      Stopped{}
+
+# promise: a stopped call stays stopped whatever event arrives
+law call_stopped_absorbing:
+  for +ev: Nat
+  {call_step(Stopped{}, ev) == Stopped{} : Phase}
+"#;
+        assert_new_operator_catches(src, "call_stopped_absorbing", "SiblingCtor", "absorb");
+    }
+
+    #[test]
+    fn bool_const_catches_implication_law() {
+        let src = r#"import Base
+
+def valid(+c: Nat, +tools_given: Bool) -> Bool:
+  match c:
+    case 0n:
+      True{}
+    case 1n+k:
+      tools_given
+
+def forces(+c: Nat, +tools_given: Bool) -> Bool:
+  match c:
+    case 0n:
+      False{}
+    case 1n+k:
+      tools_given
+
+# promise: whenever a config forces tools, it is valid
+law forced_implies_valid:
+  for +c: Nat
+  for +g: Bool
+  {Bool.or(valid(c, g), Bool.not(forces(c, g))) == True{} : Bool}
+"#;
+        assert_new_operator_catches(src, "forced_implies_valid", "BoolConst", "implies");
+    }
+
+    #[test]
+    fn flip_cmp_catches_strict_refusal_law() {
+        let src = r#"import Base
+
+def media_count_ok(+count: Nat, +max: Nat) -> Bool:
+  Nat.is_le(count, max)
+
+# promise: a media count above the limit is always refused
+law media_count_refuses_overflow:
+  for +m: Nat
+  for +extra: Nat
+  {media_count_ok(Nat.add(Nat.add(1n, m), extra), m) == False{} : Bool}
+"#;
+        assert_new_operator_catches(src, "media_count_refuses_overflow", "FlipCmp", "refuse");
+    }
+
+    #[test]
+    fn bound_operators_keep_their_own_budget_after_legacy_cap() {
+        // Many comparison sites saturate the legacy budget; bound families still appear.
+        let mut body = String::from("Bool.and(Nat.is_le(a, b), Nat.is_le(b, a))");
+        for _ in 0..30 {
+            body = format!("Bool.and({body}, Nat.is_lt(a, Nat.add(b, 1n)))");
+        }
+        let src = format!(
+            "def busy(+a: Nat, +b: Nat, +t: Bool) -> Bool:\n  Bool.and(t, {body})\n\ndef shrink(+x: Nat) -> Nat:\n  Nat.sub(x, 1n)\n"
+        );
+        let (types, defs) = parse_book_items(&src).unwrap();
+        let env = TypeEnv::build(&types, &defs, &[]);
+        let def_map: HashMap<String, &Def> = defs.iter().map(|d| (d.name.clone(), d)).collect();
+        let mutants = generate_mutants_for_cone(&defs, &def_map, &env.ctor_map);
+        let legacy = mutants
+            .iter()
+            .filter(|m| LEGACY_OPS.contains(&m.operator.as_str()))
+            .count();
+        assert_eq!(legacy, MAX_MUTANTS_PER_LAW);
+        for op in ["NatBound", "BoolConst", "FlipCmp"] {
+            assert!(
+                mutants.iter().any(|m| m.operator == op),
+                "{op} missing after legacy cap"
+            );
+        }
+        assert!(mutants.len() <= MAX_MUTANTS_PER_LAW + MAX_BOUND_MUTANTS_PER_LAW);
     }
 
     const EXS_LAW_SRC: &str = r#"import Base
@@ -10462,7 +11040,7 @@ def cancel_idempotent(s):
   - **Division & modulo (`b = 1n+bp > 0`):** `nat_mod_lt(a, bp)` (`a % (1n+bp) < 1n+bp`), `nat_div_mod(a, bp)` (`a % (1n+bp) + (a / (1n+bp)) * (1n+bp) == a`), `nat_div_mod_r(a, bp)` (`(a / (1n+bp)) * (1n+bp) + a % (1n+bp) == a`), `nat_div_lt_of_lt_mul(a, n, bp, h)` (`a < n * (1n+bp) -> a / (1n+bp) < n`), and `nat_div_lt_of_lt_mul_l(a, n, bp, h)` (`a < (1n+bp) * n -> a / (1n+bp) < n`).
 - **Generated per-law Rust tests:** every `law` also emits a `#[cfg(test)]` Rust test into `OUT_DIR/verified.rs` (run automatically by `cargo test`) that checks the emitted functions across small values, `u64::MAX - 1`, `u64::MAX`, ADT constructors, and deterministic PRNG samples (skipping only checked `Nat` overflow panics).
 - **Counterexample vs proof-failure diagnosis:** when `bend --check-only` fails on a law, `rusty-bends-build` evaluates the emitted Rust on concrete inputs first and reports `[E_LAW_FALSE]` with aligned `lhs`/`rhs` values if the law is false, or notes `"no counterexample up to ...: the law may be true; the proof is what failed"` if no counterexample exists.
-- **Mutation checking before sealing (`E_LAW_VACUOUS`):** every unlocked/new law is checked against small mutants of the live functions in its dependency cone (`True{}`/`False{}` swap, `Nat.is_le`/`Nat.is_lt` swap, `Nat.add`/`Nat.sub` swap, `Bool.and`/`Bool.or` operand drop, returning a constructor argument unchanged, swapping match arms) and fails with `[E_LAW_VACUOUS]` if it catches none. Run `RUSTY_BENDS_MUTATE=all cargo check` to report caught/survived status for already-locked laws without failing.
+- **Mutation checking before sealing (`E_LAW_VACUOUS`):** every unlocked/new law is checked against small mutants of the live functions in its dependency cone (`True{}`/`False{}` swap, `Nat.is_le`/`Nat.is_lt` swap, `Nat.add`/`Nat.sub` swap, `Bool.and`/`Bool.or` operand drop, returning a constructor argument unchanged, swapping match arms) and fails with `[E_LAW_VACUOUS]` if it catches none. Bound and safety laws are covered too: `NatBound` pushes a `Nat` result past a bound (`+ 1n`, `- 1n`, `0n`), `SiblingCtor` replaces a returned constructor with its sibling constructors, `BoolConst` replaces a `Bool` variable with `True{}` / `False{}`, and `FlipCmp` loosens comparisons (`Nat.is_le` <-> `Nat.is_ge`, `Nat.is_lt` <-> `Nat.is_gt`). Each reported mutant ends with its operator, e.g. `caught by f: result -> Nat.add(result, 1n) [NatBound]`. Run `RUSTY_BENDS_MUTATE=all cargo check` to report caught/survived status for already-locked laws without failing.
 - **Unevaluable new laws (`E_LAW_UNCHECKED`):** a new law the checker cannot evaluate (`exs`, a `where` refinement, an unparsable clause, or a goal without `==`) fails the build, naming the reason and the supported forms. If it truly cannot be sampled, add `# unchecked: <why>` in the comment block directly above `law <name>:`; the marker is stored in `rusty-bends.lock` and shown as `[unchecked: <why>]` by the law listing. Locked laws only warn.
 
 ## 5. Mandatory Rules for AI Agents
