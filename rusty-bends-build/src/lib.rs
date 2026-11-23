@@ -55,6 +55,9 @@ pub struct Config {
     pub emit_rust: bool,
     pub mutate_mode: MutateMode,
     pub list_laws: bool,
+    /// `RUSTY_BENDS_LIST_PANICS=1`: print every checked-growth panic site as
+    /// `function: op at file:line` (Issue #13).
+    pub list_panics: bool,
 }
 
 impl Default for Config {
@@ -65,14 +68,18 @@ impl Default for Config {
         let mutate_mode = env::var("RUSTY_BENDS_MUTATE")
             .map(|v| MutateMode::parse(&v))
             .unwrap_or(MutateMode::NewOnly);
-        let list_laws = env::var("RUSTY_BENDS_LIST_LAWS")
-            .map(|v| {
-                matches!(
-                    v.trim().to_ascii_lowercase().as_str(),
-                    "1" | "true" | "yes" | "on"
-                )
-            })
-            .unwrap_or(false);
+        let env_flag = |name: &str| {
+            env::var(name)
+                .map(|v| {
+                    matches!(
+                        v.trim().to_ascii_lowercase().as_str(),
+                        "1" | "true" | "yes" | "on"
+                    )
+                })
+                .unwrap_or(false)
+        };
+        let list_laws = env_flag("RUSTY_BENDS_LIST_LAWS");
+        let list_panics = env_flag("RUSTY_BENDS_LIST_PANICS");
         Self {
             verified_dir: PathBuf::from("verified"),
             bend_bin: resolve_bend_bin(
@@ -93,6 +100,7 @@ impl Default for Config {
             emit_rust: true,
             mutate_mode,
             list_laws,
+            list_panics,
         }
     }
 }
@@ -173,6 +181,7 @@ pub fn run(cfg: &Config) -> Result<Option<PathBuf>, String> {
     println!("cargo:rerun-if-env-changed=RUSTY_BENDS_UPDATE_LAWS");
     println!("cargo:rerun-if-env-changed=RUSTY_BENDS_MUTATE");
     println!("cargo:rerun-if-env-changed=RUSTY_BENDS_LIST_LAWS");
+    println!("cargo:rerun-if-env-changed=RUSTY_BENDS_LIST_PANICS");
     println!("cargo:rerun-if-env-changed=BEND_BIN");
     println!("cargo:rerun-if-env-changed=BEND_PIN_VERSION");
     println!("cargo:rerun-if-env-changed=BEND_VERDICT");
@@ -322,6 +331,7 @@ where
         && !lock_report.needs_write
         && lock_report.new_names.is_empty()
         && cfg.mutate_mode == MutateMode::NewOnly
+        && !cfg.list_panics
     {
         return Ok(if cfg.emit_rust {
             Some(verified_rs)
@@ -388,12 +398,26 @@ where
     }
 
     // 6. Erase q=0 parts and emit pure Rust (ADTs + match + defs) into OUT_DIR/verified.rs
-    let emitted_path = if cfg.emit_rust {
-        let summary = emit::emit_verified_rust(&combined_source, law_count)?;
-        fs::write(&verified_rs, summary.rust_source).map_err(|e| e.to_string())?;
-        Some(verified_rs)
+    let summary = if cfg.emit_rust || cfg.list_panics {
+        Some(emit::emit_verified_rust(&combined_source, law_count)?)
     } else {
         None
+    };
+    if let (true, Some(summary)) = (cfg.list_panics, summary.as_ref()) {
+        let files: Vec<(&Path, &str)> = file_sources
+            .iter()
+            .map(|(f, t)| (f.as_path(), t.as_str()))
+            .collect();
+        for line in format_panic_sites(&summary.panic_sites, &files) {
+            println!("cargo:warning={line}");
+        }
+    }
+    let emitted_path = match summary {
+        Some(summary) if cfg.emit_rust => {
+            fs::write(&verified_rs, summary.rust_source).map_err(|e| e.to_string())?;
+            Some(verified_rs)
+        }
+        _ => None,
     };
 
     // 7. Persist passing content hash
@@ -498,6 +522,127 @@ fn run_bend_step(bend_bin: &str, flag: &str, file: &Path) -> Result<(), String> 
     Ok(())
 }
 
+/// Locates `def <name>` in `files`: returns `(file index, header line, end line exclusive)`.
+fn locate_def(name: &str, files: &[(&Path, &str)]) -> Option<(usize, usize, usize)> {
+    for (fi, (_, text)) in files.iter().enumerate() {
+        let lines: Vec<&str> = text.lines().collect();
+        for (li, raw) in lines.iter().enumerate() {
+            let Some(rest) = raw.strip_prefix("def ") else {
+                continue;
+            };
+            let def_name = rest
+                .trim_start()
+                .split(|c: char| c == '(' || c == ':' || c.is_whitespace())
+                .next()
+                .unwrap_or("");
+            if def_name != name {
+                continue;
+            }
+            let mut end = li + 1;
+            while end < lines.len() {
+                let trimmed = emit::strip_comment(lines[end]).trim();
+                if !trimmed.is_empty() && emit::is_top_level_start(lines[end], trimmed) {
+                    break;
+                }
+                end += 1;
+            }
+            return Some((fi, li, end));
+        }
+    }
+    None
+}
+
+/// Number of places in `line` where the Bend source of a checked-growth `op` appears.
+fn op_occurrences(line: &str, op: &str) -> usize {
+    let is_ident = |b: u8| b.is_ascii_alphanumeric() || b == b'_' || b == b'.';
+    let count_calls = |callee: &str| {
+        let needle = format!("{callee}(");
+        line.match_indices(&needle)
+            .filter(|(i, _)| *i == 0 || !is_ident(line.as_bytes()[*i - 1]))
+            .count()
+    };
+    match op {
+        "Nat.add" => {
+            let bytes = line.as_bytes();
+            let infix = line.matches(" + ").count();
+            // Successor literals in expressions: `1n+x`.
+            let succ_lit = (1..bytes.len())
+                .filter(|&i| {
+                    bytes[i] == b'+'
+                        && bytes[i - 1] == b'n'
+                        && i >= 2
+                        && bytes[i - 2].is_ascii_digit()
+                })
+                .count();
+            count_calls("Nat.add") + infix + succ_lit
+        }
+        "Nat.mul" => count_calls("Nat.mul") + line.matches(" * ").count(),
+        "Nat.succ" => count_calls("Nat.succ"),
+        other => other.strip_prefix("call ").map(count_calls).unwrap_or(0),
+    }
+}
+
+/// Formats checked-growth panic sites as `RustyBends panic [function]: op at file:line`, plus a
+/// one-line summary. Source lines are matched by op kind in source order; an op that cannot
+/// be matched to a body line is reported at the `def` header line.
+pub fn format_panic_sites(sites: &[emit::PanicSite], files: &[(&Path, &str)]) -> Vec<String> {
+    use std::collections::BTreeMap;
+    let mut grouped: BTreeMap<(&str, &str), usize> = BTreeMap::new();
+    for site in sites {
+        *grouped
+            .entry((site.function.as_str(), site.op.as_str()))
+            .or_default() += 1;
+    }
+
+    let mut located: Vec<(String, usize, String, String)> = Vec::new();
+    for ((function, op), count) in grouped {
+        let Some((fi, header, end)) = locate_def(function, files) else {
+            for _ in 0..count {
+                located.push((String::from("?"), 0, function.to_string(), op.to_string()));
+            }
+            continue;
+        };
+        let path = files[fi].0.display().to_string();
+        let lines: Vec<&str> = files[fi].1.lines().collect();
+        let mut candidates = Vec::new();
+        for (li, raw) in lines.iter().enumerate().take(end).skip(header + 1) {
+            let code = emit::strip_comment(raw);
+            let t = code.trim_start();
+            if t.starts_with("case ") || t.starts_with("match ") {
+                continue;
+            }
+            for _ in 0..op_occurrences(code, op) {
+                candidates.push(li + 1);
+            }
+        }
+        for k in 0..count {
+            let line_no = candidates.get(k).copied().unwrap_or(header + 1);
+            located.push((path.clone(), line_no, function.to_string(), op.to_string()));
+        }
+    }
+    located.sort();
+
+    let functions: std::collections::BTreeSet<&str> =
+        sites.iter().map(|s| s.function.as_str()).collect();
+    let mut out: Vec<String> = located
+        .iter()
+        .map(|(path, line, function, op)| {
+            format!("RustyBends panic [{function}]: {op} at {path}:{line}")
+        })
+        .collect();
+    if sites.is_empty() {
+        out.push("RustyBends panics: no checked-growth panic sites in emitted Rust".to_string());
+    } else {
+        out.push(format!(
+            "RustyBends panics: {} checked-growth panic site(s) in {} function(s); mark a def '# {}' to return Option (None on overflow) instead of panicking",
+            sites.len(),
+            functions.len(),
+            emit::TOTAL_MARKER
+        ));
+    }
+    out
+}
+
 pub fn collect_bend_files(dir: &Path, out: &mut Vec<PathBuf>) -> Result<(), String> {
     for entry in fs::read_dir(dir).map_err(|e| e.to_string())? {
         let path = entry.map_err(|e| e.to_string())?.path();
@@ -552,6 +697,7 @@ mod tests {
             emit_rust: true,
             mutate_mode: MutateMode::NewOnly,
             list_laws: false,
+            list_panics: false,
         }
     }
 

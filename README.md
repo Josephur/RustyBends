@@ -48,6 +48,9 @@ On each build, for every `.bend` file in the verified directory:
 `Nat` arithmetic emits `checked_add` / `checked_mul` (panicking on `u64` overflow so
 emitted Rust agrees with mathematical `Nat` wherever it returns) together with
 `saturating_sub` and total division (`0 - x == 0`, `a / 0 == 0`, `a % 0 == a`).
+`RUSTY_BENDS_LIST_PANICS=1` lists every such panic site as `function: op at file:line`.
+A `def` with `# rusty-bends: total` directly above it emits as `Option<T>` instead,
+returning `None` on overflow, for functions fed by untrusted input.
 
 The crate has no dependencies beyond the Rust standard library.
 
@@ -132,6 +135,7 @@ Import it in any file under `verified/` with `import nat_lemmas.bend as L`. Ever
 | `RUSTY_BENDS_UPDATE_LAWS` | `1` rewrites `rusty-bends.lock` from the current laws (once proofs & mutation checks pass), skipping the tamper check. Review the lock's diff before committing. |
 | `RUSTY_BENDS_MUTATE` | `all`: also runs the mutation check over locked laws and prints caught/survived diagnostics without failing the build. |
 | `RUSTY_BENDS_LIST_LAWS` | `1`: prints each law as `name: promise` during builds so reviewers can read plain-English guarantees without reading Bend 2 syntax (also available via `cargo run -p rusty-bends-build --bin rusty-bends-laws -- [dir]`). Laws with an `# unchecked:` marker show `[unchecked: <why>]`. |
+| `RUSTY_BENDS_LIST_PANICS` | `1`: prints every checked-growth `Nat` panic site in the emitted Rust as `RustyBends panic [function]: op at file:line`, plus a total. |
 
 ## Repository layout
 

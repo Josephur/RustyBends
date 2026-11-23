@@ -7,6 +7,7 @@
 //! - 'Dead' (q=0) parameters ('-T: Type') and annotations ('(x : T)') are erased.
 //! - 'law' and 'proof' blocks (including match/rewrite proofs) are completely stripped.
 
+use std::cell::RefCell;
 use std::collections::{HashMap, HashSet, VecDeque};
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -41,6 +42,18 @@ pub struct Def {
     pub params: Vec<Param>,
     pub ret: String,
     pub body: String,
+    /// `# rusty-bends: total` above the `def`: emit as `Option<T>` (`None` on `Nat`
+    /// overflow) instead of panicking (Issue #13).
+    pub total: bool,
+}
+
+/// One checked-growth panic site in emitted Rust: `function` panics with
+/// `rusty-bends: Nat overflow` when `op` overflows `u64`.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct PanicSite {
+    pub function: String,
+    /// `Nat.add`, `Nat.mul`, `Nat.succ`, or `call <f>` (a call to a total function).
+    pub op: String,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -49,6 +62,8 @@ pub struct EmitSummary {
     pub types_emitted: usize,
     pub defs_emitted: usize,
     pub dead_params_erased: usize,
+    /// Every checked-growth op that can panic, per public emitted function, in emission order.
+    pub panic_sites: Vec<PanicSite>,
 }
 
 #[derive(Debug, Clone)]
@@ -431,6 +446,9 @@ pub(crate) fn emit_items_to_rust(
         }
     }
 
+    let total_cone = total_def_cone(defs, &def_map);
+    let mut panic_sites = Vec::new();
+
     for def in defs {
         let mut type_params = Vec::new();
         let mut type_param_set = HashSet::new();
@@ -473,24 +491,55 @@ pub(crate) fn emit_items_to_rust(
         }
 
         let default_mode = arith_mode_for_type(&def.ret, ArithMode::NatChecked);
-        let ctx = EmitCtx {
-            defs: &def_map,
-            type_env,
-            clone_vars: &clone_vars,
-            has_generics,
-        };
-        let body_expr = emit_expr_with_ctx(&def.body, &ctx, default_mode)?;
         let ret_ty = infer_return_type(&def.body, &def.ret, &type_param_set);
         let guard_prefix = if step_limit.is_some() {
             "__rb_tick();\n    "
         } else {
             ""
         };
+        const FN_ALLOWS: &str = "unused_variables, unused_parens, unreachable_patterns, irrefutable_let_patterns, clippy::let_and_return, clippy::double_parens, clippy::unnecessary_cast, clippy::clone_on_copy, clippy::match_like_matches_macro";
 
-        blocks.push(format!(
-            "#[inline]\n#[allow(unused_variables, unused_parens, unreachable_patterns, irrefutable_let_patterns, clippy::let_and_return, clippy::double_parens, clippy::unnecessary_cast, clippy::clone_on_copy, clippy::match_like_matches_macro)]\npub fn {name}{generics}({rust_params}) -> {ret_ty} {{\n    {guard_prefix}{body_expr}\n}}",
-            name = def.name
-        ));
+        // Variants to emit: the public function (total when marked), plus a private
+        // `Option` shadow when an unmarked def is called from a total function.
+        let mut variants = vec![(def.name.clone(), def.total, true)];
+        if !def.total && total_cone.contains(&def.name) {
+            variants.push((total_fn_name(def), true, false));
+        }
+        for (fn_name, total, public) in variants {
+            let ops = RefCell::new(Vec::new());
+            let ctx = EmitCtx {
+                defs: &def_map,
+                type_env,
+                clone_vars: &clone_vars,
+                has_generics,
+                total,
+                total_cone: &total_cone,
+                panic_ops: &ops,
+            };
+            let body_expr = emit_expr_with_ctx(&def.body, &ctx, default_mode)?;
+            if public {
+                for op in ops.into_inner() {
+                    panic_sites.push(PanicSite {
+                        function: def.name.clone(),
+                        op,
+                    });
+                }
+            }
+            if total {
+                let (vis, extra_allow) = if public {
+                    ("pub ", "")
+                } else {
+                    ("", "dead_code, ")
+                };
+                blocks.push(format!(
+                    "#[inline]\n#[allow({extra_allow}{FN_ALLOWS}, clippy::needless_question_mark, clippy::question_mark, clippy::unnecessary_lazy_evaluations)]\n{vis}fn {fn_name}{generics}({rust_params}) -> Option<{ret_ty}> {{\n    {guard_prefix}Some({body_expr})\n}}"
+                ));
+            } else {
+                blocks.push(format!(
+                    "#[inline]\n#[allow({FN_ALLOWS})]\npub fn {fn_name}{generics}({rust_params}) -> {ret_ty} {{\n    {guard_prefix}{body_expr}\n}}"
+                ));
+            }
+        }
     }
 
     let mut out = String::new();
@@ -514,6 +563,7 @@ pub(crate) fn emit_items_to_rust(
         types_emitted: types.len(),
         defs_emitted: defs.len(),
         dead_params_erased,
+        panic_sites,
     })
 }
 
@@ -770,6 +820,7 @@ pub fn parse_book_items(source: &str) -> Result<(Vec<TypeDef>, Vec<Def>), String
         }
 
         if stripped.starts_with("def ") {
+            let total = has_total_marker(&lines, i);
             // Bend 2 allows the parameter list (and an equality return type) to span lines:
             //   def f(
             //     +a: Nat,
@@ -813,7 +864,9 @@ pub fn parse_book_items(source: &str) -> Result<(Vec<TypeDef>, Vec<Def>), String
                     "[E_EMIT_EMPTY_BODY] Empty body in 'def {header_part}'"
                 ));
             }
-            defs.push(parse_def_header(header_part, body)?);
+            let mut def = parse_def_header(header_part, body)?;
+            def.total = total;
+            defs.push(def);
             continue;
         }
 
@@ -821,6 +874,55 @@ pub fn parse_book_items(source: &str) -> Result<(Vec<TypeDef>, Vec<Def>), String
     }
 
     Ok((types, defs))
+}
+
+/// Every def reachable from a `# rusty-bends: total` def (including the total defs themselves).
+/// Each needs an `Option`-returning variant so overflow anywhere below a total function
+/// propagates as `None` instead of panicking.
+pub(crate) fn total_def_cone(defs: &[Def], def_map: &HashMap<String, &Def>) -> HashSet<String> {
+    let mut cone = HashSet::new();
+    let mut queue: VecDeque<String> = defs
+        .iter()
+        .filter(|d| d.total)
+        .map(|d| d.name.clone())
+        .collect();
+    while let Some(name) = queue.pop_front() {
+        if !cone.insert(name.clone()) {
+            continue;
+        }
+        if let Some(def) = def_map.get(&name) {
+            for tok in crate::lock::tokenize_bend(&def.body) {
+                if def_map.contains_key(&tok) && !cone.contains(&tok) {
+                    queue.push_back(tok);
+                }
+            }
+        }
+    }
+    cone
+}
+
+/// The comment line that opts a `def` into non-panicking `Option<T>` emission.
+pub const TOTAL_MARKER: &str = "rusty-bends: total";
+
+/// True when the contiguous comment block directly above `lines[def_idx]` contains
+/// `# rusty-bends: total` (blank or non-comment lines end the block).
+pub(crate) fn has_total_marker(lines: &[&str], def_idx: usize) -> bool {
+    let mut k = def_idx;
+    while k > 0 {
+        let prev = lines[k - 1].trim();
+        let body = if let Some(rest) = prev.strip_prefix('#') {
+            rest
+        } else if let Some(rest) = prev.strip_prefix("--") {
+            rest
+        } else {
+            return false;
+        };
+        if body.trim().eq_ignore_ascii_case(TOTAL_MARKER) {
+            return true;
+        }
+        k -= 1;
+    }
+    false
 }
 
 fn is_erased_proof_or_type_def(header_part: &str, body: &str, law_names: &HashSet<String>) -> bool {
@@ -1047,6 +1149,7 @@ fn parse_def_header(header: &str, body: String) -> Result<Def, String> {
         params,
         ret,
         body,
+        total: false,
     })
 }
 
@@ -1788,11 +1891,41 @@ fn parse_indented_case_arms(lines: &[&str]) -> Vec<(String, String)> {
     arms
 }
 
+#[derive(Clone, Copy)]
 pub(crate) struct EmitCtx<'a> {
     pub(crate) defs: &'a HashMap<String, &'a Def>,
     pub(crate) type_env: &'a TypeEnv,
     pub(crate) clone_vars: &'a HashSet<String>,
     pub(crate) has_generics: bool,
+    /// Emitting an `Option<T>` body: overflow and total calls propagate `None` with `?`.
+    pub(crate) total: bool,
+    /// Defs with an `Option`-returning variant (`# rusty-bends: total` defs and their callees).
+    pub(crate) total_cone: &'a HashSet<String>,
+    /// Records each panicking checked-growth op emitted (ignored in total mode).
+    pub(crate) panic_ops: &'a RefCell<Vec<String>>,
+}
+
+const OVERFLOW_EXPECT: &str = ".expect(\"rusty-bends: Nat overflow\")";
+
+impl EmitCtx<'_> {
+    /// Suffix for a `checked_*` result: `?` in total mode, otherwise a recorded panic site.
+    fn overflow(&self, op: &str) -> &'static str {
+        if self.total {
+            "?"
+        } else {
+            self.panic_ops.borrow_mut().push(op.to_string());
+            OVERFLOW_EXPECT
+        }
+    }
+}
+
+/// Name of the `Option`-returning variant of `def`.
+pub(crate) fn total_fn_name(def: &Def) -> String {
+    if def.total {
+        def.name.clone()
+    } else {
+        format!("__rb_total_{}", def.name)
+    }
 }
 
 pub(crate) fn emit_expr_with_mode(
@@ -1802,11 +1935,16 @@ pub(crate) fn emit_expr_with_mode(
     clone_vars: &HashSet<String>,
     mode: ArithMode,
 ) -> Result<String, String> {
+    let no_cone = HashSet::new();
+    let ops = RefCell::new(Vec::new());
     let ctx = EmitCtx {
         defs,
         type_env,
         clone_vars,
         has_generics: false,
+        total: false,
+        total_cone: &no_cone,
+        panic_ops: &ops,
     };
     emit_expr_with_ctx(expr, &ctx, mode)
 }
@@ -1860,10 +1998,8 @@ fn emit_expr_with_ctx(expr: &str, ctx: &EmitCtx<'_>, mode: ArithMode) -> Result<
                     }
                 }
                 let body_ctx = EmitCtx {
-                    defs: ctx.defs,
-                    type_env: ctx.type_env,
                     clone_vars: &body_clone_vars,
-                    has_generics: ctx.has_generics,
+                    ..*ctx
                 };
                 return Ok(format!(
                     "{{\n        let {} = {};\n        {}\n    }}",
@@ -1922,10 +2058,8 @@ fn emit_expr_with_ctx(expr: &str, ctx: &EmitCtx<'_>, mode: ArithMode) -> Result<
                     }
                 }
                 let arm_ctx = EmitCtx {
-                    defs: ctx.defs,
-                    type_env: ctx.type_env,
                     clone_vars: &arm_clone_vars,
-                    has_generics: ctx.has_generics,
+                    ..*ctx
                 };
                 let emitted_body = emit_expr_with_ctx(&arm_body, &arm_ctx, mode)?;
                 let guard_clause = if pat_state.guards.is_empty() {
@@ -2041,10 +2175,8 @@ fn emit_expr_with_ctx(expr: &str, ctx: &EmitCtx<'_>, mode: ArithMode) -> Result<
                     }
                 }
                 let body_ctx = EmitCtx {
-                    defs: ctx.defs,
-                    type_env: ctx.type_env,
                     clone_vars: &body_clone_vars,
-                    has_generics: ctx.has_generics,
+                    ..*ctx
                 };
                 return Ok(format!(
                     "{{\n        let {} = {};\n        {}\n    }}",
@@ -2073,7 +2205,7 @@ fn emit_expr_with_ctx(expr: &str, ctx: &EmitCtx<'_>, mode: ArithMode) -> Result<
         let r = emit_expr_with_ctx(rhs, ctx, mode)?;
         return Ok(match (mode, op) {
             (ArithMode::NatChecked, '+') => {
-                format!("({l}).checked_add({r}).expect(\"rusty-bends: Nat overflow\")")
+                format!("({l}).checked_add({r}){}", ctx.overflow("Nat.add"))
             }
             (ArithMode::NatChecked, '-') => format!("({l}).saturating_sub({r})"),
             (ArithMode::Wrapping, '+') => format!("({l}).wrapping_add({r})"),
@@ -2088,7 +2220,7 @@ fn emit_expr_with_ctx(expr: &str, ctx: &EmitCtx<'_>, mode: ArithMode) -> Result<
         let r = emit_expr_with_ctx(rhs, ctx, mode)?;
         return Ok(match (mode, op) {
             (ArithMode::NatChecked, '*') => {
-                format!("({l}).checked_mul({r}).expect(\"rusty-bends: Nat overflow\")")
+                format!("({l}).checked_mul({r}){}", ctx.overflow("Nat.mul"))
             }
             (ArithMode::Wrapping, '*') => format!("({l}).wrapping_mul({r})"),
             (ArithMode::NatChecked, '/') => {
@@ -2192,6 +2324,24 @@ fn emit_expr_with_ctx(expr: &str, ctx: &EmitCtx<'_>, mode: ArithMode) -> Result<
                 }
                 emitted_args.push(emit_expr_with_ctx(arg, ctx, mode)?);
             }
+            if let Some(def) = target_def {
+                if ctx.total && ctx.total_cone.contains(callee) {
+                    return Ok(format!(
+                        "{}({})?",
+                        total_fn_name(def).replace('.', "::"),
+                        emitted_args.join(", ")
+                    ));
+                }
+                if def.total {
+                    // A total function called from panicking code keeps panicking semantics.
+                    return Ok(format!(
+                        "{}({}){}",
+                        callee.replace('.', "::"),
+                        emitted_args.join(", "),
+                        ctx.overflow(&format!("call {callee}"))
+                    ));
+                }
+            }
             return Ok(format!(
                 "{}({})",
                 callee.replace('.', "::"),
@@ -2236,8 +2386,9 @@ fn emit_base_builtin(
             e(raw_args[0], ArithMode::NatChecked)?
         )),
         ("Nat.succ", 1) => Some(format!(
-            "({}).checked_add(1_u64).expect(\"rusty-bends: Nat overflow\")",
-            e(raw_args[0], ArithMode::NatChecked)?
+            "({}).checked_add(1_u64){}",
+            e(raw_args[0], ArithMode::NatChecked)?,
+            ctx.overflow("Nat.succ")
         )),
         ("Nat.pred", 1) => Some(format!(
             "({}).saturating_sub(1_u64)",
@@ -2248,9 +2399,10 @@ fn emit_base_builtin(
 
         // Binary Nat arithmetic (checked add/mul, saturating sub, total div/mod matching Bend 2)
         ("Nat.add", 2) => Some(format!(
-            "({}).checked_add({}).expect(\"rusty-bends: Nat overflow\")",
+            "({}).checked_add({}){}",
             e(raw_args[0], ArithMode::NatChecked)?,
-            e(raw_args[1], ArithMode::NatChecked)?
+            e(raw_args[1], ArithMode::NatChecked)?,
+            ctx.overflow("Nat.add")
         )),
         ("Nat.sub", 2) => Some(format!(
             "({}).saturating_sub({})",
@@ -2258,9 +2410,10 @@ fn emit_base_builtin(
             e(raw_args[1], ArithMode::NatChecked)?
         )),
         ("Nat.mul", 2) => Some(format!(
-            "({}).checked_mul({}).expect(\"rusty-bends: Nat overflow\")",
+            "({}).checked_mul({}){}",
             e(raw_args[0], ArithMode::NatChecked)?,
-            e(raw_args[1], ArithMode::NatChecked)?
+            e(raw_args[1], ArithMode::NatChecked)?,
+            ctx.overflow("Nat.mul")
         )),
         ("Nat.div", 2) => Some(format!(
             "{{ let __a = {}; let __b = {}; if __b == 0_u64 {{ 0_u64 }} else {{ __a / __b }} }}",
@@ -3446,5 +3599,152 @@ def checked_id(x: Nat, -proof: {x == x : Nat}) -> Nat:
         assert!(summary
             .rust_source
             .contains("pub fn checked_id(x: u64) -> u64"));
+    }
+
+    const CANVAS_SRC: &str = r#"import Base
+
+def area(+w: Nat, +h: Nat) -> Nat:
+  Nat.mul(w, h)
+
+def media_canvas_ok(+w: Nat, +h: Nat, max_pixels: Nat) -> Bool:
+  Bool.and(Bool.and(Nat.is_gt(w, 0n), Nat.is_gt(h, 0n)), Nat.is_le(area(w, h), max_pixels))
+
+def canvas_gate(+w: Nat, +h: Nat) -> Bool:
+  media_canvas_ok(w, h, 1000n)
+
+# promise: a zero-width canvas is always refused
+law zero_width_refused:
+  for +h: Nat
+  for +m: Nat
+  {media_canvas_ok(0n, h, m) == False{} : Bool}
+"#;
+
+    fn total_canvas_src() -> String {
+        CANVAS_SRC.replace(
+            "def media_canvas_ok(",
+            "# Request data reaches this check: refuse instead of panicking.\n# rusty-bends: total\ndef media_canvas_ok(",
+        )
+    }
+
+    fn compile_and_run(tag: &str, source: &str, extra_args: &[&str]) -> String {
+        let dir = std::env::temp_dir().join(format!("rb_total_{tag}_{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let rs_path = dir.join("main.rs");
+        let bin_path = dir.join("main_bin");
+        std::fs::write(&rs_path, source).unwrap();
+        let rustc = std::env::var("RUSTC").unwrap_or_else(|_| "rustc".to_string());
+        let compile = std::process::Command::new(&rustc)
+            .args(["--edition", "2021", "-D", "warnings"])
+            .args(extra_args)
+            .arg("-o")
+            .arg(&bin_path)
+            .arg(&rs_path)
+            .output()
+            .expect("rustc must run");
+        assert!(
+            compile.status.success(),
+            "rustc failed:\n{}\nsource:\n{source}",
+            String::from_utf8_lossy(&compile.stderr)
+        );
+        let run = std::process::Command::new(&bin_path)
+            .output()
+            .expect("run compiled binary");
+        let stdout = String::from_utf8_lossy(&run.stdout).to_string();
+        assert!(
+            run.status.success(),
+            "binary failed:\n{stdout}{}",
+            String::from_utf8_lossy(&run.stderr)
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+        stdout
+    }
+
+    #[test]
+    fn records_checked_growth_panic_sites_and_lists_them_with_file_and_line() {
+        let summary = emit_verified_rust(CANVAS_SRC, 1).unwrap();
+        let sites: Vec<(&str, &str)> = summary
+            .panic_sites
+            .iter()
+            .map(|p| (p.function.as_str(), p.op.as_str()))
+            .collect();
+        assert_eq!(sites, vec![("area", "Nat.mul")]);
+
+        let path = std::path::Path::new("verified/media.bend");
+        let listing = crate::format_panic_sites(&summary.panic_sites, &[(path, CANVAS_SRC)]);
+        assert_eq!(
+            listing[0],
+            "RustyBends panic [area]: Nat.mul at verified/media.bend:4"
+        );
+        assert!(listing[1].contains("1 checked-growth panic site(s) in 1 function(s)"));
+        assert!(listing[1].contains("# rusty-bends: total"));
+
+        let none = emit_verified_rust("def id(+n: Nat) -> Nat:\n  n\n", 0).unwrap();
+        assert!(none.panic_sites.is_empty());
+        assert_eq!(
+            crate::format_panic_sites(&none.panic_sites, &[]),
+            vec!["RustyBends panics: no checked-growth panic sites in emitted Rust"]
+        );
+    }
+
+    #[test]
+    fn total_marker_emits_option_returning_function_that_refuses_overflow() {
+        let src = total_canvas_src();
+        let (_, defs) = parse_book_items(&src).unwrap();
+        assert!(defs.iter().any(|d| d.name == "media_canvas_ok" && d.total));
+        assert!(defs.iter().any(|d| d.name == "area" && !d.total));
+
+        let summary = emit_verified_rust(&src, 1).unwrap();
+        let rs = &summary.rust_source;
+        assert!(
+            rs.contains("pub fn media_canvas_ok(w: u64, h: u64, max_pixels: u64) -> Option<bool>"),
+            "{rs}"
+        );
+        // Callee gets a private Option shadow; its public form keeps panicking semantics.
+        assert!(rs.contains("fn __rb_total_area(w: u64, h: u64) -> Option<u64>"));
+        assert!(rs.contains("(w).checked_mul(h)?"));
+        assert!(rs.contains("__rb_total_area(w, h)?"));
+        assert!(rs.contains("pub fn area(w: u64, h: u64) -> u64"));
+
+        // Panic listing: area's own Nat.mul, plus the panicking caller of the total fn.
+        let mut sites: Vec<(String, String)> = summary
+            .panic_sites
+            .iter()
+            .map(|p| (p.function.clone(), p.op.clone()))
+            .collect();
+        sites.sort();
+        assert_eq!(
+            sites,
+            vec![
+                ("area".to_string(), "Nat.mul".to_string()),
+                (
+                    "canvas_gate".to_string(),
+                    "call media_canvas_ok".to_string()
+                ),
+            ]
+        );
+        let path = std::path::Path::new("verified/media.bend");
+        let listing = crate::format_panic_sites(&summary.panic_sites, &[(path, &src)]);
+        assert!(listing.iter().any(|l| l
+            == "RustyBends panic [canvas_gate]: call media_canvas_ok at verified/media.bend:12"));
+
+        let runtime_only = rs.split("#[cfg(test)]").next().unwrap();
+        let harness = format!(
+            "{runtime_only}\nfn main() {{\n    assert_eq!(media_canvas_ok(u64::MAX, u64::MAX, u64::MAX - 1), None);\n    assert_eq!(media_canvas_ok(10, 10, 100), Some(true));\n    assert_eq!(media_canvas_ok(10, 11, 100), Some(false));\n    assert_eq!(media_canvas_ok(0, 5, 100), Some(false));\n    assert!(std::panic::catch_unwind(|| area(u64::MAX, 2)).is_err());\n    assert!(canvas_gate(10, 10));\n    assert!(!canvas_gate(100, 100));\n}}\n"
+        );
+        compile_and_run("runtime", &harness, &[]);
+    }
+
+    #[test]
+    fn total_function_generated_law_test_still_runs() {
+        let summary = emit_verified_rust(&total_canvas_src(), 1).unwrap();
+        assert!(summary.rust_source.contains("fn law_zero_width_refused()"));
+        let out = compile_and_run(
+            "lawtest",
+            &summary.rust_source,
+            &["--test", "-A", "dead_code"],
+        );
+        assert!(out.contains("law_zero_width_refused ... ok"), "{out}");
+        assert!(out.contains("test result: ok"), "{out}");
     }
 }
