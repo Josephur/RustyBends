@@ -36,6 +36,9 @@ cat << 'RUSTY_BENDS_EOF' > "rusty-bends-build/src/lib.rs"
 pub mod emit;
 pub mod law_test;
 pub mod lock;
+pub mod mutate;
+
+pub use mutate::MutateMode;
 
 use std::env;
 use std::fs;
@@ -74,6 +77,7 @@ pub struct Config {
     pub out_dir: PathBuf,
     pub allow_lock_update: bool,
     pub emit_rust: bool,
+    pub mutate_mode: MutateMode,
 }
 
 impl Default for Config {
@@ -81,6 +85,9 @@ impl Default for Config {
         let verdict_mode = env::var("BEND_VERDICT")
             .map(|v| VerdictMode::parse(&v))
             .unwrap_or(VerdictMode::Auto);
+        let mutate_mode = env::var("RUSTY_BENDS_MUTATE")
+            .map(|v| MutateMode::parse(&v))
+            .unwrap_or(MutateMode::NewOnly);
         Self {
             verified_dir: PathBuf::from("verified"),
             bend_bin: resolve_bend_bin(
@@ -99,6 +106,7 @@ impl Default for Config {
             out_dir: PathBuf::from(env::var("OUT_DIR").unwrap_or_else(|_| "target".to_string())),
             allow_lock_update: env::var("RUSTY_BENDS_UPDATE_LAWS").ok().as_deref() == Some("1"),
             emit_rust: true,
+            mutate_mode,
         }
     }
 }
@@ -147,6 +155,7 @@ pub fn run(cfg: &Config) -> Result<Option<PathBuf>, String> {
     println!("cargo:rerun-if-changed={}", cfg.lock_file.display());
     println!("cargo:rerun-if-changed={}", cfg.pin_file.display());
     println!("cargo:rerun-if-env-changed=RUSTY_BENDS_UPDATE_LAWS");
+    println!("cargo:rerun-if-env-changed=RUSTY_BENDS_MUTATE");
     println!("cargo:rerun-if-env-changed=BEND_BIN");
     println!("cargo:rerun-if-env-changed=BEND_PIN_VERSION");
     println!("cargo:rerun-if-env-changed=BEND_VERDICT");
@@ -268,8 +277,9 @@ where
     // Record which laws were already locked before this build for failure diagnostics.
     let pre_locked_laws = lock::read_locked_law_names(&cfg.lock_file);
 
-    // 1. Enforce AST/token-canonical LAWS lock before running Bend
-    let law_count = lock::enforce_law_lock(&cfg.lock_file, &bend_files, cfg.allow_lock_update)?;
+    // 1. Check AST/token-canonical LAWS lock (defer writing until Bend & mutation checks pass)
+    let lock_report = lock::check_law_lock(&cfg.lock_file, &bend_files, cfg.allow_lock_update)?;
+    let law_count = lock_report.current.len();
 
     // 2. Check incremental content-hash cache for fast no-op rebuilds
     fs::create_dir_all(&cfg.out_dir).map_err(|e| e.to_string())?;
@@ -280,7 +290,12 @@ where
     let cache_hit = fs::read_to_string(&cache_file)
         .map(|s| s.trim() == combined_hash)
         .unwrap_or(false);
-    if cache_hit && (!cfg.emit_rust || verified_rs.exists()) {
+    if cache_hit
+        && (!cfg.emit_rust || verified_rs.exists())
+        && !lock_report.needs_write
+        && lock_report.new_names.is_empty()
+        && cfg.mutate_mode == MutateMode::NewOnly
+    {
         return Ok(if cfg.emit_rust {
             Some(verified_rs)
         } else {
@@ -329,7 +344,23 @@ where
         }
     }
 
-    // 4. Erase q=0 parts and emit pure Rust (ADTs + match + defs) into OUT_DIR/verified.rs
+    // 4. Mutation-check every unlocked/new law before sealing (and report all locked laws under RUSTY_BENDS_MUTATE=all)
+    let mut_summary = mutate::run_mutation_checks(
+        &combined_source,
+        &lock_report,
+        cfg.mutate_mode,
+        &cfg.out_dir,
+    )?;
+    for w in &mut_summary.warnings {
+        println!("cargo:warning={w}");
+    }
+
+    // 5. Persist rusty-bends.lock only after Bend proofs and mutation checks succeed
+    if lock_report.needs_write {
+        lock::write_law_lock(&cfg.lock_file, &lock_report)?;
+    }
+
+    // 6. Erase q=0 parts and emit pure Rust (ADTs + match + defs) into OUT_DIR/verified.rs
     let emitted_path = if cfg.emit_rust {
         let summary = emit::emit_verified_rust(&combined_source, law_count)?;
         fs::write(&verified_rs, summary.rust_source).map_err(|e| e.to_string())?;
@@ -338,7 +369,7 @@ where
         None
     };
 
-    // 5. Persist passing content hash
+    // 7. Persist passing content hash
     fs::write(&cache_file, &combined_hash).map_err(|e| e.to_string())?;
     Ok(emitted_path)
 }
@@ -492,6 +523,7 @@ mod tests {
             out_dir: root.join("out"),
             allow_lock_update: false,
             emit_rust: true,
+            mutate_mode: MutateMode::NewOnly,
         }
     }
 
@@ -500,7 +532,7 @@ mod tests {
         let root = temp_workspace("emit_adt_cache");
         fs::write(
             root.join("verified/core.bend"),
-            "type Status:\n  Open\n  Closed\n\ndef close(+s: Status) -> Status:\n  match s:\n    case Status.Open => Status.Closed\n    case Status.Closed => Status.Closed\n\nlaw close_idem(for +s: Status):\n  close(close(s)) == close(s)\n\nproof close_idem:\n  match s:\n    case Status.Open => refl\n    case Status.Closed => refl\n",
+            "type Status:\n  Open\n  Closed\n\ndef close(+s: Status) -> Status:\n  match s:\n    case Status.Open => Status.Closed\n    case Status.Closed => Status.Closed\n\nlaw close_always_closed(for +s: Status):\n  close(s) == Status.Closed\n\nproof close_always_closed:\n  match s:\n    case Status.Open => refl\n    case Status.Closed => refl\n",
         )
         .unwrap();
 
@@ -521,8 +553,8 @@ mod tests {
             .expect("expected generated #[cfg(test)] law module");
         assert!(runtime_part.contains("pub enum Status"));
         assert!(runtime_part.contains("Status::Open => Status::Closed,"));
-        assert!(!runtime_part.contains("law close_idem"));
-        assert!(tests_part.contains("fn law_close_idem()"));
+        assert!(!runtime_part.contains("law close_always_closed"));
+        assert!(tests_part.contains("fn law_close_always_closed()"));
 
         // Second run with unchanged files hits cache (0 checker invocations)
         run_with_checker(&cfg, |_file, _has_laws| {
@@ -536,7 +568,7 @@ mod tests {
     }
 
     #[test]
-    fn lock_blocks_weakened_law_and_approves_human_update() {
+    fn lock_blocks_weakened_law_and_approves_non_vacuous_human_update() {
         let root = temp_workspace("lock_tamper");
         let core = root.join("verified/core.bend");
         fs::write(
@@ -547,7 +579,9 @@ mod tests {
 
         let cfg = make_cfg(&root);
         run_with_checker(&cfg, |_, _| Ok(())).expect("initial lock creation");
+        let original_lock = fs::read_to_string(&cfg.lock_file).unwrap();
 
+        // Tampering with a locked law to a vacuous tautology must fail with E_LAW_LOCK_TAMPERED
         fs::write(
             &core,
             "def inc(+n: Nat) -> Nat:\n  n + 1n\n\nlaw inc_two:\n  3n == 3n\n\nproof inc_two:\n  refl\n",
@@ -557,9 +591,24 @@ mod tests {
         let err = run_with_checker(&cfg, |_, _| Ok(())).expect_err("must fail on tampered law");
         assert!(err.contains("E_LAW_LOCK_TAMPERED"));
 
+        // Even with RUSTY_BENDS_UPDATE_LAWS=1, sealing a vacuous law is blocked with E_LAW_VACUOUS
+        // and the existing lock file must remain untouched.
         let mut approved_cfg = make_cfg(&root);
         approved_cfg.allow_lock_update = true;
-        run_with_checker(&approved_cfg, |_, _| Ok(())).expect("approved update succeeds");
+        let vacuous_err =
+            run_with_checker(&approved_cfg, |_, _| Ok(())).expect_err("vacuous update blocked");
+        assert!(vacuous_err.contains("E_LAW_VACUOUS"));
+        assert_eq!(fs::read_to_string(&cfg.lock_file).unwrap(), original_lock);
+
+        // Updating to a non-vacuous law with RUSTY_BENDS_UPDATE_LAWS=1 succeeds and updates the lock.
+        fs::write(
+            &core,
+            "def inc(+n: Nat) -> Nat:\n  n + 1n\n\nlaw inc_two:\n  inc(3n) == 4n\n\nproof inc_two:\n  refl\n",
+        )
+        .unwrap();
+        run_with_checker(&approved_cfg, |_, _| Ok(()))
+            .expect("approved non-vacuous update succeeds");
+        assert_ne!(fs::read_to_string(&cfg.lock_file).unwrap(), original_lock);
 
         let _ = fs::remove_dir_all(&root);
     }
@@ -853,12 +902,21 @@ pub fn extract_laws_from_source(source: &str) -> Vec<CanonicalLaw> {
     laws
 }
 
-/// Enforces `rusty-bends.lock` against the canonicalized laws in `files`.
-pub fn enforce_law_lock(
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct LockCheckReport {
+    pub current: BTreeMap<String, CanonicalLaw>,
+    pub locked_names: BTreeSet<String>,
+    pub new_names: BTreeSet<String>,
+    pub serialized: String,
+    pub needs_write: bool,
+}
+
+/// Checks `rusty-bends.lock` against the canonicalized laws in `files` without modifying the lock file.
+pub fn check_law_lock(
     lock_file: &Path,
     files: &[PathBuf],
     allow_lock_update: bool,
-) -> Result<usize, String> {
+) -> Result<LockCheckReport, String> {
     let current = extract_canonical_laws(files)?;
     let serialized = current
         .values()
@@ -866,42 +924,87 @@ pub fn enforce_law_lock(
         .collect::<Vec<_>>()
         .join("\n");
 
-    if allow_lock_update || !lock_file.exists() {
-        fs::write(lock_file, &serialized).map_err(|e| e.to_string())?;
-        return Ok(current.len());
+    let mut locked_names = BTreeSet::new();
+    let mut new_names = BTreeSet::new();
+    let needs_write = allow_lock_update || !lock_file.exists();
+
+    if lock_file.exists() {
+        let expected_raw = fs::read_to_string(lock_file).map_err(|e| e.to_string())?;
+        let mut existing_hashes: BTreeMap<String, String> = BTreeMap::new();
+
+        for line in expected_raw.lines() {
+            let trimmed = line.trim();
+            if trimmed.is_empty() || trimmed.starts_with('#') {
+                continue;
+            }
+            let parts: Vec<&str> = trimmed.splitn(3, "  ").collect();
+            if parts.len() < 2 {
+                if !allow_lock_update && !serialized.lines().any(|cur| cur == trimmed) {
+                    return Err(format!(
+                        "[E_LAW_LOCK_TAMPERED] Locked law altered or deleted: '{trimmed}'.\nHint: Restore the original law or run RUSTY_BENDS_UPDATE_LAWS=1 cargo check."
+                    ));
+                }
+                continue;
+            }
+            let expected_hash = parts[0].trim().to_string();
+            let law_name = parts[1].trim().to_string();
+            if !allow_lock_update {
+                match current.get(&law_name) {
+                    None => {
+                        return Err(format!(
+                            "[E_LAW_LOCK_TAMPERED] Locked law '{law_name}' was deleted.\nHint: Restore 'law {law_name}' in verified/, or approve intentionally with RUSTY_BENDS_UPDATE_LAWS=1 cargo check."
+                        ));
+                    }
+                    Some(actual) if actual.hash != expected_hash => {
+                        return Err(format!(
+                            "[E_LAW_LOCK_TAMPERED] Locked law '{law_name}' was modified (expected {expected_hash}, got {}).\nHint: Restore the original law statement, or approve intentionally with RUSTY_BENDS_UPDATE_LAWS=1 cargo check.",
+                            actual.hash
+                        ));
+                    }
+                    Some(_) => {}
+                }
+            }
+            existing_hashes.insert(law_name, expected_hash);
+        }
+
+        for (name, law) in &current {
+            if existing_hashes.get(name) == Some(&law.hash) {
+                locked_names.insert(name.clone());
+            } else {
+                new_names.insert(name.clone());
+            }
+        }
+    } else {
+        for name in current.keys() {
+            new_names.insert(name.clone());
+        }
     }
 
-    let expected_raw = fs::read_to_string(lock_file).map_err(|e| e.to_string())?;
-    for line in expected_raw.lines().filter(|l| !l.trim().is_empty()) {
-        let parts: Vec<&str> = line.splitn(3, "  ").collect();
-        if parts.len() < 2 {
-            // Backward compatibility with legacy lock lines
-            if !serialized.lines().any(|cur| cur == line) {
-                return Err(format!(
-                    "[E_LAW_LOCK_TAMPERED] Locked law altered or deleted: '{line}'.\nHint: Restore the original law or run RUSTY_BENDS_UPDATE_LAWS=1 cargo check."
-                ));
-            }
-            continue;
-        }
-        let expected_hash = parts[0].trim();
-        let law_name = parts[1].trim();
-        match current.get(law_name) {
-            None => {
-                return Err(format!(
-                    "[E_LAW_LOCK_TAMPERED] Locked law '{law_name}' was deleted.\nHint: Restore 'law {law_name}' in verified/, or approve intentionally with RUSTY_BENDS_UPDATE_LAWS=1 cargo check."
-                ));
-            }
-            Some(actual) if actual.hash != expected_hash => {
-                return Err(format!(
-                    "[E_LAW_LOCK_TAMPERED] Locked law '{law_name}' was modified (expected {expected_hash}, got {}).\nHint: Restore the original law statement, or approve intentionally with RUSTY_BENDS_UPDATE_LAWS=1 cargo check.",
-                    actual.hash
-                ));
-            }
-            Some(_) => {}
-        }
-    }
+    Ok(LockCheckReport {
+        current,
+        locked_names,
+        new_names,
+        serialized,
+        needs_write,
+    })
+}
 
-    Ok(current.len())
+/// Persists `report.serialized` to `lock_file`.
+pub fn write_law_lock(lock_file: &Path, report: &LockCheckReport) -> Result<(), String> {
+    fs::write(lock_file, &report.serialized).map_err(|e| e.to_string())
+}
+
+/// Enforces `rusty-bends.lock` against the canonicalized laws in `files`.
+pub fn enforce_law_lock(
+    lock_file: &Path,
+    files: &[PathBuf],
+    allow_lock_update: bool,
+) -> Result<usize, String> {
+    let report = check_law_lock(lock_file, files, allow_lock_update)?;
+    if report.needs_write {
+        write_law_lock(lock_file, &report)?;
+    }
+    Ok(report.current.len())
 }
 
 /// Reads the set of locked law names currently present in `lock_file` (returns empty if missing).
@@ -1940,7 +2043,7 @@ fn resolve_ctor_path(name: &str, ctors: &HashMap<String, CtorInfo>) -> String {
     name.replace('.', "::")
 }
 
-fn leading_indent(line: &str) -> usize {
+pub(crate) fn leading_indent(line: &str) -> usize {
     line.chars()
         .take_while(|c| *c == ' ' || *c == '\t')
         .map(|c| if c == '\t' { 4 } else { 1 })
@@ -2569,7 +2672,7 @@ fn split_case_arms(arms_str: &str) -> Vec<String> {
     arms
 }
 
-fn split_case_arm(arm: &str) -> Option<(&str, &str)> {
+pub(crate) fn split_case_arm(arm: &str) -> Option<(&str, &str)> {
     if let Some(pair) = split_fat_arrow(arm) {
         return Some(pair);
     }
@@ -4624,12 +4727,13 @@ pub(crate) fn emit_eval_law_checker(
     );
 
     let mut s = String::new();
+    let vis = if compact_mutant_mode { "pub " } else { "" };
     let ret_sig = if compact_mutant_mode {
         " -> Option<String>"
     } else {
         ""
     };
-    s.push_str(&format!("fn {fn_name}(){ret_sig} {{\n"));
+    s.push_str(&format!("{vis}fn {fn_name}(){ret_sig} {{\n"));
 
     if runtime_vars.is_empty() {
         s.push_str(&format!("    match {eval_expr} {{\n"));
@@ -5313,6 +5417,1467 @@ def pool_free_conserved(a, f, rel):
 }
 RUSTY_BENDS_EOF
 
+cat << 'RUSTY_BENDS_EOF' > "rusty-bends-build/src/mutate.rs"
+//! Mutation testing gate for RustyBends laws (Issue #6).
+//!
+//! Before an unlocked/new law is accepted (and before `rusty-bends.lock` can be
+//! created or updated), generates small mutants of every live `def` in the law's
+//! transitive dependency cone and evaluates the law on concrete inputs using the
+//! emitted Rust evaluator from `law_test`. If no mutant makes the law false, the
+//! law is vacuous and fails the build with `[E_LAW_VACUOUS]`.
+//!
+//! `RUSTY_BENDS_MUTATE=all` additionally runs over already-locked laws and emits
+//! one diagnostic line per law (`CAUGHT` or `SURVIVED`) without failing on them.
+
+use crate::emit::{
+    build_ctor_map, emit_items_to_rust, leading_indent, parse_book_items, split_case_arm,
+    split_top_level, split_top_level_once, CtorInfo, Def, Quantity, TypeDef,
+};
+use crate::law_test::{
+    create_temp_eval_dir, emit_eval_law_checker, emit_pool_runtime_helpers, law_dependency_cone,
+    parse_laws, ParsedLaw,
+};
+use crate::lock::{self, LockCheckReport};
+use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
+use std::env;
+use std::fs;
+use std::path::Path;
+use std::process::Command;
+
+const MAX_MUTANTS_PER_LAW: usize = 48;
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum MutateMode {
+    NewOnly,
+    All,
+}
+
+impl MutateMode {
+    pub fn parse(raw: &str) -> Self {
+        match raw.trim().to_ascii_lowercase().as_str() {
+            "all" => Self::All,
+            _ => Self::NewOnly,
+        }
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Mutant {
+    pub operator: String,
+    pub description: String,
+    pub def_name: String,
+    pub mutated_body: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct LawMutationReport {
+    pub law_name: String,
+    pub cone: Vec<String>,
+    pub total_mutants: usize,
+    pub caught_by: Option<(String, String)>,
+    pub survived_operators: Vec<String>,
+    pub skipped_reason: Option<String>,
+    pub from_cache: bool,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct MutationRunSummary {
+    pub reports: Vec<LawMutationReport>,
+    pub warnings: Vec<String>,
+}
+
+struct MutateCtx<'a> {
+    types: &'a [TypeDef],
+    defs: &'a [Def],
+    def_map: &'a HashMap<String, &'a Def>,
+    type_map: &'a HashMap<String, &'a TypeDef>,
+    ctor_map: &'a HashMap<String, CtorInfo>,
+    out_dir: &'a Path,
+}
+
+/// Runs mutation checks according to `mode`:
+/// - Always checks every unlocked/new law in `lock_report.new_names` and fails with
+///   `[E_LAW_VACUOUS]` if any testable new law fails to catch at least one mutant.
+/// - Under `MutateMode::All`, also evaluates every locked law and emits one warning line
+///   per locked law (`CAUGHT` or `SURVIVED`) without failing on locked laws.
+pub fn run_mutation_checks(
+    combined_source: &str,
+    lock_report: &LockCheckReport,
+    mode: MutateMode,
+    out_dir: &Path,
+) -> Result<MutationRunSummary, String> {
+    let all_laws = parse_laws(combined_source);
+    if all_laws.is_empty() {
+        return Ok(MutationRunSummary {
+            reports: Vec::new(),
+            warnings: Vec::new(),
+        });
+    }
+
+    let check_targets: Vec<&ParsedLaw> = all_laws
+        .iter()
+        .filter(|l| {
+            lock_report.new_names.contains(&l.name)
+                || (mode == MutateMode::All && lock_report.locked_names.contains(&l.name))
+        })
+        .collect();
+
+    if check_targets.is_empty() {
+        return Ok(MutationRunSummary {
+            reports: Vec::new(),
+            warnings: Vec::new(),
+        });
+    }
+
+    let (types, defs) = parse_book_items(combined_source)?;
+    let ctor_map = build_ctor_map(&types);
+    let def_map: HashMap<String, &Def> = defs.iter().map(|d| (d.name.clone(), d)).collect();
+    let type_map: HashMap<String, &TypeDef> = types.iter().map(|t| (t.name.clone(), t)).collect();
+
+    fs::create_dir_all(out_dir).map_err(|e| e.to_string())?;
+    let cache_path = out_dir.join("rusty-bends-mutate.cache");
+    let mut cache = load_mutate_cache(&cache_path);
+    let mut cache_dirty = false;
+
+    let mut reports = Vec::new();
+    let mut warnings = Vec::new();
+
+    let ctx = MutateCtx {
+        types: &types,
+        defs: &defs,
+        def_map: &def_map,
+        type_map: &type_map,
+        ctor_map: &ctor_map,
+        out_dir,
+    };
+
+    for law in check_targets {
+        let is_locked = lock_report.locked_names.contains(&law.name);
+        let cone = law_dependency_cone(law, &defs);
+        let cone_key = compute_cone_hash(law, &cone, &types, &def_map);
+
+        let report = if let Some((desc, ce)) = cache.get(&cone_key).cloned() {
+            LawMutationReport {
+                law_name: law.name.clone(),
+                cone: cone.clone(),
+                total_mutants: 1,
+                caught_by: Some((desc, ce)),
+                survived_operators: Vec::new(),
+                skipped_reason: None,
+                from_cache: true,
+            }
+        } else {
+            let r = check_single_law(law, &cone, &ctx)?;
+            if let Some((ref desc, ref ce)) = r.caught_by {
+                cache.insert(cone_key, (desc.clone(), ce.clone()));
+                cache_dirty = true;
+            }
+            r
+        };
+
+        if is_locked && mode == MutateMode::All {
+            warnings.push(format_locked_law_line(&report));
+        } else if !is_locked {
+            if let Some(ref reason) = report.skipped_reason {
+                warnings.push(format!(
+                    "RustyBends mutate [{}]: SKIPPED ({reason})",
+                    report.law_name
+                ));
+            } else if report.caught_by.is_none() {
+                let cone_str = if report.cone.is_empty() {
+                    "none".to_string()
+                } else {
+                    report.cone.join(", ")
+                };
+                let ops_str = if report.survived_operators.is_empty() {
+                    "none (law references no live verified functions)".to_string()
+                } else {
+                    report.survived_operators.join(", ")
+                };
+                return Err(format!(
+                    "[E_LAW_VACUOUS] Law '{}' is vacuous: it caught 0 mutants across [{cone_str}] (survived {} mutants: {ops_str}).\nHint: Strengthen '{}' so it fails when its target function is broken.",
+                    report.law_name, report.total_mutants, report.law_name
+                ));
+            }
+        }
+
+        reports.push(report);
+    }
+
+    if cache_dirty {
+        save_mutate_cache(&cache_path, &cache)?;
+    }
+
+    Ok(MutationRunSummary { reports, warnings })
+}
+
+pub fn format_locked_law_line(report: &LawMutationReport) -> String {
+    if let Some((ref desc, ref ce)) = report.caught_by {
+        let cached_tag = if report.from_cache { " [cached]" } else { "" };
+        format!(
+            "RustyBends mutate [{}]: caught by {desc} ({ce}){cached_tag}",
+            report.law_name
+        )
+    } else if let Some(ref reason) = report.skipped_reason {
+        format!(
+            "RustyBends mutate [{}]: skipped ({reason})",
+            report.law_name
+        )
+    } else {
+        let ops = if report.survived_operators.is_empty() {
+            "none".to_string()
+        } else {
+            report.survived_operators.join(", ")
+        };
+        format!(
+            "RustyBends mutate [{}]: SURVIVED ({} mutants: {ops})",
+            report.law_name, report.total_mutants
+        )
+    }
+}
+
+fn check_single_law(
+    law: &ParsedLaw,
+    cone: &[String],
+    ctx: &MutateCtx<'_>,
+) -> Result<LawMutationReport, String> {
+    if let Some(ref reason) = law.unsupported_reason {
+        return Ok(LawMutationReport {
+            law_name: law.name.clone(),
+            cone: cone.to_vec(),
+            total_mutants: 0,
+            caught_by: None,
+            survived_operators: Vec::new(),
+            skipped_reason: Some(reason.clone()),
+            from_cache: false,
+        });
+    }
+
+    let mut cone_defs: Vec<Def> = Vec::new();
+    for name in cone {
+        if let Some(def) = ctx.def_map.get(name) {
+            cone_defs.push((*def).clone());
+        }
+    }
+
+    let mutants = generate_mutants_for_cone(&cone_defs, ctx.def_map, ctx.ctor_map);
+    if mutants.is_empty() {
+        return Ok(LawMutationReport {
+            law_name: law.name.clone(),
+            cone: cone.to_vec(),
+            total_mutants: 0,
+            caught_by: None,
+            survived_operators: Vec::new(),
+            skipped_reason: None,
+            from_cache: false,
+        });
+    }
+
+    // Verify the law expression itself can be lowered into an eval checker before mutating.
+    if let Err(reason) = emit_eval_law_checker(
+        "check",
+        law,
+        ctx.defs,
+        ctx.def_map,
+        ctx.type_map,
+        ctx.ctor_map,
+        true,
+    ) {
+        return Ok(LawMutationReport {
+            law_name: law.name.clone(),
+            cone: cone.to_vec(),
+            total_mutants: mutants.len(),
+            caught_by: None,
+            survived_operators: Vec::new(),
+            skipped_reason: Some(reason),
+            from_cache: false,
+        });
+    }
+
+    let ops: Vec<String> = mutants
+        .iter()
+        .map(|m| m.operator.clone())
+        .collect::<BTreeSet<_>>()
+        .into_iter()
+        .collect();
+
+    let caught = evaluate_mutants_batch(
+        law,
+        &mutants,
+        ctx.types,
+        &cone_defs,
+        ctx.type_map,
+        ctx.ctor_map,
+        ctx.out_dir,
+    )?;
+    Ok(LawMutationReport {
+        law_name: law.name.clone(),
+        cone: cone.to_vec(),
+        total_mutants: mutants.len(),
+        caught_by: caught,
+        survived_operators: ops,
+        skipped_reason: None,
+        from_cache: false,
+    })
+}
+
+fn evaluate_mutants_batch(
+    law: &ParsedLaw,
+    mutants: &[Mutant],
+    types: &[TypeDef],
+    cone_defs: &[Def],
+    type_map: &HashMap<String, &TypeDef>,
+    ctor_map: &HashMap<String, CtorInfo>,
+    out_dir: &Path,
+) -> Result<Option<(String, String)>, String> {
+    match run_mutant_harness(law, mutants, types, cone_defs, type_map, ctor_map, out_dir) {
+        Ok(res) => Ok(res),
+        Err(_) => {
+            // If one mutant produced a Rust compile/type error inside a combined module,
+            // fall back to checking each mutant individually and skip invalid mutants.
+            for m in mutants {
+                if let Ok(Some(hit)) = run_mutant_harness(
+                    law,
+                    std::slice::from_ref(m),
+                    types,
+                    cone_defs,
+                    type_map,
+                    ctor_map,
+                    out_dir,
+                ) {
+                    return Ok(Some(hit));
+                }
+            }
+            Ok(None)
+        }
+    }
+}
+
+fn run_mutant_harness(
+    law: &ParsedLaw,
+    mutants: &[Mutant],
+    types: &[TypeDef],
+    cone_defs: &[Def],
+    type_map: &HashMap<String, &TypeDef>,
+    ctor_map: &HashMap<String, CtorInfo>,
+    out_dir: &Path,
+) -> Result<Option<(String, String)>, String> {
+    let mut program = String::new();
+    program.push_str("#![allow(clippy::all, non_snake_case, unused_variables, unused_parens, dead_code, unused_mut)]\n");
+
+    let types_only = emit_items_to_rust(types, &[], ctor_map, 0, None)?;
+    program.push_str(&types_only.rust_source);
+    program.push('\n');
+    program.push_str(&emit_pool_runtime_helpers(types, type_map, true));
+    program.push('\n');
+
+    let mut active_indices = Vec::new();
+    for (idx, mutant) in mutants.iter().enumerate() {
+        let mut mut_defs = cone_defs.to_vec();
+        for d in &mut mut_defs {
+            if d.name == mutant.def_name {
+                d.body = mutant.mutated_body.clone();
+            }
+        }
+        let Ok(defs_rs) = emit_items_to_rust(&[], &mut_defs, ctor_map, 0, Some(10_000)) else {
+            continue;
+        };
+        let mut_def_map: HashMap<String, &Def> =
+            mut_defs.iter().map(|d| (d.name.clone(), d)).collect();
+        let Ok(check_fn) = emit_eval_law_checker(
+            "check",
+            law,
+            &mut_defs,
+            &mut_def_map,
+            type_map,
+            ctor_map,
+            true,
+        ) else {
+            continue;
+        };
+        program.push_str(&format!("mod m_{idx} {{\n    use super::*;\n"));
+        for line in defs_rs.rust_source.lines() {
+            program.push_str("    ");
+            program.push_str(line);
+            program.push('\n');
+        }
+        for line in check_fn.lines() {
+            program.push_str("    ");
+            program.push_str(line);
+            program.push('\n');
+        }
+        program.push_str("}\n\n");
+        active_indices.push(idx);
+    }
+
+    if active_indices.is_empty() {
+        return Ok(None);
+    }
+
+    program.push_str("fn main() {\n");
+    for idx in &active_indices {
+        program.push_str(&format!(
+            "    if let Some(ce) = m_{idx}::check() {{ println!(\"CAUGHT\\t{idx}\\t{{}}\", ce.replace(['\\n', '\\r', '\\t'], \" \")); return; }}\n"
+        ));
+    }
+    program.push_str("}\n");
+
+    let eval_dir = create_temp_eval_dir(out_dir, "mut")?;
+    let rs_path = eval_dir.0.join("mutate.rs");
+    let bin_path = eval_dir.0.join("mutate_bin");
+    fs::write(&rs_path, program).map_err(|e| e.to_string())?;
+
+    let rustc = env::var("RUSTC").unwrap_or_else(|_| "rustc".to_string());
+    let compile = Command::new(&rustc)
+        .args(["--edition", "2021", "-A", "warnings", "-o"])
+        .arg(&bin_path)
+        .arg(&rs_path)
+        .output()
+        .map_err(|e| format!("failed to invoke '{rustc}' for mutation testing: {e}"))?;
+    if !compile.status.success() {
+        return Err(format!(
+            "rustc failed compiling mutant harness:\n{}",
+            String::from_utf8_lossy(&compile.stderr)
+        ));
+    }
+
+    let run = Command::new(&bin_path)
+        .output()
+        .map_err(|e| format!("failed to run mutant binary: {e}"))?;
+    if !run.status.success() {
+        return Err(format!(
+            "mutant binary exited with failure:\n{}{}",
+            String::from_utf8_lossy(&run.stdout),
+            String::from_utf8_lossy(&run.stderr)
+        ));
+    }
+
+    let stdout = String::from_utf8_lossy(&run.stdout);
+    for line in stdout.lines() {
+        if let Some(rest) = line.strip_prefix("CAUGHT\t") {
+            if let Some((idx_str, ce)) = rest.split_once('\t') {
+                if let Ok(idx) = idx_str.parse::<usize>() {
+                    if let Some(m) = mutants.get(idx) {
+                        return Ok(Some((m.description.clone(), ce.trim().to_string())));
+                    }
+                }
+            }
+        }
+    }
+
+    Ok(None)
+}
+
+/// Generates small syntactic mutants for all live `Def`s in a law's dependency cone.
+pub(crate) fn generate_mutants_for_cone(
+    cone_defs: &[Def],
+    def_map: &HashMap<String, &Def>,
+    ctor_map: &HashMap<String, CtorInfo>,
+) -> Vec<Mutant> {
+    let mut mutants = Vec::new();
+    let mut seen: HashSet<(String, String)> = HashSet::new();
+
+    let mut push = |operator: &str, desc: String, def: &Def, body: String| {
+        if mutants.len() >= MAX_MUTANTS_PER_LAW {
+            return;
+        }
+        let trimmed = body.trim().to_string();
+        if trimmed == def.body.trim() {
+            return;
+        }
+        if seen.insert((def.name.clone(), trimmed)) {
+            mutants.push(Mutant {
+                operator: operator.to_string(),
+                description: format!("{}: {desc}", def.name),
+                def_name: def.name.clone(),
+                mutated_body: body,
+            });
+        }
+    };
+
+    for def in cone_defs {
+        let protected = compute_protected_ranges(&def.body);
+
+        // 1. Bool flip: True{} <-> False{}, true <-> false, Bool.pick branch swap
+        for (body, desc) in mutate_bool_flips(&def.body, &protected) {
+            push("BoolFlip", desc, def, body);
+        }
+
+        // 2. Nat comparison & arithmetic swaps
+        for (body, desc) in mutate_nat_ops(&def.body, &protected) {
+            push("NatCmpArith", desc, def, body);
+        }
+
+        // 3. Drop one operand of Bool.and / Bool.or / && / ||
+        for (body, desc) in mutate_drop_bool_operand(&def.body, &protected) {
+            push("DropBoolOperand", desc, def, body);
+        }
+
+        // 4. Return parameter or matched constructor unchanged
+        for (body, desc) in mutate_return_unchanged(def, ctor_map) {
+            push("ReturnUnchanged", desc, def, body);
+        }
+
+        // 5. Swap two match arms with compatible binders
+        for (body, desc) in mutate_swap_match_arms(def, def_map, ctor_map) {
+            push("SwapMatchArms", desc, def, body);
+        }
+    }
+
+    drop(push);
+    mutants.truncate(MAX_MUTANTS_PER_LAW);
+    mutants
+}
+
+/// Computes byte ranges `(start, end)` in `body` that belong to pattern/header positions
+/// (`case <pat>:`, `match <scrut>:`, `let <pat> =`) and must never be mutated.
+fn compute_protected_ranges(body: &str) -> Vec<(usize, usize)> {
+    let mut ranges = Vec::new();
+    let mut offset = 0usize;
+
+    for raw_line in body.split_inclusive('\n') {
+        let line = raw_line.strip_suffix('\n').unwrap_or(raw_line);
+        let trimmed = line.trim_start();
+        let ws = line.len() - trimmed.len();
+        let line_code_start = offset + ws;
+
+        if trimmed.starts_with("case ") {
+            if let Some((pat, _)) = split_case_arm(trimmed) {
+                let pat_end = (pat.as_ptr() as usize) - (trimmed.as_ptr() as usize) + pat.len();
+                let mut delim_end = line_code_start + pat_end;
+                let after = &line[ws + pat_end..];
+                if let Some(pos) = after.find("=>") {
+                    delim_end = offset + ws + pat_end + pos + 2;
+                } else if let Some(pos) = after.find(':') {
+                    delim_end = offset + ws + pat_end + pos + 1;
+                }
+                ranges.push((offset, delim_end));
+            } else {
+                ranges.push((offset, offset + line.len()));
+            }
+        } else if trimmed.starts_with("match ") {
+            if let Some((_, _)) = split_top_level_once(trimmed, ':') {
+                if let Some(colon) = line.rfind(':') {
+                    ranges.push((offset, offset + colon + 1));
+                }
+            }
+        } else if trimmed.starts_with("let ") {
+            if let Some(eq) = line.find('=') {
+                ranges.push((offset, offset + eq + 1));
+            }
+        }
+
+        offset += raw_line.len();
+    }
+
+    ranges
+}
+
+fn in_protected(pos: usize, ranges: &[(usize, usize)]) -> bool {
+    ranges.iter().any(|&(s, e)| pos >= s && pos < e)
+}
+
+fn replace_span(s: &str, start: usize, end: usize, repl: &str) -> String {
+    let mut out = String::with_capacity(s.len() + repl.len());
+    out.push_str(&s[..start]);
+    out.push_str(repl);
+    out.push_str(&s[end..]);
+    out
+}
+
+fn mutate_bool_flips(body: &str, protected: &[(usize, usize)]) -> Vec<(String, String)> {
+    let mut out = Vec::new();
+    let bytes = body.as_bytes();
+    let mut i = 0usize;
+
+    while i < bytes.len() {
+        if in_protected(i, protected) {
+            i += 1;
+            continue;
+        }
+        let prev_ident = i > 0 && (bytes[i - 1].is_ascii_alphanumeric() || bytes[i - 1] == b'_');
+        if !prev_ident {
+            for (needle, repl) in [
+                ("True{}", "False{}"),
+                ("False{}", "True{}"),
+                ("true", "false"),
+                ("false", "true"),
+            ] {
+                if body[i..].starts_with(needle) {
+                    let end = i + needle.len();
+                    let next_ident = end < bytes.len()
+                        && (bytes[end].is_ascii_alphanumeric() || bytes[end] == b'_');
+                    if !next_ident || needle.ends_with('}') {
+                        out.push((
+                            replace_span(body, i, end, repl),
+                            format!("{needle} -> {repl}"),
+                        ));
+                        i = end;
+                        continue;
+                    }
+                }
+            }
+            if body[i..].starts_with("Bool.pick(") {
+                let paren_start = i + "Bool.pick".len();
+                if let Some(close_rel) = find_matching_paren(&body[paren_start..]) {
+                    let close_abs = paren_start + close_rel;
+                    let inner = &body[paren_start + 1..close_abs];
+                    let args = split_top_level(inner, ',');
+                    if args.len() == 3 {
+                        let swapped = format!("Bool.pick({}, {}, {})", args[0], args[2], args[1]);
+                        out.push((
+                            replace_span(body, i, close_abs + 1, &swapped),
+                            "Bool.pick branches swapped".to_string(),
+                        ));
+                    } else if args.len() == 4 {
+                        let swapped = format!(
+                            "Bool.pick({}, {}, {}, {})",
+                            args[0], args[1], args[3], args[2]
+                        );
+                        out.push((
+                            replace_span(body, i, close_abs + 1, &swapped),
+                            "Bool.pick branches swapped".to_string(),
+                        ));
+                    }
+                }
+            }
+        }
+        i += 1;
+    }
+
+    out
+}
+
+fn mutate_nat_ops(body: &str, protected: &[(usize, usize)]) -> Vec<(String, String)> {
+    let mut out = Vec::new();
+    let bytes = body.as_bytes();
+    let mut i = 0usize;
+
+    let fn_swaps: &[(&str, &[&str])] = &[
+        ("Nat.is_le", &["Nat.is_lt"]),
+        ("Nat.is_lt", &["Nat.is_le"]),
+        ("Nat.le", &["Nat.lt"]),
+        ("Nat.lte", &["Nat.lt"]),
+        ("Nat.lt", &["Nat.le"]),
+        ("Nat.is_ge", &["Nat.is_gt"]),
+        ("Nat.is_gt", &["Nat.is_ge"]),
+        ("Nat.ge", &["Nat.gt"]),
+        ("Nat.gte", &["Nat.gt"]),
+        ("Nat.gt", &["Nat.ge"]),
+        ("Nat.is_eq", &["Nat.is_ne"]),
+        ("Nat.is_ne", &["Nat.is_eq"]),
+        ("Nat.eq", &["Nat.ne"]),
+        ("Nat.ne", &["Nat.eq"]),
+        ("Nat.equal", &["Nat.is_ne"]),
+        ("Nat.add", &["Nat.sub", "Nat.mul"]),
+        ("Nat.sub", &["Nat.add"]),
+        ("Nat.mul", &["Nat.add"]),
+        ("Nat.min", &["Nat.max"]),
+        ("Nat.max", &["Nat.min"]),
+        ("Nat.succ", &["Nat.pred"]),
+        ("Nat.pred", &["Nat.succ"]),
+        ("Nat.div", &["Nat.mod"]),
+    ];
+
+    while i < bytes.len() {
+        if in_protected(i, protected) {
+            i += 1;
+            continue;
+        }
+        let prev_ident = i > 0
+            && (bytes[i - 1].is_ascii_alphanumeric()
+                || bytes[i - 1] == b'_'
+                || bytes[i - 1] == b'.');
+        if !prev_ident {
+            let mut matched_fn = false;
+            for &(from, tos) in fn_swaps {
+                if body[i..].starts_with(from) {
+                    let end = i + from.len();
+                    let next_ok = end == bytes.len()
+                        || (!bytes[end].is_ascii_alphanumeric()
+                            && bytes[end] != b'_'
+                            && bytes[end] != b'.');
+                    if next_ok {
+                        for &to in tos {
+                            out.push((replace_span(body, i, end, to), format!("{from} -> {to}")));
+                        }
+                        i = end;
+                        matched_fn = true;
+                        break;
+                    }
+                }
+            }
+            if matched_fn {
+                continue;
+            }
+        }
+
+        // Infix comparison and additive operators (avoiding ->, =>, {==}, and 1n+x Nat literals)
+        let two = if i + 1 < bytes.len() {
+            &body[i..i + 2]
+        } else {
+            ""
+        };
+        if two == "<=" {
+            out.push((replace_span(body, i, i + 2, "<"), "<= -> <".to_string()));
+            i += 2;
+            continue;
+        }
+        if two == ">=" {
+            out.push((replace_span(body, i, i + 2, ">"), ">= -> >".to_string()));
+            i += 2;
+            continue;
+        }
+        if two == "==" {
+            let in_refl =
+                i > 0 && bytes[i - 1] == b'{' && i + 2 < bytes.len() && bytes[i + 2] == b'}';
+            if !in_refl {
+                out.push((replace_span(body, i, i + 2, "!="), "== -> !=".to_string()));
+            }
+            i += 2;
+            continue;
+        }
+        if two == "!=" {
+            out.push((replace_span(body, i, i + 2, "=="), "!= -> ==".to_string()));
+            i += 2;
+            continue;
+        }
+        if bytes[i] == b'<' && (i + 1 >= bytes.len() || bytes[i + 1] != b'=') {
+            out.push((replace_span(body, i, i + 1, "<="), "< -> <=".to_string()));
+            i += 1;
+            continue;
+        }
+        if bytes[i] == b'>'
+            && (i + 1 >= bytes.len() || bytes[i + 1] != b'=')
+            && (i == 0 || (bytes[i - 1] != b'-' && bytes[i - 1] != b'='))
+        {
+            out.push((replace_span(body, i, i + 1, ">="), "> -> >=".to_string()));
+            i += 1;
+            continue;
+        }
+        if bytes[i] == b'+' && i > 0 && bytes[i - 1].is_ascii_whitespace() {
+            out.push((replace_span(body, i, i + 1, "-"), "+ -> -".to_string()));
+            i += 1;
+            continue;
+        }
+        if bytes[i] == b'-'
+            && (i + 1 >= bytes.len() || bytes[i + 1] != b'>')
+            && i > 0
+            && bytes[i - 1].is_ascii_whitespace()
+            && i + 1 < bytes.len()
+            && bytes[i + 1].is_ascii_whitespace()
+        {
+            out.push((replace_span(body, i, i + 1, "+"), "- -> +".to_string()));
+            i += 1;
+            continue;
+        }
+
+        i += 1;
+    }
+
+    out
+}
+
+fn mutate_drop_bool_operand(body: &str, protected: &[(usize, usize)]) -> Vec<(String, String)> {
+    let mut out = Vec::new();
+    let bytes = body.as_bytes();
+    let mut i = 0usize;
+
+    while i < bytes.len() {
+        if in_protected(i, protected) {
+            i += 1;
+            continue;
+        }
+        for fname in ["Bool.and(", "Bool.or("] {
+            if body[i..].starts_with(fname) {
+                let prev_ident =
+                    i > 0 && (bytes[i - 1].is_ascii_alphanumeric() || bytes[i - 1] == b'_');
+                if !prev_ident {
+                    let paren_start = i + fname.len() - 1;
+                    if let Some(close_rel) = find_matching_paren(&body[paren_start..]) {
+                        let close_abs = paren_start + close_rel;
+                        let inner = &body[paren_start + 1..close_abs];
+                        let args = split_top_level(inner, ',');
+                        if args.len() == 2 {
+                            let op_name = fname.trim_end_matches('(');
+                            out.push((
+                                replace_span(body, i, close_abs + 1, &format!("({})", args[0])),
+                                format!("{op_name} dropped right operand"),
+                            ));
+                            out.push((
+                                replace_span(body, i, close_abs + 1, &format!("({})", args[1])),
+                                format!("{op_name} dropped left operand"),
+                            ));
+                        }
+                    }
+                }
+            }
+        }
+        i += 1;
+    }
+
+    // Also handle top-level infix `&&` / `||` on single-line expressions
+    for op in ["&&", "||"] {
+        let trimmed = body.trim();
+        if !trimmed.contains('\n') {
+            if let Some((lhs, rhs)) = crate::emit::split_top_level_str(trimmed, op) {
+                out.push((lhs.to_string(), format!("{op} dropped right operand")));
+                out.push((rhs.to_string(), format!("{op} dropped left operand")));
+            }
+        }
+    }
+
+    out
+}
+
+fn mutate_return_unchanged(
+    def: &Def,
+    ctor_map: &HashMap<String, CtorInfo>,
+) -> Vec<(String, String)> {
+    let mut out = Vec::new();
+
+    // 4a. Whole-function identity return of a parameter with matching return type
+    for p in &def.params {
+        if p.q != Quantity::Dead && p.ty.trim() == def.ret.trim() && def.body.trim() != p.name {
+            out.push((
+                p.name.clone(),
+                format!("return parameter '{}' unchanged", p.name),
+            ));
+        }
+    }
+
+    // 4b. Inside match arms, return a matched constructor unchanged when it produces def.ret
+    let lines: Vec<&str> = def.body.lines().collect();
+    let mut i = 0usize;
+    while i < lines.len() {
+        let trimmed = lines[i].trim();
+        if let Some(after_case) = trimmed.strip_prefix("case ") {
+            if let Some((pat_raw, inline_body)) = split_case_arm(after_case) {
+                let case_indent = leading_indent(lines[i]);
+                if let Some(ctor_expr) =
+                    reconstruct_ctor_pattern_expr(pat_raw.trim(), &def.ret, ctor_map)
+                {
+                    if !inline_body.is_empty() {
+                        if inline_body.trim() != ctor_expr {
+                            let sep = if after_case.contains("=>") { "=>" } else { ":" };
+                            let mut new_lines: Vec<String> =
+                                lines.iter().map(|l| (*l).to_string()).collect();
+                            let indent_str = &lines[i][..lines[i].len() - trimmed.len()];
+                            new_lines[i] = format!("{indent_str}case {pat_raw} {sep} {ctor_expr}");
+                            out.push((
+                                new_lines.join("\n"),
+                                format!("return '{ctor_expr}' unchanged"),
+                            ));
+                        }
+                    } else {
+                        let mut end_idx = i + 1;
+                        while end_idx < lines.len() {
+                            let t = lines[end_idx].trim();
+                            if !t.is_empty() && leading_indent(lines[end_idx]) <= case_indent {
+                                break;
+                            }
+                            end_idx += 1;
+                        }
+                        let arm_body_str = lines[i + 1..end_idx].join("\n");
+                        if arm_body_str.trim() != ctor_expr && end_idx > i + 1 {
+                            let mut new_lines: Vec<String> = Vec::new();
+                            new_lines.extend(lines[..=i].iter().map(|l| (*l).to_string()));
+                            let body_indent =
+                                format!("{}  ", &lines[i][..lines[i].len() - trimmed.len()]);
+                            new_lines.push(format!("{body_indent}{ctor_expr}"));
+                            new_lines.extend(lines[end_idx..].iter().map(|l| (*l).to_string()));
+                            out.push((
+                                new_lines.join("\n"),
+                                format!("return '{ctor_expr}' unchanged"),
+                            ));
+                        }
+                    }
+                }
+            }
+        }
+        i += 1;
+    }
+
+    out
+}
+
+fn reconstruct_ctor_pattern_expr(
+    pat: &str,
+    ret_ty: &str,
+    ctor_map: &HashMap<String, CtorInfo>,
+) -> Option<String> {
+    let open = pat.find('{')?;
+    if !pat.ends_with('}') {
+        return None;
+    }
+    let head = pat[..open].trim();
+    let info = ctor_map.get(head)?;
+    if info.type_name != ret_ty.trim() {
+        return None;
+    }
+    let inner = pat[open + 1..pat.len() - 1].trim();
+    if inner.is_empty() {
+        return Some(format!("{head}{{}}"));
+    }
+    let mut fields = Vec::new();
+    for part in split_top_level(inner, ',') {
+        let clean = part
+            .trim()
+            .trim_start_matches('+')
+            .trim_start_matches('-')
+            .trim();
+        let var = if let Some((_, v)) = clean.split_once(':') {
+            v.trim()
+                .trim_start_matches('+')
+                .trim_start_matches('-')
+                .trim()
+        } else {
+            clean
+        };
+        if var == "_"
+            || var.is_empty()
+            || !var.chars().all(|c| c.is_ascii_alphanumeric() || c == '_')
+            || var.chars().next().is_some_and(|c| c.is_ascii_digit())
+        {
+            return None;
+        }
+        fields.push(var.to_string());
+    }
+    Some(format!("{head}{{{}}}", fields.join(", ")))
+}
+
+struct ArmSlice {
+    case_line: usize,
+    end_line: usize, // exclusive
+    pat: String,
+    inline_sep: Option<&'static str>, // Some(":") or Some("=>") if inline body
+    body_text: String,
+}
+
+fn mutate_swap_match_arms(
+    def: &Def,
+    def_map: &HashMap<String, &Def>,
+    ctor_map: &HashMap<String, CtorInfo>,
+) -> Vec<(String, String)> {
+    let mut out = Vec::new();
+    let lines: Vec<&str> = def.body.lines().collect();
+
+    for m_idx in 0..lines.len() {
+        let m_trim = lines[m_idx].trim();
+        if !m_trim.starts_with("match ") || !m_trim.ends_with(':') {
+            continue;
+        }
+        let m_indent = leading_indent(lines[m_idx]);
+        let Some(first_case) = (m_idx + 1..lines.len()).find(|&idx| {
+            let t = lines[idx].trim();
+            !t.is_empty() && leading_indent(lines[idx]) > m_indent && t.starts_with("case ")
+        }) else {
+            continue;
+        };
+        let case_indent = leading_indent(lines[first_case]);
+
+        // Determine the end of this match block
+        let mut match_end = lines.len();
+        for (idx, line) in lines.iter().enumerate().skip(m_idx + 1) {
+            let t = line.trim();
+            if !t.is_empty() && leading_indent(line) <= m_indent {
+                match_end = idx;
+                break;
+            }
+        }
+
+        let mut arm_starts = Vec::new();
+        for (idx, line) in lines.iter().enumerate().take(match_end).skip(first_case) {
+            let t = line.trim();
+            if !t.is_empty() && leading_indent(line) == case_indent && t.starts_with("case ") {
+                arm_starts.push(idx);
+            }
+        }
+        if arm_starts.len() < 2 {
+            continue;
+        }
+
+        let mut arms = Vec::new();
+        for (ai, &start) in arm_starts.iter().enumerate() {
+            let end = arm_starts.get(ai + 1).copied().unwrap_or(match_end);
+            let after_case = lines[start].trim().strip_prefix("case ").unwrap().trim();
+            let Some((pat_raw, inline_body)) = split_case_arm(after_case) else {
+                continue;
+            };
+            if !inline_body.is_empty() && end == start + 1 {
+                let sep = if after_case.contains("=>") { "=>" } else { ":" };
+                arms.push(ArmSlice {
+                    case_line: start,
+                    end_line: end,
+                    pat: pat_raw.trim().to_string(),
+                    inline_sep: Some(sep),
+                    body_text: inline_body.trim().to_string(),
+                });
+            } else {
+                let mut body_lines = Vec::new();
+                if !inline_body.is_empty() {
+                    let indent = format!(
+                        "{}  ",
+                        &lines[start][..lines[start].len() - lines[start].trim_start().len()]
+                    );
+                    body_lines.push(format!("{indent}{}", inline_body.trim()));
+                }
+                for &l in &lines[start + 1..end] {
+                    body_lines.push(l.to_string());
+                }
+                arms.push(ArmSlice {
+                    case_line: start,
+                    end_line: end,
+                    pat: pat_raw.trim().to_string(),
+                    inline_sep: None,
+                    body_text: body_lines.join("\n"),
+                });
+            }
+        }
+
+        for i in 0..arms.len() {
+            for j in i + 1..arms.len() {
+                if arms[i].body_text.trim() == arms[j].body_text.trim() {
+                    continue;
+                }
+                if !arms_binder_compatible(&arms[i], &arms[j], def, def_map, ctor_map) {
+                    continue;
+                }
+                if let Some(swapped) = rebuild_with_swapped_arms(&lines, &arms[i], &arms[j]) {
+                    out.push((
+                        swapped,
+                        format!("swap match arms '{}' and '{}'", arms[i].pat, arms[j].pat),
+                    ));
+                }
+            }
+        }
+    }
+
+    out
+}
+
+fn arms_binder_compatible(
+    a: &ArmSlice,
+    b: &ArmSlice,
+    def: &Def,
+    def_map: &HashMap<String, &Def>,
+    ctor_map: &HashMap<String, CtorInfo>,
+) -> bool {
+    let param_names: HashSet<String> = def.params.iter().map(|p| p.name.clone()).collect();
+    let binds_a = extract_pattern_binders(&a.pat, ctor_map);
+    let binds_b = extract_pattern_binders(&b.pat, ctor_map);
+
+    let tokens_a: HashSet<String> = lock::tokenize_bend(&a.body_text)
+        .into_iter()
+        .filter(|t| !def_map.contains_key(t) && !ctor_map.contains_key(t))
+        .collect();
+    let tokens_b: HashSet<String> = lock::tokenize_bend(&b.body_text)
+        .into_iter()
+        .filter(|t| !def_map.contains_key(t) && !ctor_map.contains_key(t))
+        .collect();
+
+    for var in &binds_a {
+        if !param_names.contains(var) && tokens_a.contains(var) && !binds_b.contains(var) {
+            return false;
+        }
+    }
+    for var in &binds_b {
+        if !param_names.contains(var) && tokens_b.contains(var) && !binds_a.contains(var) {
+            return false;
+        }
+    }
+    true
+}
+
+fn extract_pattern_binders(pat: &str, ctor_map: &HashMap<String, CtorInfo>) -> HashSet<String> {
+    let mut binders = HashSet::new();
+    for tok in lock::tokenize_bend(pat) {
+        if matches!(
+            tok.as_str(),
+            "_" | "true" | "false" | "True" | "False" | "Unit"
+        ) || ctor_map.contains_key(&tok)
+        {
+            continue;
+        }
+        let first = tok.chars().next();
+        if first.is_some_and(|c| c.is_ascii_lowercase() || c == '_')
+            && tok.chars().all(|c| c.is_ascii_alphanumeric() || c == '_')
+        {
+            binders.insert(tok);
+        }
+    }
+    binders
+}
+
+fn rebuild_with_swapped_arms(lines: &[&str], a: &ArmSlice, b: &ArmSlice) -> Option<String> {
+    let mut result: Vec<String> = Vec::new();
+    let mut idx = 0usize;
+    while idx < lines.len() {
+        if idx == a.case_line {
+            emit_arm_with_body(lines, a, &b.body_text, &mut result);
+            idx = a.end_line;
+        } else if idx == b.case_line {
+            emit_arm_with_body(lines, b, &a.body_text, &mut result);
+            idx = b.end_line;
+        } else {
+            result.push(lines[idx].to_string());
+            idx += 1;
+        }
+    }
+    Some(result.join("\n"))
+}
+
+fn emit_arm_with_body(lines: &[&str], target: &ArmSlice, new_body: &str, out: &mut Vec<String>) {
+    let line = lines[target.case_line];
+    let ws_len = line.len() - line.trim_start().len();
+    let indent = &line[..ws_len];
+    if let Some(sep) = target.inline_sep {
+        if !new_body.contains('\n') {
+            out.push(format!(
+                "{indent}case {} {sep} {}",
+                target.pat,
+                new_body.trim()
+            ));
+            return;
+        }
+    }
+    out.push(format!("{indent}case {}:", target.pat));
+    let body_indent = format!("{indent}  ");
+    for bl in new_body.lines() {
+        if bl.trim().is_empty() {
+            continue;
+        }
+        if bl.starts_with(' ') || bl.starts_with('\t') {
+            out.push(bl.to_string());
+        } else {
+            out.push(format!("{body_indent}{}", bl.trim()));
+        }
+    }
+}
+
+fn find_matching_paren(s: &str) -> Option<usize> {
+    let mut depth = 0i32;
+    for (idx, ch) in s.char_indices() {
+        match ch {
+            '(' => depth += 1,
+            ')' => {
+                depth -= 1;
+                if depth == 0 {
+                    return Some(idx);
+                }
+            }
+            _ => {}
+        }
+    }
+    None
+}
+
+fn compute_cone_hash(
+    law: &ParsedLaw,
+    cone: &[String],
+    types: &[TypeDef],
+    def_map: &HashMap<String, &Def>,
+) -> String {
+    let mut buf = Vec::new();
+    buf.extend_from_slice(b"rb-mutate-v1\0");
+    buf.extend_from_slice(law.name.as_bytes());
+    buf.push(0);
+    for v in &law.vars {
+        buf.extend_from_slice(v.name.as_bytes());
+        buf.push(b':');
+        buf.extend_from_slice(v.ty.as_bytes());
+        buf.push(0);
+    }
+    for h in &law.hypotheses {
+        buf.extend_from_slice(h.lhs.as_bytes());
+        buf.extend_from_slice(b"==");
+        buf.extend_from_slice(h.rhs.as_bytes());
+        buf.push(0);
+    }
+    buf.extend_from_slice(law.lhs.as_bytes());
+    buf.extend_from_slice(b"==");
+    buf.extend_from_slice(law.rhs.as_bytes());
+    buf.push(b':');
+    buf.extend_from_slice(law.eq_ty.as_bytes());
+    buf.push(0);
+
+    let mut sorted_types: Vec<&TypeDef> = types.iter().collect();
+    sorted_types.sort_by(|a, b| a.name.cmp(&b.name));
+    for td in sorted_types {
+        buf.extend_from_slice(td.name.as_bytes());
+        buf.push(0);
+        for v in &td.variants {
+            buf.extend_from_slice(v.name.as_bytes());
+            for ft in &v.field_types {
+                buf.push(b',');
+                buf.extend_from_slice(ft.as_bytes());
+            }
+            buf.push(0);
+        }
+    }
+
+    let mut sorted_cone = cone.to_vec();
+    sorted_cone.sort();
+    for name in sorted_cone {
+        if let Some(def) = def_map.get(&name) {
+            buf.extend_from_slice(def.name.as_bytes());
+            buf.push(0);
+            for p in &def.params {
+                buf.extend_from_slice(p.name.as_bytes());
+                buf.push(b':');
+                buf.extend_from_slice(p.ty.as_bytes());
+                buf.push(0);
+            }
+            buf.extend_from_slice(def.ret.as_bytes());
+            buf.push(0);
+            buf.extend_from_slice(def.body.as_bytes());
+            buf.push(0);
+        }
+    }
+
+    lock::fnv1a_hex(&buf)
+}
+
+fn load_mutate_cache(path: &Path) -> BTreeMap<String, (String, String)> {
+    let mut map = BTreeMap::new();
+    let Ok(raw) = fs::read_to_string(path) else {
+        return map;
+    };
+    for line in raw.lines() {
+        let parts: Vec<&str> = line.splitn(4, '\t').collect();
+        if parts.len() == 4 && parts[1] == "CAUGHT" {
+            map.insert(
+                parts[0].to_string(),
+                (parts[2].to_string(), parts[3].to_string()),
+            );
+        }
+    }
+    map
+}
+
+fn save_mutate_cache(path: &Path, map: &BTreeMap<String, (String, String)>) -> Result<(), String> {
+    let mut lines = Vec::with_capacity(map.len());
+    for (k, (desc, ce)) in map {
+        lines.push(format!(
+            "{k}\tCAUGHT\t{}\t{}",
+            desc.replace(['\t', '\n', '\r'], " "),
+            ce.replace(['\t', '\n', '\r'], " ")
+        ));
+    }
+    fs::write(path, lines.join("\n")).map_err(|e| e.to_string())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::sync::atomic::{AtomicUsize, Ordering};
+
+    static MSEQ: AtomicUsize = AtomicUsize::new(0);
+
+    fn tmp_dir(tag: &str) -> std::path::PathBuf {
+        let n = MSEQ.fetch_add(1, Ordering::SeqCst);
+        let dir = env::temp_dir().join(format!("rb_mutate_{tag}_{}_{n}", std::process::id()));
+        let _ = fs::remove_dir_all(&dir);
+        fs::create_dir_all(&dir).unwrap();
+        dir
+    }
+
+    #[test]
+    fn rejects_vacuous_laws_with_e_law_vacuous_and_skips_lock_write() {
+        let dir = tmp_dir("vacuous");
+        let core = dir.join("core.bend");
+        let lock_file = dir.join("rusty-bends.lock");
+        let out_dir = dir.join("out");
+
+        let src = r#"import Base
+
+def f(+x: Nat) -> Nat:
+  Nat.add(x, 1n)
+
+law f_reflexive:
+  for +x: Nat
+  {f(x) == f(x) : Nat}
+"#;
+        fs::write(&core, src).unwrap();
+        let report = lock::check_law_lock(&lock_file, std::slice::from_ref(&core), false).unwrap();
+        let err = run_mutation_checks(src, &report, MutateMode::NewOnly, &out_dir)
+            .expect_err("vacuous law {f(x) == f(x)} must fail mutation check");
+        assert!(err.contains("E_LAW_VACUOUS"), "got: {err}");
+        assert!(err.contains("f_reflexive"), "got: {err}");
+        assert!(!lock_file.exists(), "lock must not be written on failure");
+
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn passes_conservation_law_against_real_bend_and_caches_result() {
+        let dir = tmp_dir("conserved");
+        let core = dir.join("core.bend");
+        let lock_file = dir.join("rusty-bends.lock");
+        let out_dir = dir.join("out");
+
+        let src = r#"import Base
+
+type Pool is Data:
+  Pool{alloc: Nat, free: Nat}
+
+def pool_cap(+p: Pool) -> Nat:
+  match p:
+    case Pool{alloc, free}:
+      Nat.add(alloc, free)
+
+def pool_alloc_if(+alloc: Nat, +free: Nat, +req: Nat, ok: Bool) -> Pool:
+  match ok:
+    case True{}:
+      Pool{Nat.add(alloc, req), Nat.sub(free, req)}
+    case False{}:
+      Pool{alloc, free}
+
+def pool_alloc(+p: Pool, +req: Nat) -> Pool:
+  match p:
+    case Pool{alloc, +free}:
+      pool_alloc_if(alloc, free, req, Nat.is_le(req, free))
+
+def add_zero_sym(+a: Nat) -> {a == Nat.add(a, 0n) : Nat}:
+  match a:
+    case 0n:
+      {==}
+    case 1n+ap:
+      %add_zero_sym(ap) : {1n+ap == 1n+_ : Nat}
+      {==}
+
+def add_succ_sym(+a: Nat, +b: Nat) -> {1n+Nat.add(a, b) == Nat.add(a, 1n+b) : Nat}:
+  match a:
+    case 0n:
+      {==}
+    case 1n+ap:
+      %add_succ_sym(ap, b) : {1n+1n+Nat.add(ap, b) == 1n+_ : Nat}
+      {==}
+
+def alloc_step(
+  +rp: Nat,
+  +fp: Nat,
+  +alloc: Nat,
+  ok: Bool,
+  ih: {pool_cap(pool_alloc_if(alloc, fp, rp, ok)) == Nat.add(alloc, fp) : Nat}
+) -> {pool_cap(pool_alloc_if(alloc, 1n+fp, 1n+rp, ok)) == Nat.add(alloc, 1n+fp) : Nat}:
+  match ok:
+    case False{}:
+      {==}
+    case True{}:
+      %add_succ_sym(alloc, rp) : {Nat.add(_, Nat.sub(fp, rp)) == Nat.add(alloc, 1n+fp) : Nat}
+      %add_succ_sym(alloc, fp) : {1n+Nat.add(Nat.add(alloc, rp), Nat.sub(fp, rp)) == _ : Nat}
+      %ih : {1n+Nat.add(Nat.add(alloc, rp), Nat.sub(fp, rp)) == 1n+_ : Nat}
+      {==}
+
+def alloc_if_shift(+req: Nat, +free: Nat, +alloc: Nat) -> {pool_cap(pool_alloc_if(alloc, free, req, Nat.is_le(req, free))) == Nat.add(alloc, free) : Nat}:
+  match req free:
+    case 0n 0n:
+      %add_zero_sym(Nat.add(alloc, 0n)) : {_ == Nat.add(alloc, 0n) : Nat}
+      {==}
+    case 0n 1n+fp:
+      %add_zero_sym(alloc) : {Nat.add(_, 1n+fp) == Nat.add(alloc, 1n+fp) : Nat}
+      {==}
+    case 1n+rp 0n:
+      {==}
+    case 1n+rp 1n+fp:
+      alloc_step(rp, fp, alloc, Nat.is_le(rp, fp), alloc_if_shift(rp, fp, alloc))
+
+law alloc_conserves_capacity:
+  for +alloc: Nat
+  for +free: Nat
+  for +req: Nat
+  {pool_cap(pool_alloc(Pool{alloc, free}, req)) == Nat.add(alloc, free) : Nat}
+
+def alloc_conserves_capacity(alloc, free, req):
+  alloc_if_shift(req, free, alloc)
+"#;
+        fs::write(&core, src).unwrap();
+
+        let bend = crate::resolve_bend_bin(
+            env::var("BEND_BIN").ok(),
+            env::var_os("PATH"),
+            env::var_os("HOME").map(std::path::PathBuf::from),
+        );
+        let output = Command::new(&bend)
+            .arg(&core)
+            .arg("--check-only")
+            .output()
+            .expect("bend binary should execute");
+        assert!(
+            output.status.success(),
+            "bend --check-only failed:\n{}{}",
+            String::from_utf8_lossy(&output.stdout),
+            String::from_utf8_lossy(&output.stderr)
+        );
+
+        let report = lock::check_law_lock(&lock_file, std::slice::from_ref(&core), false).unwrap();
+        let summary = run_mutation_checks(src, &report, MutateMode::NewOnly, &out_dir)
+            .expect("conservation law must catch Nat.add -> Nat.sub mutant");
+        assert_eq!(summary.reports.len(), 1);
+        assert!(summary.reports[0].caught_by.is_some());
+        assert!(!summary.reports[0].from_cache);
+
+        // Second run hits mutation cache
+        let summary2 = run_mutation_checks(src, &report, MutateMode::NewOnly, &out_dir)
+            .expect("cached mutation check succeeds");
+        assert!(summary2.reports[0].from_cache);
+
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn mutate_mode_all_reports_locked_laws_without_failing() {
+        let dir = tmp_dir("mode_all");
+        let core = dir.join("core.bend");
+        let lock_file = dir.join("rusty-bends.lock");
+        let out_dir = dir.join("out");
+
+        let src = r#"import Base
+
+def inc(+n: Nat) -> Nat:
+  Nat.add(n, 1n)
+
+law inc_zero:
+  {inc(0n) == 1n : Nat}
+
+law empty_tautology:
+  for +n: Nat
+  {inc(n) == inc(n) : Nat}
+"#;
+        fs::write(&core, src).unwrap();
+        // Pre-seal both laws into the lock
+        lock::enforce_law_lock(&lock_file, std::slice::from_ref(&core), true).unwrap();
+
+        let report = lock::check_law_lock(&lock_file, std::slice::from_ref(&core), false).unwrap();
+        assert!(report.new_names.is_empty());
+        assert_eq!(report.locked_names.len(), 2);
+
+        let summary = run_mutation_checks(src, &report, MutateMode::All, &out_dir)
+            .expect("MutateMode::All must report without failing on locked vacuous laws");
+        assert_eq!(summary.warnings.len(), 2);
+        assert!(
+            summary
+                .warnings
+                .iter()
+                .any(|w| w.contains("empty_tautology") && w.contains("SURVIVED")),
+            "warnings: {:?}",
+            summary.warnings
+        );
+        assert!(
+            summary
+                .warnings
+                .iter()
+                .any(|w| w.contains("inc_zero") && w.contains("caught by")),
+            "warnings: {:?}",
+            summary.warnings
+        );
+
+        let _ = fs::remove_dir_all(&dir);
+    }
+}
+RUSTY_BENDS_EOF
+
 cat << 'RUSTY_BENDS_EOF' > "example-app/Cargo.toml"
 [package]
 name = "my-verified-app"
@@ -5573,6 +7138,8 @@ def cancel_idempotent(s):
   - `(a + b : U32)` / `U64` / `I32` / `I64` emit **wrapping** ops (`wrapping_add`, `wrapping_sub`, `wrapping_mul`) matching Bend 2's fixed-width integer semantics.
 - **Control flow & patterns:** nested `match`, multi-scrutinee `match a b:`, `case 1n+p:` and nested `case 1n+1n+q:` successor patterns, and multi-line `let` bindings are all supported.
 - **Generated per-law Rust tests:** every `law` also emits a `#[cfg(test)]` Rust test into `OUT_DIR/verified.rs` (run automatically by `cargo test`) that checks the emitted functions across small values, `u64::MAX - 1`, `u64::MAX`, ADT constructors, and deterministic PRNG samples (skipping only checked `Nat` overflow panics).
+- **Counterexample vs proof-failure diagnosis:** when `bend --check-only` fails on a law, `rusty-bends-build` evaluates the emitted Rust on concrete inputs first and reports `[E_LAW_FALSE]` with aligned `lhs`/`rhs` values if the law is false, or notes `"no counterexample up to ...: the law may be true; the proof is what failed"` if no counterexample exists.
+- **Mutation checking before sealing (`E_LAW_VACUOUS`):** every unlocked/new law is checked against small mutants of the live functions in its dependency cone (`True{}`/`False{}` swap, `Nat.is_le`/`Nat.is_lt` swap, `Nat.add`/`Nat.sub` swap, `Bool.and`/`Bool.or` operand drop, returning a constructor argument unchanged, swapping match arms) and fails with `[E_LAW_VACUOUS]` if it catches none. Run `RUSTY_BENDS_MUTATE=all cargo check` to report caught/survived status for already-locked laws without failing.
 
 ## 5. Mandatory Rules for AI Agents
 

@@ -62,12 +62,21 @@ pub fn extract_laws_from_source(source: &str) -> Vec<CanonicalLaw> {
     laws
 }
 
-/// Enforces `rusty-bends.lock` against the canonicalized laws in `files`.
-pub fn enforce_law_lock(
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct LockCheckReport {
+    pub current: BTreeMap<String, CanonicalLaw>,
+    pub locked_names: BTreeSet<String>,
+    pub new_names: BTreeSet<String>,
+    pub serialized: String,
+    pub needs_write: bool,
+}
+
+/// Checks `rusty-bends.lock` against the canonicalized laws in `files` without modifying the lock file.
+pub fn check_law_lock(
     lock_file: &Path,
     files: &[PathBuf],
     allow_lock_update: bool,
-) -> Result<usize, String> {
+) -> Result<LockCheckReport, String> {
     let current = extract_canonical_laws(files)?;
     let serialized = current
         .values()
@@ -75,42 +84,87 @@ pub fn enforce_law_lock(
         .collect::<Vec<_>>()
         .join("\n");
 
-    if allow_lock_update || !lock_file.exists() {
-        fs::write(lock_file, &serialized).map_err(|e| e.to_string())?;
-        return Ok(current.len());
+    let mut locked_names = BTreeSet::new();
+    let mut new_names = BTreeSet::new();
+    let needs_write = allow_lock_update || !lock_file.exists();
+
+    if lock_file.exists() {
+        let expected_raw = fs::read_to_string(lock_file).map_err(|e| e.to_string())?;
+        let mut existing_hashes: BTreeMap<String, String> = BTreeMap::new();
+
+        for line in expected_raw.lines() {
+            let trimmed = line.trim();
+            if trimmed.is_empty() || trimmed.starts_with('#') {
+                continue;
+            }
+            let parts: Vec<&str> = trimmed.splitn(3, "  ").collect();
+            if parts.len() < 2 {
+                if !allow_lock_update && !serialized.lines().any(|cur| cur == trimmed) {
+                    return Err(format!(
+                        "[E_LAW_LOCK_TAMPERED] Locked law altered or deleted: '{trimmed}'.\nHint: Restore the original law or run RUSTY_BENDS_UPDATE_LAWS=1 cargo check."
+                    ));
+                }
+                continue;
+            }
+            let expected_hash = parts[0].trim().to_string();
+            let law_name = parts[1].trim().to_string();
+            if !allow_lock_update {
+                match current.get(&law_name) {
+                    None => {
+                        return Err(format!(
+                            "[E_LAW_LOCK_TAMPERED] Locked law '{law_name}' was deleted.\nHint: Restore 'law {law_name}' in verified/, or approve intentionally with RUSTY_BENDS_UPDATE_LAWS=1 cargo check."
+                        ));
+                    }
+                    Some(actual) if actual.hash != expected_hash => {
+                        return Err(format!(
+                            "[E_LAW_LOCK_TAMPERED] Locked law '{law_name}' was modified (expected {expected_hash}, got {}).\nHint: Restore the original law statement, or approve intentionally with RUSTY_BENDS_UPDATE_LAWS=1 cargo check.",
+                            actual.hash
+                        ));
+                    }
+                    Some(_) => {}
+                }
+            }
+            existing_hashes.insert(law_name, expected_hash);
+        }
+
+        for (name, law) in &current {
+            if existing_hashes.get(name) == Some(&law.hash) {
+                locked_names.insert(name.clone());
+            } else {
+                new_names.insert(name.clone());
+            }
+        }
+    } else {
+        for name in current.keys() {
+            new_names.insert(name.clone());
+        }
     }
 
-    let expected_raw = fs::read_to_string(lock_file).map_err(|e| e.to_string())?;
-    for line in expected_raw.lines().filter(|l| !l.trim().is_empty()) {
-        let parts: Vec<&str> = line.splitn(3, "  ").collect();
-        if parts.len() < 2 {
-            // Backward compatibility with legacy lock lines
-            if !serialized.lines().any(|cur| cur == line) {
-                return Err(format!(
-                    "[E_LAW_LOCK_TAMPERED] Locked law altered or deleted: '{line}'.\nHint: Restore the original law or run RUSTY_BENDS_UPDATE_LAWS=1 cargo check."
-                ));
-            }
-            continue;
-        }
-        let expected_hash = parts[0].trim();
-        let law_name = parts[1].trim();
-        match current.get(law_name) {
-            None => {
-                return Err(format!(
-                    "[E_LAW_LOCK_TAMPERED] Locked law '{law_name}' was deleted.\nHint: Restore 'law {law_name}' in verified/, or approve intentionally with RUSTY_BENDS_UPDATE_LAWS=1 cargo check."
-                ));
-            }
-            Some(actual) if actual.hash != expected_hash => {
-                return Err(format!(
-                    "[E_LAW_LOCK_TAMPERED] Locked law '{law_name}' was modified (expected {expected_hash}, got {}).\nHint: Restore the original law statement, or approve intentionally with RUSTY_BENDS_UPDATE_LAWS=1 cargo check.",
-                    actual.hash
-                ));
-            }
-            Some(_) => {}
-        }
-    }
+    Ok(LockCheckReport {
+        current,
+        locked_names,
+        new_names,
+        serialized,
+        needs_write,
+    })
+}
 
-    Ok(current.len())
+/// Persists `report.serialized` to `lock_file`.
+pub fn write_law_lock(lock_file: &Path, report: &LockCheckReport) -> Result<(), String> {
+    fs::write(lock_file, &report.serialized).map_err(|e| e.to_string())
+}
+
+/// Enforces `rusty-bends.lock` against the canonicalized laws in `files`.
+pub fn enforce_law_lock(
+    lock_file: &Path,
+    files: &[PathBuf],
+    allow_lock_update: bool,
+) -> Result<usize, String> {
+    let report = check_law_lock(lock_file, files, allow_lock_update)?;
+    if report.needs_write {
+        write_law_lock(lock_file, &report)?;
+    }
+    Ok(report.current.len())
 }
 
 /// Reads the set of locked law names currently present in `lock_file` (returns empty if missing).

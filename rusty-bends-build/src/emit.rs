@@ -832,7 +832,7 @@ fn resolve_ctor_path(name: &str, ctors: &HashMap<String, CtorInfo>) -> String {
     name.replace('.', "::")
 }
 
-fn leading_indent(line: &str) -> usize {
+pub(crate) fn leading_indent(line: &str) -> usize {
     line.chars()
         .take_while(|c| *c == ' ' || *c == '\t')
         .map(|c| if c == '\t' { 4 } else { 1 })
@@ -1461,7 +1461,7 @@ fn split_case_arms(arms_str: &str) -> Vec<String> {
     arms
 }
 
-fn split_case_arm(arm: &str) -> Option<(&str, &str)> {
+pub(crate) fn split_case_arm(arm: &str) -> Option<(&str, &str)> {
     if let Some(pair) = split_fat_arrow(arm) {
         return Some(pair);
     }

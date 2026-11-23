@@ -19,12 +19,16 @@ On each build, for every `.bend` file in the verified directory:
 
 1. **Version pin.** If `bend.pin` (or `BEND_PIN_VERSION`) names a version, it runs
    `bend version` and fails with `E_BEND_VERSION_MISMATCH` when the installed Bend differs.
-2. **Proof gate.** It runs `bend <file> --check-only`, and `bend <file> --verdict` (Lean
-   kernel check of the proofs) according to `BEND_VERDICT`.
-3. **Law lock.** It compares every `law` with the token-canonical copy in
+2. **Proof gate and counterexample diagnosis.** It runs `bend <file> --check-only`, and `bend <file> --verdict` (Lean
+   kernel check of the proofs) according to `BEND_VERDICT`. When a proof fails, it evaluates
+   the emitted Rust on concrete inputs to distinguish a false law (`E_LAW_FALSE` with concrete
+   `lhs` vs `rhs` values) from an incomplete proof.
+3. **Law lock and mutation check (`E_LAW_VACUOUS`).** It compares every `law` with the token-canonical copy in
    `rusty-bends.lock`. A locked law that was edited, weakened or deleted fails the build
-   with `E_LAW_LOCK_TAMPERED`. Building with `RUSTY_BENDS_UPDATE_LAWS=1` rewrites the whole
-   lock from the current sources, so it is how new laws get locked, and it skips the check:
+   with `E_LAW_LOCK_TAMPERED`. Before any new law is accepted or sealed, `rusty-bends-build`
+   mutates the live functions the law depends on and checks that concrete evaluation catches at
+   least one broken mutant (`E_LAW_VACUOUS` otherwise). Building with `RUSTY_BENDS_UPDATE_LAWS=1`
+   rewrites the whole lock from the current sources once proofs and mutation checks pass:
    build once without it first, and review the lock's diff (it should only add lines).
 4. **Erasure, emission, and per-law tests.** It drops laws, proof `def`s, equality lemmas and
    other `q=0` terms from the runtime output, writes the remaining functions and ADTs
@@ -100,13 +104,14 @@ code, and hand it to a coding agent working on a RustyBends project.
 | `BEND_PIN_VERSION` | Required Bend version prefix (overrides `bend.pin`). |
 | `BEND_CHECK_FLAG`, `BEND_VERDICT_FLAG` | Override the `--check-only` / `--verdict` flags. |
 | `BENDTT` | When set, `--verdict` counts as available even if `lean` is not in `~/.elan/bin` or on `PATH`. |
-| `RUSTY_BENDS_UPDATE_LAWS` | `1` rewrites `rusty-bends.lock` from the current laws, skipping the tamper check. Review the lock's diff before committing. |
+| `RUSTY_BENDS_UPDATE_LAWS` | `1` rewrites `rusty-bends.lock` from the current laws (once proofs & mutation checks pass), skipping the tamper check. Review the lock's diff before committing. |
+| `RUSTY_BENDS_MUTATE` | `all`: also runs the mutation check over locked laws and prints caught/survived diagnostics without failing the build. |
 
 ## Repository layout
 
 | Path | What |
 |---|---|
-| `rusty-bends-build/` | The build crate: proof gate (`lib.rs`), law lock (`lock.rs`), Rust emitter (`emit.rs`). |
+| `rusty-bends-build/` | The build crate: proof gate (`lib.rs`), law lock (`lock.rs`), Rust emitter (`emit.rs`), per-law test & counterexample evaluator (`law_test.rs`), and mutation checker (`mutate.rs`). |
 | `example-app/` | A minimal crate using it. |
 | `BEND_GUIDE.md` | Bend 2 + RustyBends coding guide. |
 | `src/`, `index.html`, `package.json` | **BendTT Kernel Workbench**, a browser tool (React + Vite) to parse Bend, inspect the AST and quantity erasure, trace proofs, suggest laws and preview the emitted Rust. Run it with `npm install && npm run dev`. It is an exploration aid; the build crate is the authority. |

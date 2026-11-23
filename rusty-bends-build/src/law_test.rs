@@ -1361,12 +1361,13 @@ pub(crate) fn emit_eval_law_checker(
     );
 
     let mut s = String::new();
+    let vis = if compact_mutant_mode { "pub " } else { "" };
     let ret_sig = if compact_mutant_mode {
         " -> Option<String>"
     } else {
         ""
     };
-    s.push_str(&format!("fn {fn_name}(){ret_sig} {{\n"));
+    s.push_str(&format!("{vis}fn {fn_name}(){ret_sig} {{\n"));
 
     if runtime_vars.is_empty() {
         s.push_str(&format!("    match {eval_expr} {{\n"));

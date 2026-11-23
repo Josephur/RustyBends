@@ -12,6 +12,9 @@
 pub mod emit;
 pub mod law_test;
 pub mod lock;
+pub mod mutate;
+
+pub use mutate::MutateMode;
 
 use std::env;
 use std::fs;
@@ -50,6 +53,7 @@ pub struct Config {
     pub out_dir: PathBuf,
     pub allow_lock_update: bool,
     pub emit_rust: bool,
+    pub mutate_mode: MutateMode,
 }
 
 impl Default for Config {
@@ -57,6 +61,9 @@ impl Default for Config {
         let verdict_mode = env::var("BEND_VERDICT")
             .map(|v| VerdictMode::parse(&v))
             .unwrap_or(VerdictMode::Auto);
+        let mutate_mode = env::var("RUSTY_BENDS_MUTATE")
+            .map(|v| MutateMode::parse(&v))
+            .unwrap_or(MutateMode::NewOnly);
         Self {
             verified_dir: PathBuf::from("verified"),
             bend_bin: resolve_bend_bin(
@@ -75,6 +82,7 @@ impl Default for Config {
             out_dir: PathBuf::from(env::var("OUT_DIR").unwrap_or_else(|_| "target".to_string())),
             allow_lock_update: env::var("RUSTY_BENDS_UPDATE_LAWS").ok().as_deref() == Some("1"),
             emit_rust: true,
+            mutate_mode,
         }
     }
 }
@@ -123,6 +131,7 @@ pub fn run(cfg: &Config) -> Result<Option<PathBuf>, String> {
     println!("cargo:rerun-if-changed={}", cfg.lock_file.display());
     println!("cargo:rerun-if-changed={}", cfg.pin_file.display());
     println!("cargo:rerun-if-env-changed=RUSTY_BENDS_UPDATE_LAWS");
+    println!("cargo:rerun-if-env-changed=RUSTY_BENDS_MUTATE");
     println!("cargo:rerun-if-env-changed=BEND_BIN");
     println!("cargo:rerun-if-env-changed=BEND_PIN_VERSION");
     println!("cargo:rerun-if-env-changed=BEND_VERDICT");
@@ -244,8 +253,9 @@ where
     // Record which laws were already locked before this build for failure diagnostics.
     let pre_locked_laws = lock::read_locked_law_names(&cfg.lock_file);
 
-    // 1. Enforce AST/token-canonical LAWS lock before running Bend
-    let law_count = lock::enforce_law_lock(&cfg.lock_file, &bend_files, cfg.allow_lock_update)?;
+    // 1. Check AST/token-canonical LAWS lock (defer writing until Bend & mutation checks pass)
+    let lock_report = lock::check_law_lock(&cfg.lock_file, &bend_files, cfg.allow_lock_update)?;
+    let law_count = lock_report.current.len();
 
     // 2. Check incremental content-hash cache for fast no-op rebuilds
     fs::create_dir_all(&cfg.out_dir).map_err(|e| e.to_string())?;
@@ -256,7 +266,12 @@ where
     let cache_hit = fs::read_to_string(&cache_file)
         .map(|s| s.trim() == combined_hash)
         .unwrap_or(false);
-    if cache_hit && (!cfg.emit_rust || verified_rs.exists()) {
+    if cache_hit
+        && (!cfg.emit_rust || verified_rs.exists())
+        && !lock_report.needs_write
+        && lock_report.new_names.is_empty()
+        && cfg.mutate_mode == MutateMode::NewOnly
+    {
         return Ok(if cfg.emit_rust {
             Some(verified_rs)
         } else {
@@ -305,7 +320,23 @@ where
         }
     }
 
-    // 4. Erase q=0 parts and emit pure Rust (ADTs + match + defs) into OUT_DIR/verified.rs
+    // 4. Mutation-check every unlocked/new law before sealing (and report all locked laws under RUSTY_BENDS_MUTATE=all)
+    let mut_summary = mutate::run_mutation_checks(
+        &combined_source,
+        &lock_report,
+        cfg.mutate_mode,
+        &cfg.out_dir,
+    )?;
+    for w in &mut_summary.warnings {
+        println!("cargo:warning={w}");
+    }
+
+    // 5. Persist rusty-bends.lock only after Bend proofs and mutation checks succeed
+    if lock_report.needs_write {
+        lock::write_law_lock(&cfg.lock_file, &lock_report)?;
+    }
+
+    // 6. Erase q=0 parts and emit pure Rust (ADTs + match + defs) into OUT_DIR/verified.rs
     let emitted_path = if cfg.emit_rust {
         let summary = emit::emit_verified_rust(&combined_source, law_count)?;
         fs::write(&verified_rs, summary.rust_source).map_err(|e| e.to_string())?;
@@ -314,7 +345,7 @@ where
         None
     };
 
-    // 5. Persist passing content hash
+    // 7. Persist passing content hash
     fs::write(&cache_file, &combined_hash).map_err(|e| e.to_string())?;
     Ok(emitted_path)
 }
@@ -468,6 +499,7 @@ mod tests {
             out_dir: root.join("out"),
             allow_lock_update: false,
             emit_rust: true,
+            mutate_mode: MutateMode::NewOnly,
         }
     }
 
@@ -476,7 +508,7 @@ mod tests {
         let root = temp_workspace("emit_adt_cache");
         fs::write(
             root.join("verified/core.bend"),
-            "type Status:\n  Open\n  Closed\n\ndef close(+s: Status) -> Status:\n  match s:\n    case Status.Open => Status.Closed\n    case Status.Closed => Status.Closed\n\nlaw close_idem(for +s: Status):\n  close(close(s)) == close(s)\n\nproof close_idem:\n  match s:\n    case Status.Open => refl\n    case Status.Closed => refl\n",
+            "type Status:\n  Open\n  Closed\n\ndef close(+s: Status) -> Status:\n  match s:\n    case Status.Open => Status.Closed\n    case Status.Closed => Status.Closed\n\nlaw close_always_closed(for +s: Status):\n  close(s) == Status.Closed\n\nproof close_always_closed:\n  match s:\n    case Status.Open => refl\n    case Status.Closed => refl\n",
         )
         .unwrap();
 
@@ -497,8 +529,8 @@ mod tests {
             .expect("expected generated #[cfg(test)] law module");
         assert!(runtime_part.contains("pub enum Status"));
         assert!(runtime_part.contains("Status::Open => Status::Closed,"));
-        assert!(!runtime_part.contains("law close_idem"));
-        assert!(tests_part.contains("fn law_close_idem()"));
+        assert!(!runtime_part.contains("law close_always_closed"));
+        assert!(tests_part.contains("fn law_close_always_closed()"));
 
         // Second run with unchanged files hits cache (0 checker invocations)
         run_with_checker(&cfg, |_file, _has_laws| {
@@ -512,7 +544,7 @@ mod tests {
     }
 
     #[test]
-    fn lock_blocks_weakened_law_and_approves_human_update() {
+    fn lock_blocks_weakened_law_and_approves_non_vacuous_human_update() {
         let root = temp_workspace("lock_tamper");
         let core = root.join("verified/core.bend");
         fs::write(
@@ -523,7 +555,9 @@ mod tests {
 
         let cfg = make_cfg(&root);
         run_with_checker(&cfg, |_, _| Ok(())).expect("initial lock creation");
+        let original_lock = fs::read_to_string(&cfg.lock_file).unwrap();
 
+        // Tampering with a locked law to a vacuous tautology must fail with E_LAW_LOCK_TAMPERED
         fs::write(
             &core,
             "def inc(+n: Nat) -> Nat:\n  n + 1n\n\nlaw inc_two:\n  3n == 3n\n\nproof inc_two:\n  refl\n",
@@ -533,9 +567,24 @@ mod tests {
         let err = run_with_checker(&cfg, |_, _| Ok(())).expect_err("must fail on tampered law");
         assert!(err.contains("E_LAW_LOCK_TAMPERED"));
 
+        // Even with RUSTY_BENDS_UPDATE_LAWS=1, sealing a vacuous law is blocked with E_LAW_VACUOUS
+        // and the existing lock file must remain untouched.
         let mut approved_cfg = make_cfg(&root);
         approved_cfg.allow_lock_update = true;
-        run_with_checker(&approved_cfg, |_, _| Ok(())).expect("approved update succeeds");
+        let vacuous_err =
+            run_with_checker(&approved_cfg, |_, _| Ok(())).expect_err("vacuous update blocked");
+        assert!(vacuous_err.contains("E_LAW_VACUOUS"));
+        assert_eq!(fs::read_to_string(&cfg.lock_file).unwrap(), original_lock);
+
+        // Updating to a non-vacuous law with RUSTY_BENDS_UPDATE_LAWS=1 succeeds and updates the lock.
+        fs::write(
+            &core,
+            "def inc(+n: Nat) -> Nat:\n  n + 1n\n\nlaw inc_two:\n  inc(3n) == 4n\n\nproof inc_two:\n  refl\n",
+        )
+        .unwrap();
+        run_with_checker(&approved_cfg, |_, _| Ok(()))
+            .expect("approved non-vacuous update succeeds");
+        assert_ne!(fs::read_to_string(&cfg.lock_file).unwrap(), original_lock);
 
         let _ = fs::remove_dir_all(&root);
     }
