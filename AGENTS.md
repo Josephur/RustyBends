@@ -49,6 +49,32 @@ it may be named after, or shaped around, one particular user of it.
 - Before finishing, scan the diff for the requesting project's name and for
   identifiers copied from the issue, and rename any that slipped through.
 
+## Names and reserved keywords
+
+A name that is legal in one language can be a reserved keyword in another.
+Bend 2 accepts `as`, `in`, `fn`, `ref`, `mut`, `dyn`, `loop`, `move`,
+`self`, `crate`, `super`, ... as names, and every one of them breaks Rust if
+emitted as is (issue #16).
+
+- Never emit a Bend name into Rust source as a bare identifier. Every def,
+  parameter, pattern binder, `let` binding and law variable goes through
+  `emit::rust_ident` (or `emit::rust_path` for dotted paths): it writes
+  `r#as`, or `__rb_self` / `__rb_crate` / `__rb_super` / `__rb_Self`,
+  which have no raw form. When you add an emit path (a new construct, a
+  generated test, a mutant harness, counterexample printing), route its
+  names through these too. Keep the original Bend name only inside string
+  literals shown to people.
+- Names this crate invents in generated code (temporaries, helpers) start
+  with `__rb_` or `__`, so they can neither be keywords nor collide with user
+  names.
+- Never name our own functions, variables, fields or fixtures after a
+  keyword of Rust *or* Bend 2. Bend 2 reserves `def`, `type`, `law`, `match`,
+  `case`, `do`, `return`, `for`, `exs`, `where`, `is`, `import`, `Type`,
+  `Data`, `Kind`, `Quant` (`KEYWORDS` in `upstream/bend/bend2/bend.ts`).
+- Any change that emits names needs a test with keyword-named Bend
+  identifiers that compiles and runs the emitted Rust, like
+  `rust_keyword_names_compile_in_emitted_code_and_law_tests`.
+
 ## Source of truth
 
 - Behavior is defined by the reference implementation, not by these docs:
