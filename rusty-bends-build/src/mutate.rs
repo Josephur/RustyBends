@@ -34,6 +34,11 @@ const MAX_MUTANTS_PER_LAW: usize = 48;
 /// Separate budget for the bound-pushing operator families (Issue #12), shared round-robin
 /// so every family is represented even when the legacy families fill their budget.
 const MAX_BOUND_MUTANTS_PER_LAW: usize = 48;
+/// Separate budget for the return-replacement and literal families (Issue #15), so adding
+/// them never changes which bound-pushing mutants are selected.
+const MAX_RETURN_LIT_MUTANTS_PER_LAW: usize = 32;
+/// At most this many `Nat` literal sites per function are mutated by `NatLit`.
+const MAX_NAT_LIT_SITES_PER_DEF: usize = 8;
 
 /// Law shapes the mutation checker (and the generated per-law tests) can evaluate.
 const SUPPORTED_LAW_FORMS: &str = "Supported forms: zero or more 'for x: T' binders (T = Nat, Bool, U32/U64/I32/I64, a user ADT, List<T>, or a tuple of these), optional '{a == b : T} ->' hypotheses, and an equality goal '{lhs == rhs : T}'. Not supported: 'exs' (existential), 'where' refinements, goals without '=='.";
@@ -491,7 +496,8 @@ type Candidate<'a> = (&'a Def, String, String);
 /// Legacy families (BoolFlip, NatCmpArith, DropBoolOperand, ReturnUnchanged, SwapMatchArms)
 /// fill the first `MAX_MUTANTS_PER_LAW` slots in their original order. The bound-pushing
 /// families (NatBound, SiblingCtor, BoolConst, FlipCmp) then take up to
-/// `MAX_BOUND_MUTANTS_PER_LAW` more slots, round-robin across families. Each mutant's
+/// `MAX_BOUND_MUTANTS_PER_LAW` more slots, round-robin across families. Finally ReturnCtor
+/// and NatLit take up to `MAX_RETURN_LIT_MUTANTS_PER_LAW` slots, round-robin. Each mutant's
 /// description ends with `[<Operator>]` so reports name the operator that caught a law.
 pub(crate) fn generate_mutants_for_cone(
     cone_defs: &[Def],
@@ -567,12 +573,51 @@ pub(crate) fn generate_mutants_for_cone(
             families[3].1.push((def, body, desc));
         }
     }
+    pick_round_robin(
+        &families,
+        MAX_BOUND_MUTANTS_PER_LAW,
+        &mut make,
+        &mut mutants,
+    );
+
+    // Return-replacement and literal families (Issue #15), with their own budget.
+    let mut families: Vec<(&str, Vec<Candidate<'_>>)> =
+        vec![("ReturnCtor", Vec::new()), ("NatLit", Vec::new())];
+    for def in cone_defs {
+        let protected = compute_protected_ranges(&def.body);
+        for (body, desc) in mutate_return_ctor(def, def_map, ctor_map) {
+            families[0].1.push((def, body, desc));
+        }
+        for (body, desc) in mutate_nat_lit(&def.body, &protected) {
+            families[1].1.push((def, body, desc));
+        }
+    }
+    pick_round_robin(
+        &families,
+        MAX_RETURN_LIT_MUTANTS_PER_LAW,
+        &mut make,
+        &mut mutants,
+    );
+
+    mutants
+}
+
+/// Appends up to `cap` mutants from `families`, taking one per family in turn so every family
+/// is represented. Candidates rejected by `make` (unchanged or duplicate bodies) are skipped.
+fn pick_round_robin<F>(
+    families: &[(&str, Vec<Candidate<'_>>)],
+    cap: usize,
+    make: &mut F,
+    mutants: &mut Vec<Mutant>,
+) where
+    F: FnMut(&str, String, &Def, String) -> Option<Mutant>,
+{
     let mut cursors = vec![0usize; families.len()];
-    let mut extra = 0usize;
-    while extra < MAX_BOUND_MUTANTS_PER_LAW {
+    let mut taken = 0usize;
+    while taken < cap {
         let mut progressed = false;
         for (fi, (op, items)) in families.iter().enumerate() {
-            if extra >= MAX_BOUND_MUTANTS_PER_LAW {
+            if taken >= cap {
                 break;
             }
             while cursors[fi] < items.len() {
@@ -580,7 +625,7 @@ pub(crate) fn generate_mutants_for_cone(
                 cursors[fi] += 1;
                 if let Some(m) = make(op, desc.clone(), def, body.clone()) {
                     mutants.push(m);
-                    extra += 1;
+                    taken += 1;
                     progressed = true;
                     break;
                 }
@@ -590,8 +635,6 @@ pub(crate) fn generate_mutants_for_cone(
             break;
         }
     }
-
-    mutants
 }
 
 /// Re-indents `body` by four spaces under `let __rb_r =` and returns `<wrap>` applied to the
@@ -752,6 +795,163 @@ fn mutate_sibling_ctor(
     out
 }
 
+/// Byte spans of candidate returned expressions in `body`: every whole (trimmed) line, and the
+/// inline body of each `case <pat>: <expr>` arm. Callers filter by shape (variable, call).
+fn return_leaf_spans(body: &str) -> Vec<(usize, usize)> {
+    let mut spans = Vec::new();
+    let mut offset = 0usize;
+    for raw_line in body.split_inclusive('\n') {
+        let line = raw_line.strip_suffix('\n').unwrap_or(raw_line);
+        let trimmed = line.trim();
+        if !trimmed.is_empty() {
+            let ws = line.len() - line.trim_start().len();
+            if let Some(after_case) = line.trim_start().strip_prefix("case ") {
+                if let Some((_, inline_body)) = split_case_arm(after_case) {
+                    let ib = inline_body.trim();
+                    if !ib.is_empty() && line.trim_end().ends_with(ib) {
+                        let start = offset + line.trim_end().len() - ib.len();
+                        spans.push((start, start + ib.len()));
+                    }
+                }
+            } else {
+                spans.push((offset + ws, offset + ws + trimmed.len()));
+            }
+        }
+        offset += raw_line.len();
+    }
+    spans
+}
+
+/// True when `s` is exactly one call of a user `def`: `f(...)` with balanced parentheses.
+fn is_user_call_expr(s: &str, def_map: &HashMap<String, &Def>) -> bool {
+    let Some(open) = s.find('(') else {
+        return false;
+    };
+    def_map.contains_key(s[..open].trim())
+        && s.ends_with(')')
+        && find_matching_paren(&s[open..]) == Some(s.len() - 1 - open)
+}
+
+/// ReturnCtor: replaces a returned variable or user-function call with each constructor of
+/// the function's `Data` return type (small filler fields), or with `True{}` / `False{}` for a
+/// returned call in a `Bool` function. Catches laws guarded only by a fallthrough such as
+/// `case st _: st` or a delegated classifier call (Issue #15).
+fn mutate_return_ctor(
+    def: &Def,
+    def_map: &HashMap<String, &Def>,
+    ctor_map: &HashMap<String, CtorInfo>,
+) -> Vec<(String, String)> {
+    let ret = def.ret.trim();
+    let body = def.body.as_str();
+    let mut replacements: Vec<String> = Vec::new();
+    let mut seen_variants = HashSet::new();
+    let mut infos: Vec<&CtorInfo> = ctor_map.values().filter(|c| c.type_name == ret).collect();
+    infos.sort_by(|a, b| a.variant_name.cmp(&b.variant_name));
+    for info in infos {
+        if !seen_variants.insert(info.variant_name.clone()) {
+            continue;
+        }
+        let fields = info
+            .field_types
+            .iter()
+            .map(|ft| filler_value(ft, ctor_map))
+            .collect::<Option<Vec<_>>>();
+        if let Some(fields) = fields {
+            replacements.push(format!(
+                "{}.{}{{{}}}",
+                info.type_name,
+                info.variant_name,
+                fields.join(", ")
+            ));
+        }
+    }
+    let is_bool = ret == "Bool";
+    if replacements.is_empty() && !is_bool {
+        return Vec::new();
+    }
+
+    let mut out = Vec::new();
+    for (start, end) in return_leaf_spans(body) {
+        let leaf = &body[start..end];
+        let is_call = is_user_call_expr(leaf, def_map);
+        let candidates: Vec<String> = if is_bool {
+            // Bare Bool variables are BoolConst's; ReturnCtor takes returned calls.
+            if !is_call {
+                continue;
+            }
+            vec!["True{}".to_string(), "False{}".to_string()]
+        } else {
+            if !is_call && !is_bare_var_ident(leaf, def_map, ctor_map) {
+                continue;
+            }
+            replacements.clone()
+        };
+        let kind = if is_call { "call" } else { "variable" };
+        for repl in candidates {
+            out.push((
+                replace_span(body, start, end, &repl),
+                format!("returned {kind} '{leaf}' -> {repl}"),
+            ));
+        }
+    }
+    out
+}
+
+/// NatLit: changes a `Nat` literal `k` to `0n`, `k + 1`, and `k - 1` (at most
+/// `MAX_NAT_LIT_SITES_PER_DEF` sites per function). All `-> 0n` mutants come first, so
+/// "zero is rejected" laws guarded by a constant such as `Nat.is_eq(dh, 256n)` are caught.
+fn mutate_nat_lit(body: &str, protected: &[(usize, usize)]) -> Vec<(String, String)> {
+    let bytes = body.as_bytes();
+    let is_ident = |b: u8| b.is_ascii_alphanumeric() || b == b'_';
+    let mut sites: Vec<(usize, usize, u64)> = Vec::new();
+    let mut i = 0usize;
+    while i < bytes.len() && sites.len() < MAX_NAT_LIT_SITES_PER_DEF {
+        let starts = bytes[i].is_ascii_digit()
+            && (i == 0 || !(is_ident(bytes[i - 1]) || bytes[i - 1] == b'.'));
+        if !starts {
+            i += 1;
+            continue;
+        }
+        let mut end = i;
+        while end < bytes.len() && bytes[end].is_ascii_digit() {
+            end += 1;
+        }
+        let is_nat = end < bytes.len()
+            && bytes[end] == b'n'
+            && (end + 1 >= bytes.len() || !is_ident(bytes[end + 1]));
+        if is_nat && !in_protected(i, protected) {
+            if let Ok(k) = body[i..end].parse::<u64>() {
+                sites.push((i, end + 1, k));
+            }
+        }
+        i = end.max(i + 1);
+    }
+
+    let mut out = Vec::new();
+    let mut push = |start: usize, end: usize, k: u64, to: u64| {
+        if to != k {
+            out.push((
+                replace_span(body, start, end, &format!("{to}n")),
+                format!("{k}n -> {to}n"),
+            ));
+        }
+    };
+    for &(s0, e0, k) in &sites {
+        push(s0, e0, k, 0);
+    }
+    for &(s0, e0, k) in &sites {
+        if let Some(up) = k.checked_add(1) {
+            push(s0, e0, k, up);
+        }
+    }
+    for &(s0, e0, k) in &sites {
+        if k > 1 {
+            push(s0, e0, k, k - 1);
+        }
+    }
+    out
+}
+
 fn is_bare_var_ident(
     s: &str,
     def_map: &HashMap<String, &Def>,
@@ -819,25 +1019,10 @@ fn mutate_bool_const(
     // (b) Bare variables in returned positions of a Bool function: a whole body line that is
     // just an identifier, or the inline body of a `case <pat>: <ident>` arm.
     if def.ret.trim() == "Bool" {
-        let mut offset = 0usize;
-        for raw_line in body.split_inclusive('\n') {
-            let line = raw_line.strip_suffix('\n').unwrap_or(raw_line);
-            let trimmed = line.trim();
-            if !trimmed.is_empty() {
-                let ws = line.len() - line.trim_start().len();
-                if is_bare_var_ident(trimmed, def_map, ctor_map) {
-                    targets.insert((offset + ws, offset + ws + trimmed.len()));
-                } else if let Some(after_case) = line.trim_start().strip_prefix("case ") {
-                    if let Some((_, inline_body)) = split_case_arm(after_case) {
-                        let ib = inline_body.trim();
-                        if is_bare_var_ident(ib, def_map, ctor_map) && line.ends_with(ib) {
-                            let start = offset + line.len() - ib.len();
-                            targets.insert((start, start + ib.len()));
-                        }
-                    }
-                }
+        for (start, end) in return_leaf_spans(body) {
+            if is_bare_var_ident(&body[start..end], def_map, ctor_map) {
+                targets.insert((start, end));
             }
-            offset += raw_line.len();
         }
     }
 
@@ -1920,14 +2105,39 @@ law empty_tautology:
         )
     }
 
+    /// Operators that existed before Issue #15 (legacy + bound-pushing).
+    const PRE_ISSUE15_OPS: &[&str] = &[
+        "BoolFlip",
+        "NatCmpArith",
+        "DropBoolOperand",
+        "ReturnUnchanged",
+        "SwapMatchArms",
+        "NatBound",
+        "SiblingCtor",
+        "BoolConst",
+        "FlipCmp",
+    ];
+
     fn assert_new_operator_catches(src: &str, law_name: &str, op: &str, tag: &str) {
+        assert_operator_closes_gap(src, law_name, op, tag, LEGACY_OPS);
+    }
+
+    /// Asserts every operator in `prior_ops` survives `law_name` (the gap), `op` alone catches
+    /// it with an id naming `op`, and the full gate accepts the law as a new law.
+    fn assert_operator_closes_gap(
+        src: &str,
+        law_name: &str,
+        op: &str,
+        tag: &str,
+        prior_ops: &[&str],
+    ) {
         let dir = tmp_dir(tag);
         let out = dir.join("out");
-        let legacy = eval_with_ops(src, law_name, LEGACY_OPS, &out)
-            .expect("legacy mutant harness must compile");
+        let legacy = eval_with_ops(src, law_name, prior_ops, &out)
+            .expect("prior-operator mutant harness must compile");
         assert!(
             legacy.is_none(),
-            "{law_name}: expected legacy operators to survive (the Issue #12 gap), got {legacy:?}"
+            "{law_name}: expected {prior_ops:?} to survive (the gap), got {legacy:?}"
         );
         let caught = eval_with_ops(src, law_name, &[op], &out)
             .expect("new-operator harness must compile")
@@ -1945,9 +2155,16 @@ law empty_tautology:
             .expect("law must no longer be vacuous");
         let (desc, _) = summary.reports[0].caught_by.clone().expect("caught");
         assert!(
-            ["[NatBound]", "[SiblingCtor]", "[BoolConst]", "[FlipCmp]"]
-                .iter()
-                .any(|t| desc.ends_with(t)),
+            [
+                "[NatBound]",
+                "[SiblingCtor]",
+                "[BoolConst]",
+                "[FlipCmp]",
+                "[ReturnCtor]",
+                "[NatLit]"
+            ]
+            .iter()
+            .any(|t| desc.ends_with(t)),
             "caught by a new operator: {desc}"
         );
         let _ = fs::remove_dir_all(&dir);
@@ -2066,7 +2283,143 @@ law media_count_refuses_overflow:
                 "{op} missing after legacy cap"
             );
         }
-        assert!(mutants.len() <= MAX_MUTANTS_PER_LAW + MAX_BOUND_MUTANTS_PER_LAW);
+        assert!(
+            mutants.len()
+                <= MAX_MUTANTS_PER_LAW + MAX_BOUND_MUTANTS_PER_LAW + MAX_RETURN_LIT_MUTANTS_PER_LAW
+        );
+        assert!(mutants.iter().any(|m| m.operator == "NatLit"));
+    }
+
+    #[test]
+    fn return_ctor_catches_fallthrough_variable_absorbing_law() {
+        let src = r#"import Base
+
+type CallPhase is Data:
+  CpText{}
+  CpBlock{}
+  CpStopped{}
+
+type CallEvent is Data:
+  CeOpen{}
+  CeClose{}
+
+def call_step(p: CallPhase, ev: CallEvent) -> CallPhase:
+  match p ev:
+    case CpText{} CeOpen{}:
+      CpBlock{}
+    case CpBlock{} CeClose{}:
+      CpStopped{}
+    case st _:
+      st
+
+# promise: a stopped call stays stopped whatever event arrives
+law call_stopped_absorbing:
+  for ev: CallEvent
+  {call_step(CpStopped{}, ev) == CpStopped{} : CallPhase}
+"#;
+        assert_operator_closes_gap(
+            src,
+            "call_stopped_absorbing",
+            "ReturnCtor",
+            "fallthrough",
+            PRE_ISSUE15_OPS,
+        );
+    }
+
+    #[test]
+    fn return_ctor_catches_delegated_call_classifier_law() {
+        let src = r#"import Base
+
+type PxAddrClass is Data:
+  PxAcPublic{}
+  PxAcPrivate{}
+  PxAcLoopback{}
+
+type PxV6 is Data:
+  PxMapped{a: Nat, b: Nat}
+  PxNative{hi: Nat}
+
+def px_v4_class(+a: Nat, +b: Nat) -> PxAddrClass:
+  match a:
+    case 10n:
+      PxAcPrivate{}
+    case 127n:
+      PxAcLoopback{}
+    case _:
+      PxAcPublic{}
+
+def px_native_class(+hi: Nat) -> PxAddrClass:
+  match hi:
+    case 0n:
+      PxAcLoopback{}
+    case _:
+      PxAcPublic{}
+
+def px_v6_class(+v: PxV6) -> PxAddrClass:
+  match v:
+    case PxMapped{a, b}:
+      px_v4_class(a, b)
+    case PxNative{hi}:
+      px_native_class(hi)
+
+# promise: an IPv4-mapped IPv6 address is classified exactly like its IPv4 address
+law px_v6_mapped_no_wider:
+  for +a: Nat
+  for +b: Nat
+  {px_v6_class(PxMapped{a, b}) == px_v4_class(a, b) : PxAddrClass}
+"#;
+        assert_operator_closes_gap(
+            src,
+            "px_v6_mapped_no_wider",
+            "ReturnCtor",
+            "v6call",
+            PRE_ISSUE15_OPS,
+        );
+    }
+
+    #[test]
+    fn nat_lit_catches_zero_rejected_law() {
+        // `dh = 0` is refused because dh must equal 256n or 512n; changing a literal
+        // (256n -> 0n) is what breaks the law.
+        let src = r#"import Base
+
+def g4_heads_valid(+nh: Nat, +nkv: Nat, +dh: Nat, +pairs: Nat) -> Bool:
+  Bool.and(Bool.or(Nat.is_eq(dh, 256n), Nat.is_eq(dh, 512n)), Nat.is_le(nkv, nh))
+
+# promise: a zero head dimension is always rejected
+law g4_heads_zero_dh_rejected:
+  for +nh: Nat
+  for +nkv: Nat
+  for +p: Nat
+  {g4_heads_valid(nh, nkv, 0n, p) == False{} : Bool}
+"#;
+        let dir = tmp_dir("zero_dh");
+        let caught = eval_with_ops(src, "g4_heads_zero_dh_rejected", &["NatLit"], &dir)
+            .expect("harness compiles")
+            .expect("NatLit catches the literal-guarded law");
+        assert!(caught.0.contains("256n -> 0n [NatLit]"), "{caught:?}");
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn nat_lit_respects_per_function_site_cap_and_skips_patterns() {
+        let body = "match x:\n  case 7n:\n    1n\n  case _:\n    Nat.add(Nat.add(Nat.add(2n, 3n), Nat.add(4n, 5n)), Nat.add(Nat.add(6n, 8n), Nat.add(9n, 10n)))";
+        let protected = compute_protected_ranges(body);
+        let muts = mutate_nat_lit(body, &protected);
+        assert!(
+            muts.iter().all(|(_, d)| !d.starts_with("7n ")),
+            "case pattern literal mutated"
+        );
+        let sites: HashSet<&str> = muts
+            .iter()
+            .map(|(_, d)| d.split(" -> ").next().unwrap())
+            .collect();
+        assert_eq!(sites.len(), MAX_NAT_LIT_SITES_PER_DEF);
+        assert!(
+            !sites.contains("10n"),
+            "ninth site must be capped: {sites:?}"
+        );
+        assert_eq!(muts[0].1, "1n -> 0n", "-> 0n mutants come first");
     }
 
     const EXS_LAW_SRC: &str = r#"import Base
