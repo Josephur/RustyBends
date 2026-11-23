@@ -54,6 +54,7 @@ pub struct Config {
     pub allow_lock_update: bool,
     pub emit_rust: bool,
     pub mutate_mode: MutateMode,
+    pub list_laws: bool,
 }
 
 impl Default for Config {
@@ -64,6 +65,14 @@ impl Default for Config {
         let mutate_mode = env::var("RUSTY_BENDS_MUTATE")
             .map(|v| MutateMode::parse(&v))
             .unwrap_or(MutateMode::NewOnly);
+        let list_laws = env::var("RUSTY_BENDS_LIST_LAWS")
+            .map(|v| {
+                matches!(
+                    v.trim().to_ascii_lowercase().as_str(),
+                    "1" | "true" | "yes" | "on"
+                )
+            })
+            .unwrap_or(false);
         Self {
             verified_dir: PathBuf::from("verified"),
             bend_bin: resolve_bend_bin(
@@ -83,6 +92,7 @@ impl Default for Config {
             allow_lock_update: env::var("RUSTY_BENDS_UPDATE_LAWS").ok().as_deref() == Some("1"),
             emit_rust: true,
             mutate_mode,
+            list_laws,
         }
     }
 }
@@ -132,6 +142,7 @@ pub fn run(cfg: &Config) -> Result<Option<PathBuf>, String> {
     println!("cargo:rerun-if-changed={}", cfg.pin_file.display());
     println!("cargo:rerun-if-env-changed=RUSTY_BENDS_UPDATE_LAWS");
     println!("cargo:rerun-if-env-changed=RUSTY_BENDS_MUTATE");
+    println!("cargo:rerun-if-env-changed=RUSTY_BENDS_LIST_LAWS");
     println!("cargo:rerun-if-env-changed=BEND_BIN");
     println!("cargo:rerun-if-env-changed=BEND_PIN_VERSION");
     println!("cargo:rerun-if-env-changed=BEND_VERDICT");
@@ -256,6 +267,16 @@ where
     // 1. Check AST/token-canonical LAWS lock (defer writing until Bend & mutation checks pass)
     let lock_report = lock::check_law_lock(&cfg.lock_file, &bend_files, cfg.allow_lock_update)?;
     let law_count = lock_report.current.len();
+
+    for w in &lock_report.warnings {
+        println!("cargo:warning={w}");
+    }
+    if cfg.list_laws {
+        let listing = lock::format_law_list(&lock_report.current);
+        for line in listing.lines() {
+            println!("cargo:warning={line}");
+        }
+    }
 
     // 2. Check incremental content-hash cache for fast no-op rebuilds
     fs::create_dir_all(&cfg.out_dir).map_err(|e| e.to_string())?;
@@ -447,7 +468,7 @@ fn run_bend_step(bend_bin: &str, flag: &str, file: &Path) -> Result<(), String> 
     Ok(())
 }
 
-fn collect_bend_files(dir: &Path, out: &mut Vec<PathBuf>) -> Result<(), String> {
+pub fn collect_bend_files(dir: &Path, out: &mut Vec<PathBuf>) -> Result<(), String> {
     for entry in fs::read_dir(dir).map_err(|e| e.to_string())? {
         let path = entry.map_err(|e| e.to_string())?.path();
         if path.is_dir() {
@@ -500,6 +521,7 @@ mod tests {
             allow_lock_update: false,
             emit_rust: true,
             mutate_mode: MutateMode::NewOnly,
+            list_laws: false,
         }
     }
 
@@ -508,7 +530,7 @@ mod tests {
         let root = temp_workspace("emit_adt_cache");
         fs::write(
             root.join("verified/core.bend"),
-            "type Status:\n  Open\n  Closed\n\ndef close(+s: Status) -> Status:\n  match s:\n    case Status.Open => Status.Closed\n    case Status.Closed => Status.Closed\n\nlaw close_always_closed(for +s: Status):\n  close(s) == Status.Closed\n\nproof close_always_closed:\n  match s:\n    case Status.Open => refl\n    case Status.Closed => refl\n",
+            "type Status:\n  Open\n  Closed\n\ndef close(+s: Status) -> Status:\n  match s:\n    case Status.Open => Status.Closed\n    case Status.Closed => Status.Closed\n\n# promise: closing any status yields Closed\nlaw close_always_closed(for +s: Status):\n  close(s) == Status.Closed\n\nproof close_always_closed:\n  match s:\n    case Status.Open => refl\n    case Status.Closed => refl\n",
         )
         .unwrap();
 
@@ -549,7 +571,7 @@ mod tests {
         let core = root.join("verified/core.bend");
         fs::write(
             &core,
-            "def inc(+n: Nat) -> Nat:\n  n + 1n\n\nlaw inc_two:\n  inc(2n) == 3n\n\nproof inc_two:\n  refl\n",
+            "def inc(+n: Nat) -> Nat:\n  n + 1n\n\n# promise: inc(2n) returns 3n\nlaw inc_two:\n  inc(2n) == 3n\n\nproof inc_two:\n  refl\n",
         )
         .unwrap();
 
@@ -560,7 +582,7 @@ mod tests {
         // Tampering with a locked law to a vacuous tautology must fail with E_LAW_LOCK_TAMPERED
         fs::write(
             &core,
-            "def inc(+n: Nat) -> Nat:\n  n + 1n\n\nlaw inc_two:\n  3n == 3n\n\nproof inc_two:\n  refl\n",
+            "def inc(+n: Nat) -> Nat:\n  n + 1n\n\n# promise: tautology\nlaw inc_two:\n  3n == 3n\n\nproof inc_two:\n  refl\n",
         )
         .unwrap();
 
@@ -579,7 +601,7 @@ mod tests {
         // Updating to a non-vacuous law with RUSTY_BENDS_UPDATE_LAWS=1 succeeds and updates the lock.
         fs::write(
             &core,
-            "def inc(+n: Nat) -> Nat:\n  n + 1n\n\nlaw inc_two:\n  inc(3n) == 4n\n\nproof inc_two:\n  refl\n",
+            "def inc(+n: Nat) -> Nat:\n  n + 1n\n\n# promise: inc(3n) returns 4n\nlaw inc_two:\n  inc(3n) == 4n\n\nproof inc_two:\n  refl\n",
         )
         .unwrap();
         run_with_checker(&approved_cfg, |_, _| Ok(()))
@@ -723,13 +745,14 @@ def pool_free(+p: PoolAcct, +rel: Nat) -> PoolAcct:
     case PoolAcct{+a, f}:
       pool_free_if(a, f, rel, Nat.is_le(rel, a))
 
+# promise: freeing from a pool conserves total capacity
 law pool_free_conserved:
   for +a: Nat
   for +f: Nat
   for +rel: Nat
   {pool_total(pool_free(PoolAcct{a, f}, rel)) == Nat.add(a, f) : Nat}
 "#;
-        // Seed the lock as if the law was previously sealed, then break the function (True{} drops sub, adding rel unconditionally).
+        // Seed the lock as if the law was previously sealed, then break the function (False{} drops sub, adding rel unconditionally).
         fs::write(&core, valid_src).unwrap();
         let _ = lock::enforce_law_lock(&cfg.lock_file, std::slice::from_ref(&core), false).unwrap();
 
@@ -755,6 +778,7 @@ def pool_free(+p: PoolAcct, +rel: Nat) -> PoolAcct:
     case PoolAcct{+a, f}:
       pool_free_if(a, f, rel, Nat.is_le(rel, a))
 
+# promise: freeing from a pool conserves total capacity
 law pool_free_conserved:
   for +a: Nat
   for +f: Nat
@@ -786,6 +810,7 @@ def pool_free_conserved(a, f, rel):
 def deposit(+bal: Nat, +amt: Nat) -> Nat:
   Nat.add(bal, amt)
 
+# promise: depositing zero leaves balance unchanged
 law deposit_zero:
   for +bal: Nat
   {deposit(bal, 0n) == bal : Nat}
@@ -809,5 +834,39 @@ def deposit_zero(bal):
 
         let _ = fs::remove_dir_all(&root);
         let _ = fs::remove_dir_all(&root2);
+    }
+
+    #[test]
+    fn new_law_requires_promise_and_wording_change_preserves_lock() {
+        let root = temp_workspace("issue8_promise");
+        let core = root.join("verified/core.bend");
+        let cfg = make_cfg(&root);
+
+        fs::write(
+            &core,
+            "def inc(+n: Nat) -> Nat:\n  n + 1n\n\nlaw inc_two:\n  inc(2n) == 3n\n",
+        )
+        .unwrap();
+        let err = run_with_checker(&cfg, |_, _| Ok(())).expect_err("must require # promise:");
+        assert!(err.contains("E_LAW_NO_PROMISE"), "got: {err}");
+        assert!(!cfg.lock_file.exists(), "lock must not be written on error");
+
+        fs::write(
+            &core,
+            "def inc(+n: Nat) -> Nat:\n  n + 1n\n\n# promise: inc adds one to two\nlaw inc_two:\n  inc(2n) == 3n\n",
+        )
+        .unwrap();
+        run_with_checker(&cfg, |_, _| Ok(())).expect("law with # promise: passes");
+
+        // Editing only the promise wording must not trigger E_LAW_LOCK_TAMPERED
+        fs::write(
+            &core,
+            "def inc(+n: Nat) -> Nat:\n  n + 1n\n\n# promise: incrementing two always returns three\n# harm: off-by-one increment bug\nlaw inc_two:\n  inc(2n) == 3n\n",
+        )
+        .unwrap();
+        run_with_checker(&cfg, |_, _| Ok(()))
+            .expect("promise wording edit must pass without E_LAW_LOCK_TAMPERED");
+
+        let _ = fs::remove_dir_all(&root);
     }
 }

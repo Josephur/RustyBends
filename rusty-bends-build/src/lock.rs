@@ -19,6 +19,8 @@ pub struct CanonicalLaw {
     pub name: String,
     pub canonical_sig: String,
     pub hash: String,
+    pub promise: Option<String>,
+    pub harm: Option<String>,
 }
 
 /// Extracts all `law` blocks across the provided `.bend` files in canonical token form.
@@ -35,6 +37,7 @@ pub fn extract_canonical_laws(files: &[PathBuf]) -> Result<BTreeMap<String, Cano
 
 /// Tokenizes Bend source (stripping comments and whitespace) and extracts every full multi-line `law`.
 pub fn extract_laws_from_source(source: &str) -> Vec<CanonicalLaw> {
+    let docs = extract_law_doc_comments(source);
     let tokens = tokenize_bend(source);
     let mut laws = Vec::new();
     let mut i = 0usize;
@@ -49,10 +52,13 @@ pub fn extract_laws_from_source(source: &str) -> Vec<CanonicalLaw> {
             }
             let canonical_sig = tokens[start..i].join(" ");
             let hash = fnv1a_hex(canonical_sig.as_bytes());
+            let (promise, harm) = docs.get(&name).cloned().unwrap_or((None, None));
             laws.push(CanonicalLaw {
                 name,
                 canonical_sig,
                 hash,
+                promise,
+                harm,
             });
             continue;
         }
@@ -62,6 +68,95 @@ pub fn extract_laws_from_source(source: &str) -> Vec<CanonicalLaw> {
     laws
 }
 
+fn normalize_doc_ws(raw: &str) -> String {
+    raw.split_whitespace().collect::<Vec<_>>().join(" ")
+}
+
+fn append_doc_field(slot: &mut Option<String>, raw: &str) {
+    let normalized = normalize_doc_ws(raw);
+    if normalized.is_empty() {
+        return;
+    }
+    match slot {
+        Some(existing) => {
+            existing.push(' ');
+            existing.push_str(&normalized);
+        }
+        None => *slot = Some(normalized),
+    }
+}
+
+/// Extracts `# promise:` and `# harm:` lines from the contiguous comment block immediately above
+/// each top-level `law <name>` declaration. Blank or non-comment lines break the block.
+pub fn extract_law_doc_comments(
+    source: &str,
+) -> BTreeMap<String, (Option<String>, Option<String>)> {
+    let mut docs = BTreeMap::new();
+    let lines: Vec<&str> = source.lines().collect();
+
+    for (idx, line) in lines.iter().enumerate() {
+        if line.starts_with(char::is_whitespace) {
+            continue;
+        }
+        let Some(after_kw) = line.strip_prefix("law") else {
+            continue;
+        };
+        if !after_kw
+            .chars()
+            .next()
+            .is_some_and(|c| c.is_ascii_whitespace())
+        {
+            continue;
+        }
+        let name = after_kw
+            .trim_start()
+            .split(|c: char| c.is_ascii_whitespace() || c == ':' || c == '(')
+            .next()
+            .unwrap_or("")
+            .trim();
+        if name.is_empty() {
+            continue;
+        }
+
+        let mut start = idx;
+        while start > 0 {
+            let prev = lines[start - 1].trim();
+            if prev.is_empty() || !(prev.starts_with('#') || prev.starts_with("--")) {
+                break;
+            }
+            start -= 1;
+        }
+
+        let mut promise: Option<String> = None;
+        let mut harm: Option<String> = None;
+        for &comment_line in &lines[start..idx] {
+            let trimmed = comment_line.trim();
+            let body = if let Some(rest) = trimmed.strip_prefix('#') {
+                rest.trim()
+            } else if let Some(rest) = trimmed.strip_prefix("--") {
+                rest.trim()
+            } else {
+                continue;
+            };
+            if body
+                .get(..8)
+                .is_some_and(|p| p.eq_ignore_ascii_case("promise:"))
+            {
+                append_doc_field(&mut promise, &body[8..]);
+            } else if body
+                .get(..5)
+                .is_some_and(|p| p.eq_ignore_ascii_case("harm:"))
+            {
+                append_doc_field(&mut harm, &body[5..]);
+            }
+        }
+
+        docs.insert(name.to_string(), (promise, harm));
+    }
+
+    docs
+}
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct LockCheckReport {
     pub current: BTreeMap<String, CanonicalLaw>,
@@ -69,6 +164,36 @@ pub struct LockCheckReport {
     pub new_names: BTreeSet<String>,
     pub serialized: String,
     pub needs_write: bool,
+    pub warnings: Vec<String>,
+}
+
+fn serialize_lock_entries(current: &BTreeMap<String, CanonicalLaw>) -> String {
+    let mut lines = Vec::new();
+    for law in current.values() {
+        lines.push(format!("{}  {}  {}", law.hash, law.name, law.canonical_sig));
+        if let Some(ref p) = law.promise {
+            lines.push(format!("# promise {}: {p}", law.name));
+        }
+        if let Some(ref h) = law.harm {
+            lines.push(format!("# harm {}: {h}", law.name));
+        }
+    }
+    if lines.is_empty() {
+        String::new()
+    } else {
+        format!("{}\n", lines.join("\n"))
+    }
+}
+
+/// Formats a sorted `name: promise` listing suitable for PR descriptions and build output.
+pub fn format_law_list(laws: &BTreeMap<String, CanonicalLaw>) -> String {
+    laws.values()
+        .map(|law| match &law.promise {
+            Some(p) => format!("{}: {p}", law.name),
+            None => format!("{}: (no promise)", law.name),
+        })
+        .collect::<Vec<_>>()
+        .join("\n")
 }
 
 /// Checks `rusty-bends.lock` against the canonicalized laws in `files` without modifying the lock file.
@@ -78,14 +203,11 @@ pub fn check_law_lock(
     allow_lock_update: bool,
 ) -> Result<LockCheckReport, String> {
     let current = extract_canonical_laws(files)?;
-    let serialized = current
-        .values()
-        .map(|law| format!("{}  {}  {}", law.hash, law.name, law.canonical_sig))
-        .collect::<Vec<_>>()
-        .join("\n");
+    let serialized = serialize_lock_entries(&current);
 
     let mut locked_names = BTreeSet::new();
     let mut new_names = BTreeSet::new();
+    let mut locked_promises: BTreeMap<String, String> = BTreeMap::new();
     let needs_write = allow_lock_update || !lock_file.exists();
 
     if lock_file.exists() {
@@ -94,7 +216,19 @@ pub fn check_law_lock(
 
         for line in expected_raw.lines() {
             let trimmed = line.trim();
-            if trimmed.is_empty() || trimmed.starts_with('#') {
+            if trimmed.is_empty() {
+                continue;
+            }
+            if trimmed.starts_with('#') {
+                if let Some(rest) = trimmed.strip_prefix("# promise ") {
+                    if let Some((law_name, text)) = rest.split_once(':') {
+                        let name = law_name.trim();
+                        let normalized = normalize_doc_ws(text);
+                        if !name.is_empty() && !normalized.is_empty() {
+                            locked_promises.insert(name.to_string(), normalized);
+                        }
+                    }
+                }
                 continue;
             }
             let parts: Vec<&str> = trimmed.splitn(3, "  ").collect();
@@ -140,12 +274,44 @@ pub fn check_law_lock(
         }
     }
 
+    for name in &new_names {
+        if let Some(law) = current.get(name) {
+            if law.promise.is_none() {
+                return Err(format!(
+                    "[E_LAW_NO_PROMISE] New law '{name}' is missing a plain-English '# promise:' comment.\nHint: Add '# promise: <one-sentence statement of what this law guarantees>' (and optionally '# harm: ...') directly above 'law {name}:'."
+                ));
+            }
+        }
+    }
+
+    let mut warnings = Vec::new();
+    for name in &locked_names {
+        if let Some(law) = current.get(name) {
+            match (&law.promise, locked_promises.get(name)) {
+                (None, Some(old)) => warnings.push(format!(
+                    "RustyBends [law {name}]: promise removed (was: \"{old}\"); add '# promise: ...' directly above 'law {name}:'."
+                )),
+                (None, None) => warnings.push(format!(
+                    "RustyBends [law {name}]: locked law is missing a '# promise:' comment. Add '# promise: <one-sentence rule>' directly above 'law {name}:'."
+                )),
+                (Some(cur), Some(old)) if cur != old => warnings.push(format!(
+                    "RustyBends [law {name}]: promise wording changed (lock hash unchanged): \"{old}\" -> \"{cur}\""
+                )),
+                (Some(cur), None) => warnings.push(format!(
+                    "RustyBends [law {name}]: promise added (lock hash unchanged): \"{cur}\""
+                )),
+                (Some(_), Some(_)) => {}
+            }
+        }
+    }
+
     Ok(LockCheckReport {
         current,
         locked_names,
         new_names,
         serialized,
         needs_write,
+        warnings,
     })
 }
 
@@ -290,7 +456,7 @@ mod tests {
 
         fs::write(
             &file,
-            "law conserved(for +a: Nat, for +b: Nat):\n  deposit(a, b) == deposit(b, a)\nproof conserved:\n  refl\n",
+            "# promise: depositing in either order yields the same balance\nlaw conserved(for +a: Nat, for +b: Nat):\n  deposit(a, b) == deposit(b, a)\nproof conserved:\n  refl\n",
         )
         .unwrap();
         assert_eq!(
@@ -301,7 +467,7 @@ mod tests {
         // Multi-line reformat + comments inside the law must remain locked-valid!
         fs::write(
             &file,
-            "# header comment\nlaw conserved(\n  for +a: Nat,\n  -- inline note\n  for +b: Nat\n):\n  deposit(a, b)\n    ==\n  deposit(b, a)\n\nproof conserved:\n  refl\n",
+            "# promise: depositing in either order yields the same balance\n# header comment\nlaw conserved(\n  for +a: Nat,\n  -- inline note\n  for +b: Nat\n):\n  deposit(a, b)\n    ==\n  deposit(b, a)\n\nproof conserved:\n  refl\n",
         )
         .unwrap();
         assert_eq!(enforce_law_lock(&lock, &[file], false).unwrap(), 1);
@@ -316,7 +482,7 @@ mod tests {
 
         fs::write(
             &file,
-            "law cancel_idempotent(\n  for +s: OrderState\n):\n  cancel_order(\n    cancel_order(s)\n  ) == cancel_order(s)\n\nproof cancel_idempotent:\n  refl\n",
+            "# promise: cancelling an order twice matches cancelling it once\nlaw cancel_idempotent(\n  for +s: OrderState\n):\n  cancel_order(\n    cancel_order(s)\n  ) == cancel_order(s)\n\nproof cancel_idempotent:\n  refl\n",
         )
         .unwrap();
         enforce_law_lock(&lock, std::slice::from_ref(&file), false).unwrap();
@@ -324,7 +490,7 @@ mod tests {
         // Subtle change on line 6 of the multi-line law must be caught
         fs::write(
             &file,
-            "law cancel_idempotent(\n  for +s: OrderState\n):\n  cancel_order(\n    s\n  ) == cancel_order(s)\n\nproof cancel_idempotent:\n  refl\n",
+            "# promise: cancelling an order twice matches cancelling it once\nlaw cancel_idempotent(\n  for +s: OrderState\n):\n  cancel_order(\n    s\n  ) == cancel_order(s)\n\nproof cancel_idempotent:\n  refl\n",
         )
         .unwrap();
         let err = enforce_law_lock(&lock, &[file], false).unwrap_err();
@@ -338,7 +504,11 @@ mod tests {
         let file = dir.join("core.bend");
         let lock = dir.join("rusty-bends.lock");
 
-        fs::write(&file, "law keep_me:\n  1n == 1n\nproof keep_me:\n  refl\n").unwrap();
+        fs::write(
+            &file,
+            "# promise: identity holds\nlaw keep_me:\n  1n == 1n\nproof keep_me:\n  refl\n",
+        )
+        .unwrap();
         enforce_law_lock(&lock, std::slice::from_ref(&file), false).unwrap();
 
         fs::write(&file, "def x(+n: Nat) -> Nat:\n  n\n").unwrap();
@@ -354,15 +524,143 @@ mod tests {
         let file = dir.join("core.bend");
         let lock = dir.join("rusty-bends.lock");
 
-        fs::write(&file, "law first:\n  1n == 1n\nproof first:\n  refl\n").unwrap();
+        fs::write(
+            &file,
+            "# promise: one equals one\nlaw first:\n  1n == 1n\nproof first:\n  refl\n",
+        )
+        .unwrap();
         enforce_law_lock(&lock, std::slice::from_ref(&file), false).unwrap();
 
         fs::write(
             &file,
-            "law first:\n  1n == 1n\nproof first:\n  refl\n\nlaw second:\n  2n == 2n\nproof second:\n  refl\n",
+            "# promise: one equals one\nlaw first:\n  1n == 1n\nproof first:\n  refl\n\n# promise: two equals two\nlaw second:\n  2n == 2n\nproof second:\n  refl\n",
         )
         .unwrap();
         assert_eq!(enforce_law_lock(&lock, &[file], false).unwrap(), 2);
         let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn new_law_without_promise_fails_with_e_law_no_promise() {
+        let dir = tmp_dir("no_promise");
+        let file = dir.join("core.bend");
+        let lock = dir.join("rusty-bends.lock");
+
+        // Completely missing promise
+        fs::write(&file, "law missing_p:\n  1n == 1n\n").unwrap();
+        let err = check_law_lock(&lock, std::slice::from_ref(&file), false).unwrap_err();
+        assert!(err.contains("E_LAW_NO_PROMISE"), "got: {err}");
+        assert!(err.contains("missing_p"), "got: {err}");
+
+        // Blank promise text
+        fs::write(&file, "# promise:   \nlaw missing_p:\n  1n == 1n\n").unwrap();
+        let err_blank = check_law_lock(&lock, std::slice::from_ref(&file), false).unwrap_err();
+        assert!(err_blank.contains("E_LAW_NO_PROMISE"), "got: {err_blank}");
+
+        // Separated from `law` by a blank line -> does not attach to `law`
+        fs::write(
+            &file,
+            "# promise: separated comment\n\nlaw missing_p:\n  1n == 1n\n",
+        )
+        .unwrap();
+        let err_sep = check_law_lock(&lock, &[file], false).unwrap_err();
+        assert!(err_sep.contains("E_LAW_NO_PROMISE"), "got: {err_sep}");
+
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn locked_law_without_promise_warns_without_failing() {
+        let dir = tmp_dir("locked_no_promise");
+        let file = dir.join("core.bend");
+        let lock = dir.join("rusty-bends.lock");
+
+        let src = "law legacy_law:\n  for +x: Nat\n  {x == x : Nat}\n";
+        fs::write(&file, src).unwrap();
+        let law = extract_laws_from_source(src).into_iter().next().unwrap();
+        // Legacy lock file without `# promise` lines
+        fs::write(
+            &lock,
+            format!("{}  {}  {}\n", law.hash, law.name, law.canonical_sig),
+        )
+        .unwrap();
+
+        let report = check_law_lock(&lock, &[file], false)
+            .expect("locked law missing promise should warn, not fail");
+        assert!(report.locked_names.contains("legacy_law"));
+        assert!(
+            report
+                .warnings
+                .iter()
+                .any(|w| w.contains("legacy_law") && w.contains("missing a '# promise:' comment")),
+            "warnings: {:?}",
+            report.warnings
+        );
+
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn editing_promise_wording_does_not_trip_lock_and_is_reported() {
+        let dir = tmp_dir("promise_edit");
+        let file = dir.join("core.bend");
+        let lock = dir.join("rusty-bends.lock");
+
+        fs::write(
+            &file,
+            "# promise: initial balance rule\n# harm: wrong balance\nlaw bal_rule:\n  for +x: Nat\n  {x == x : Nat}\n",
+        )
+        .unwrap();
+        enforce_law_lock(&lock, std::slice::from_ref(&file), false).unwrap();
+        let initial_hash = extract_canonical_laws(std::slice::from_ref(&file))
+            .unwrap()
+            .get("bal_rule")
+            .unwrap()
+            .hash
+            .clone();
+
+        // Edit only the promise wording
+        fs::write(
+            &file,
+            "# promise: clearer wording for the balance invariant\n# harm: wrong balance\nlaw bal_rule:\n  for +x: Nat\n  {x == x : Nat}\n",
+        )
+        .unwrap();
+        let updated_hash = extract_canonical_laws(std::slice::from_ref(&file))
+            .unwrap()
+            .get("bal_rule")
+            .unwrap()
+            .hash
+            .clone();
+        assert_eq!(initial_hash, updated_hash);
+
+        let report = check_law_lock(&lock, &[file], false)
+            .expect("editing promise wording must not trigger E_LAW_LOCK_TAMPERED");
+        assert!(
+            report.warnings.iter().any(|w| w.contains("bal_rule")
+                && w.contains("promise wording changed")
+                && w.contains("initial balance rule")
+                && w.contains("clearer wording for the balance invariant")),
+            "warnings: {:?}",
+            report.warnings
+        );
+
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn format_law_list_prints_name_and_promise() {
+        let src = r#"# promise: first guarantee
+law alpha:
+  1n == 1n
+
+law beta:
+  2n == 2n
+"#;
+        let map: BTreeMap<String, CanonicalLaw> = extract_laws_from_source(src)
+            .into_iter()
+            .map(|l| (l.name.clone(), l))
+            .collect();
+        let listing = format_law_list(&map);
+        assert_eq!(listing, "alpha: first guarantee\nbeta: (no promise)");
     }
 }

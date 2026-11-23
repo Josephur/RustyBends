@@ -42,6 +42,8 @@ def cancel_order(s: OrderState) -> OrderState:
       Cancelled{}
 
 # LAW 1: depositing into an empty balance equals amt (definitional)
+# promise: depositing into a zero balance yields the deposited amount unchanged
+# harm: an initial deposit could lose or inflate customer funds
 law deposit_from_zero:
   for amt: Nat
   {deposit(0n, amt) == amt : Nat}
@@ -50,6 +52,8 @@ def deposit_from_zero(amt):
   {==}
 
 # LAW 2: depositing 0n leaves any balance unchanged (inductive proof)
+# promise: depositing zero leaves any existing balance unchanged
+# harm: zero-value deposits could corrupt account balances
 law deposit_zero:
   for bal: Nat
   {deposit(bal, 0n) == bal : Nat}
@@ -63,6 +67,8 @@ def deposit_zero(bal):
       {==}
 
 # LAW 3: cancelling an order is idempotent across every ADT state
+# promise: cancelling an order twice produces the same state as cancelling it once
+# harm: retrying a cancel request could transition an order into an invalid state
 law cancel_idempotent:
   for s: OrderState
   {cancel_order(cancel_order(s)) == cancel_order(s) : OrderState}

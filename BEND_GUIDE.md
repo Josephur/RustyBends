@@ -55,10 +55,13 @@ def cancel_order(s: OrderState) -> OrderState:
       Cancelled{}
 
 # 4. LAWS & PROOFS:
+#    - Promise  = '# promise: <one-sentence English statement>' directly above every law (required for new laws; '# harm:' optional)
 #    - Theorem  = 'law <name>: for <var>: <Type> {<lhs> == <rhs> : <Type>}'
 #    - Proof    = 'def <name>(<var>):' with the SAME name (erased automatically by rusty-bends-build!)
 #    - Refl     = '{==}'
 #    - Rewrite  = '%<lemma>(<args>) : {<goal_with_underscore>}'
+# promise: depositing zero leaves any existing balance unchanged
+# harm: zero-value deposits could corrupt account balances
 law deposit_zero:
   for bal: Nat
   {deposit(bal, 0n) == bal : Nat}
@@ -71,6 +74,7 @@ def deposit_zero(bal):
       %deposit_zero(p) : {1n+Nat.add(p, 0n) == 1n+_ : Nat}
       {==}
 
+# promise: cancelling an order twice produces the same state as cancelling it once
 law cancel_idempotent:
   for s: OrderState
   {cancel_order(cancel_order(s)) == cancel_order(s) : OrderState}
@@ -111,5 +115,6 @@ def cancel_idempotent(s):
 3. **Run `cargo check` after every edit.** Cargo runs `build.rs` -> `rusty_bends_build::verify_and_emit("verified")`.
 4. **NEVER delete, comment out, or weaken laws in `verified/`.**
    `rusty-bends.lock` uses an AST/token canonicalizer (safe across whitespace/comment edits, strict on law changes) and fails with `E_LAW_LOCK_TAMPERED`.
-5. **Lean `--verdict` kernel cross-check**: `rusty-bends-build` always runs `bend <file> --check-only` (which checks all laws and proofs). By default (`BEND_VERDICT=auto`), it also runs `--verdict` whenever Lean (`~/.elan/bin/lean`) or `$BENDTT` is installed, and skips `--verdict` with a warning otherwise. Set `BEND_VERDICT=require` in CI to enforce Lean cross-checking, or `BEND_VERDICT=off` to disable it.
-6. **Pin Bend 2 if upstream drifts**: uncomment the version prefix (e.g. `2.0.`) in `bend.pin` or set `BEND_PIN_VERSION`.
+5. **Every new law MUST have a plain-English `# promise:` comment directly above `law <name>:`** (`# harm:` is optional). Missing promises on new laws fail with `E_LAW_NO_PROMISE` (locked laws warn if missing). Promises are stored in `rusty-bends.lock` outside the law hash, so improving `# promise:` wording is reported in build output without tripping `E_LAW_LOCK_TAMPERED`. Run `RUSTY_BENDS_LIST_LAWS=1 cargo check` or `cargo run -p rusty-bends-build --bin rusty-bends-laws -- verified` to print every law as `name: promise`.
+6. **Lean `--verdict` kernel cross-check**: `rusty-bends-build` always runs `bend <file> --check-only` (which checks all laws and proofs). By default (`BEND_VERDICT=auto`), it also runs `--verdict` whenever Lean (`~/.elan/bin/lean`) or `$BENDTT` is installed, and skips `--verdict` with a warning otherwise. Set `BEND_VERDICT=require` in CI to enforce Lean cross-checking, or `BEND_VERDICT=off` to disable it.
+7. **Pin Bend 2 if upstream drifts**: uncomment the version prefix (e.g. `2.0.`) in `bend.pin` or set `BEND_PIN_VERSION`.

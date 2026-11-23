@@ -23,9 +23,13 @@ On each build, for every `.bend` file in the verified directory:
    kernel check of the proofs) according to `BEND_VERDICT`. When a proof fails, it evaluates
    the emitted Rust on concrete inputs to distinguish a false law (`E_LAW_FALSE` with concrete
    `lhs` vs `rhs` values) from an incomplete proof.
-3. **Law lock and mutation check (`E_LAW_VACUOUS`).** It compares every `law` with the token-canonical copy in
+3. **Law lock, `# promise:` gate (`E_LAW_NO_PROMISE`), and mutation check (`E_LAW_VACUOUS`).** It compares every `law` with the token-canonical copy in
    `rusty-bends.lock`. A locked law that was edited, weakened or deleted fails the build
-   with `E_LAW_LOCK_TAMPERED`. Before any new law is accepted or sealed, `rusty-bends-build`
+   with `E_LAW_LOCK_TAMPERED`. Every new unlocked law must carry a plain-English
+   `# promise:` comment directly above `law <name>:` (`E_LAW_NO_PROMISE` otherwise;
+   locked laws warn if missing). Promise text is recorded in `rusty-bends.lock` outside
+   each law's hash, so wording edits are reported in build output without tripping
+   `E_LAW_LOCK_TAMPERED`. Before any new law is accepted or sealed, `rusty-bends-build`
    mutates the live functions the law depends on and checks that concrete evaluation catches at
    least one broken mutant (`E_LAW_VACUOUS` otherwise). Building with `RUSTY_BENDS_UPDATE_LAWS=1`
    rewrites the whole lock from the current sources once proofs and mutation checks pass:
@@ -76,6 +80,8 @@ import Base
 def deposit(bal: Nat, amt: Nat) -> Nat:
   Nat.add(bal, amt)
 
+# promise: depositing into a zero balance yields the deposited amount unchanged
+# harm: an initial deposit could lose or inflate customer funds
 law deposit_from_zero:
   for amt: Nat
   {deposit(0n, amt) == amt : Nat}
@@ -106,12 +112,13 @@ code, and hand it to a coding agent working on a RustyBends project.
 | `BENDTT` | When set, `--verdict` counts as available even if `lean` is not in `~/.elan/bin` or on `PATH`. |
 | `RUSTY_BENDS_UPDATE_LAWS` | `1` rewrites `rusty-bends.lock` from the current laws (once proofs & mutation checks pass), skipping the tamper check. Review the lock's diff before committing. |
 | `RUSTY_BENDS_MUTATE` | `all`: also runs the mutation check over locked laws and prints caught/survived diagnostics without failing the build. |
+| `RUSTY_BENDS_LIST_LAWS` | `1`: prints each law as `name: promise` during builds so reviewers can read plain-English guarantees without reading Bend 2 syntax (also available via `cargo run -p rusty-bends-build --bin rusty-bends-laws -- [dir]`). |
 
 ## Repository layout
 
 | Path | What |
 |---|---|
-| `rusty-bends-build/` | The build crate: proof gate (`lib.rs`), law lock (`lock.rs`), Rust emitter (`emit.rs`), per-law test & counterexample evaluator (`law_test.rs`), and mutation checker (`mutate.rs`). |
+| `rusty-bends-build/` | The build crate: proof gate (`lib.rs`), law lock & `# promise:` parser (`lock.rs`), Rust emitter (`emit.rs`), per-law test & counterexample evaluator (`law_test.rs`), mutation checker (`mutate.rs`), and CLI lister (`src/bin/rusty-bends-laws.rs`). |
 | `example-app/` | A minimal crate using it. |
 | `BEND_GUIDE.md` | Bend 2 + RustyBends coding guide. |
 | `src/`, `index.html`, `package.json` | **BendTT Kernel Workbench**, a browser tool (React + Vite) to parse Bend, inspect the AST and quantity erasure, trace proofs, suggest laws and preview the emitted Rust. Run it with `npm install && npm run dev`. It is an exploration aid; the build crate is the authority. |

@@ -1,3 +1,9 @@
 8a4a712b79f366c7  cancel_idempotent  law cancel_idempotent : for s : OrderState { cancel_order ( cancel_order ( s ) ) == cancel_order ( s ) : OrderState }
+# promise cancel_idempotent: cancelling an order twice produces the same state as cancelling it once
+# harm cancel_idempotent: retrying a cancel request could transition an order into an invalid state
 c7086690a6e4c16b  deposit_from_zero  law deposit_from_zero : for amt : Nat { deposit ( 0n , amt ) == amt : Nat }
+# promise deposit_from_zero: depositing into a zero balance yields the deposited amount unchanged
+# harm deposit_from_zero: an initial deposit could lose or inflate customer funds
 70bf2ecec778c27b  deposit_zero  law deposit_zero : for bal : Nat { deposit ( bal , 0n ) == bal : Nat }
+# promise deposit_zero: depositing zero leaves any existing balance unchanged
+# harm deposit_zero: zero-value deposits could corrupt account balances

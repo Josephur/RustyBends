@@ -1274,6 +1274,7 @@ mod tests {
 def f(+x: Nat) -> Nat:
   Nat.add(x, 1n)
 
+# promise: reflexive identity test fixture
 law f_reflexive:
   for +x: Nat
   {f(x) == f(x) : Nat}
@@ -1363,6 +1364,7 @@ def alloc_if_shift(+req: Nat, +free: Nat, +alloc: Nat) -> {pool_cap(pool_alloc_i
     case 1n+rp 1n+fp:
       alloc_step(rp, fp, alloc, Nat.is_le(rp, fp), alloc_if_shift(rp, fp, alloc))
 
+# promise: allocation conserves total pool capacity
 law alloc_conserves_capacity:
   for +alloc: Nat
   for +free: Nat
@@ -1418,9 +1420,11 @@ def alloc_conserves_capacity(alloc, free, req):
 def inc(+n: Nat) -> Nat:
   Nat.add(n, 1n)
 
+# promise: incrementing zero yields one
 law inc_zero:
   {inc(0n) == 1n : Nat}
 
+# promise: tautological placeholder fixture
 law empty_tautology:
   for +n: Nat
   {inc(n) == inc(n) : Nat}
