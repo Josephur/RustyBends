@@ -36,7 +36,7 @@ On each build, for every `.bend` file in the verified directory:
    build once without it first, and review the lock's diff (it should only add lines).
 4. **Erasure, emission, and per-law tests.** It drops laws, proof `def`s, equality lemmas and
    other `q=0` terms from the runtime output, writes the remaining functions and ADTs
-   (`pub enum`, `match`, `Nat` / fixed-width integers / `Bool` / pairs) to
+   (`pub enum`, `Box<T>`-indirected recursive ADTs and built-in `List<T>`, `match`, `Nat` / fixed-width integers / `Bool` / pairs) to
    `$OUT_DIR/verified.rs`, and appends generated `#[cfg(test)]` per-law tests so
    `cargo test` checks the emitted Rust directly.
 

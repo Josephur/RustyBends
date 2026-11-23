@@ -2,12 +2,12 @@
 //!
 //! Runs *only after* the real 'bend' proof checker approves every type, definition, and law.
 //! Strictly enforces the BendTT dead/live split:
-//! - 'type' ADTs emit '#[derive(Debug, Clone, Copy, PartialEq, Eq)] pub enum ...'.
+//! - 'type' ADTs emit '#[derive(Debug, Clone, Copy, PartialEq, Eq)] pub enum ...' (or Clone-only with Box<T> indirection when recursive).
 //! - 'match' and 'if/else' emit idiomatic Rust pattern matching and conditionals.
 //! - 'Dead' (q=0) parameters ('-T: Type') and annotations ('(x : T)') are erased.
 //! - 'law' and 'proof' blocks (including match/rewrite proofs) are completely stripped.
 
-use std::collections::{HashMap, HashSet};
+use std::collections::{HashMap, HashSet, VecDeque};
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Quantity {
@@ -56,22 +56,261 @@ pub(crate) struct CtorInfo {
     pub(crate) type_name: String,
     pub(crate) variant_name: String,
     pub(crate) arity: usize,
+    pub(crate) field_types: Vec<String>,
+    pub(crate) boxed_fields: Vec<bool>,
 }
 
-pub(crate) fn build_ctor_map(types: &[TypeDef]) -> HashMap<String, CtorInfo> {
-    let mut ctor_map: HashMap<String, CtorInfo> = HashMap::new();
-    for td in types {
-        for v in &td.variants {
-            let info = CtorInfo {
-                type_name: td.name.clone(),
-                variant_name: v.name.clone(),
-                arity: v.field_types.len(),
+#[derive(Debug, Clone)]
+pub(crate) struct TypeEnv {
+    pub(crate) ctor_map: HashMap<String, CtorInfo>,
+    pub(crate) non_copy_types: HashSet<String>,
+    pub(crate) uses_builtin_list: bool,
+}
+
+impl TypeEnv {
+    pub(crate) fn build(types: &[TypeDef], defs: &[Def], extra_sources: &[&str]) -> Self {
+        let type_names: HashSet<&str> = types.iter().map(|t| t.name.as_str()).collect();
+        let user_ctor_names: HashSet<&str> = types
+            .iter()
+            .flat_map(|t| t.variants.iter().map(|v| v.name.as_str()))
+            .collect();
+
+        // Build ADT dependency graph: A -> B if any variant of A mentions user ADT B.
+        let mut deps: HashMap<&str, HashSet<String>> = HashMap::new();
+        for td in types {
+            let mut refs = HashSet::new();
+            for v in &td.variants {
+                for ft in &v.field_types {
+                    collect_referenced_adts(ft, &type_names, &mut refs);
+                }
+            }
+            deps.insert(td.name.as_str(), refs);
+        }
+
+        let mut uses_builtin_list = false;
+        if !type_names.contains("List") {
+            'scan_list: for td in types {
+                for v in &td.variants {
+                    for ft in &v.field_types {
+                        if mentions_builtin_list(ft, &user_ctor_names) {
+                            uses_builtin_list = true;
+                            break 'scan_list;
+                        }
+                    }
+                }
+            }
+            if !uses_builtin_list {
+                'scan_defs: for d in defs {
+                    if mentions_builtin_list(&d.ret, &user_ctor_names)
+                        || mentions_builtin_list(&d.body, &user_ctor_names)
+                        || d.params
+                            .iter()
+                            .any(|p| mentions_builtin_list(&p.ty, &user_ctor_names))
+                    {
+                        uses_builtin_list = true;
+                        break 'scan_defs;
+                    }
+                }
+            }
+            if !uses_builtin_list {
+                for src in extra_sources {
+                    if mentions_builtin_list(src, &user_ctor_names) {
+                        uses_builtin_list = true;
+                        break;
+                    }
+                }
+            }
+        }
+
+        let mut ctor_map: HashMap<String, CtorInfo> = HashMap::new();
+        let mut non_copy_types: HashSet<String> = HashSet::new();
+        if uses_builtin_list {
+            non_copy_types.insert("List".to_string());
+        }
+
+        for td in types {
+            let mut has_boxed = false;
+            for v in &td.variants {
+                let mut boxed_fields = Vec::with_capacity(v.field_types.len());
+                for ft in &v.field_types {
+                    let mut field_refs = HashSet::new();
+                    collect_referenced_adts(ft, &type_names, &mut field_refs);
+                    let needs_box = field_refs
+                        .iter()
+                        .any(|b| b == &td.name || can_reach(b, &td.name, &deps));
+                    if needs_box {
+                        has_boxed = true;
+                    }
+                    boxed_fields.push(needs_box);
+                }
+                let info = CtorInfo {
+                    type_name: td.name.clone(),
+                    variant_name: v.name.clone(),
+                    arity: v.field_types.len(),
+                    field_types: v.field_types.clone(),
+                    boxed_fields,
+                };
+                ctor_map.insert(format!("{}.{}", td.name, v.name), info.clone());
+                ctor_map.entry(v.name.clone()).or_insert(info);
+            }
+            if has_boxed {
+                non_copy_types.insert(td.name.clone());
+            }
+        }
+
+        // Fixed-point propagation of non-Copy across non-recursive wrapper ADTs.
+        loop {
+            let mut changed = false;
+            for td in types {
+                if non_copy_types.contains(&td.name) {
+                    continue;
+                }
+                let refs_non_copy = td.variants.iter().any(|v| {
+                    v.field_types
+                        .iter()
+                        .any(|ft| type_contains_non_copy(ft, &non_copy_types))
+                });
+                if refs_non_copy {
+                    non_copy_types.insert(td.name.clone());
+                    changed = true;
+                }
+            }
+            if !changed {
+                break;
+            }
+        }
+
+        if uses_builtin_list && !type_names.contains("List") {
+            let nil_info = CtorInfo {
+                type_name: "List".to_string(),
+                variant_name: "Nil".to_string(),
+                arity: 0,
+                field_types: Vec::new(),
+                boxed_fields: Vec::new(),
             };
-            ctor_map.insert(format!("{}.{}", td.name, v.name), info.clone());
-            ctor_map.entry(v.name.clone()).or_insert(info);
+            let con_info = CtorInfo {
+                type_name: "List".to_string(),
+                variant_name: "Con".to_string(),
+                arity: 2,
+                field_types: vec!["_".to_string(), "List".to_string()],
+                boxed_fields: vec![false, true],
+            };
+            ctor_map.insert("List.Nil".to_string(), nil_info.clone());
+            ctor_map.entry("Nil".to_string()).or_insert(nil_info);
+            ctor_map.insert("List.Con".to_string(), con_info.clone());
+            ctor_map.entry("Con".to_string()).or_insert(con_info);
+        }
+
+        Self {
+            ctor_map,
+            non_copy_types,
+            uses_builtin_list,
         }
     }
-    ctor_map
+}
+
+fn can_reach(start: &str, target: &str, deps: &HashMap<&str, HashSet<String>>) -> bool {
+    let mut visited = HashSet::new();
+    let mut queue = VecDeque::new();
+    visited.insert(start.to_string());
+    queue.push_back(start.to_string());
+    while let Some(cur) = queue.pop_front() {
+        if let Some(nexts) = deps.get(cur.as_str()) {
+            for next in nexts {
+                if next == target {
+                    return true;
+                }
+                if visited.insert(next.clone()) {
+                    queue.push_back(next.clone());
+                }
+            }
+        }
+    }
+    false
+}
+
+pub(crate) fn parse_list_elem_type(ty: &str) -> Option<&str> {
+    let t = ty.trim();
+    let rest = t.strip_prefix("List")?.trim_start();
+    if !(rest.starts_with('<') && rest.ends_with('>')) || !is_wrapped_in_angles(rest) {
+        return None;
+    }
+    let inner = rest[1..rest.len() - 1].trim();
+    let parts = split_type_args(inner, ',');
+    parts
+        .last()
+        .copied()
+        .map(str::trim)
+        .filter(|s| !s.is_empty())
+}
+
+fn collect_referenced_adts(ty: &str, type_names: &HashSet<&str>, out: &mut HashSet<String>) {
+    let t = ty.trim();
+    if is_wrapped_in_parens(t) {
+        let inner = t[1..t.len() - 1].trim();
+        let parts = split_type_args(inner, ',');
+        if parts.len() > 1 {
+            for p in parts {
+                collect_referenced_adts(p, type_names, out);
+            }
+            return;
+        }
+        collect_referenced_adts(inner, type_names, out);
+        return;
+    }
+    let amp = split_type_args(t, '&');
+    if amp.len() > 1 {
+        for p in amp {
+            collect_referenced_adts(p, type_names, out);
+        }
+        return;
+    }
+    if let Some(elem) = parse_list_elem_type(t) {
+        collect_referenced_adts(elem, type_names, out);
+        return;
+    }
+    if type_names.contains(t) {
+        out.insert(t.to_string());
+    }
+}
+
+pub(crate) fn type_contains_non_copy(ty: &str, non_copy_types: &HashSet<String>) -> bool {
+    let t = ty.trim();
+    if is_wrapped_in_parens(t) {
+        let inner = t[1..t.len() - 1].trim();
+        let parts = split_type_args(inner, ',');
+        if parts.len() > 1 {
+            return parts
+                .iter()
+                .any(|p| type_contains_non_copy(p, non_copy_types));
+        }
+        return type_contains_non_copy(inner, non_copy_types);
+    }
+    let amp = split_type_args(t, '&');
+    if amp.len() > 1 {
+        return amp
+            .iter()
+            .any(|p| type_contains_non_copy(p, non_copy_types));
+    }
+    if parse_list_elem_type(t).is_some() {
+        return true;
+    }
+    non_copy_types.contains(t)
+}
+
+fn mentions_builtin_list(s: &str, user_ctors: &HashSet<&str>) -> bool {
+    if s.contains("List<") || s.contains("List.Nil") || s.contains("List.Con") || s.contains('[') {
+        return true;
+    }
+    for tok in crate::lock::tokenize_bend(s) {
+        if tok == "List"
+            || (!user_ctors.contains("Nil") && tok == "Nil")
+            || (!user_ctors.contains("Con") && tok == "Con")
+        {
+            return true;
+        }
+    }
+    false
 }
 
 /// Parses Bend v1 'type' and 'def' items from verified source, erases all q=0 parts and laws,
@@ -79,12 +318,13 @@ pub(crate) fn build_ctor_map(types: &[TypeDef]) -> HashMap<String, CtorInfo> {
 /// `include!(concat!(env!("OUT_DIR"), "/verified.rs"))`.
 pub fn emit_verified_rust(source: &str, laws_verified: usize) -> Result<EmitSummary, String> {
     let (types, defs) = parse_book_items(source)?;
-    let ctor_map = build_ctor_map(&types);
-    let mut summary = emit_items_to_rust(&types, &defs, &ctor_map, laws_verified, None)?;
-
     let laws = crate::law_test::parse_laws(source);
+    let extra_sources = collect_law_source_slices(&laws);
+    let type_env = TypeEnv::build(&types, &defs, &extra_sources);
+    let mut summary = emit_items_to_rust(&types, &defs, &type_env, laws_verified, None, true)?;
+
     if !laws.is_empty() {
-        let test_mod = crate::law_test::emit_law_tests_module(&laws, &types, &defs, &ctor_map);
+        let test_mod = crate::law_test::emit_law_tests_module(&laws, &types, &defs, &type_env);
         if !test_mod.is_empty() {
             summary.rust_source.push('\n');
             summary.rust_source.push_str(&test_mod);
@@ -97,16 +337,41 @@ pub fn emit_verified_rust(source: &str, laws_verified: usize) -> Result<EmitSumm
 /// Emits pure runtime Rust only (without `#[cfg(test)]` law harnesses).
 pub fn emit_runtime_only(source: &str, laws_verified: usize) -> Result<EmitSummary, String> {
     let (types, defs) = parse_book_items(source)?;
-    let ctor_map = build_ctor_map(&types);
-    emit_items_to_rust(&types, &defs, &ctor_map, laws_verified, None)
+    let type_env = TypeEnv::build(&types, &defs, &[]);
+    emit_items_to_rust(&types, &defs, &type_env, laws_verified, None, true)
+}
+
+pub(crate) fn collect_law_source_slices(laws: &[crate::law_test::ParsedLaw]) -> Vec<&str> {
+    let mut slices = Vec::new();
+    for l in laws {
+        if !l.lhs.is_empty() {
+            slices.push(l.lhs.as_str());
+        }
+        if !l.rhs.is_empty() {
+            slices.push(l.rhs.as_str());
+        }
+        if !l.eq_ty.is_empty() {
+            slices.push(l.eq_ty.as_str());
+        }
+        for v in &l.vars {
+            slices.push(v.ty.as_str());
+        }
+        for h in &l.hypotheses {
+            slices.push(h.lhs.as_str());
+            slices.push(h.rhs.as_str());
+            slices.push(h.ty.as_str());
+        }
+    }
+    slices
 }
 
 pub(crate) fn emit_items_to_rust(
     types: &[TypeDef],
     defs: &[Def],
-    ctor_map: &HashMap<String, CtorInfo>,
+    type_env: &TypeEnv,
     laws_verified: usize,
     step_limit: Option<usize>,
+    emit_types: bool,
 ) -> Result<EmitSummary, String> {
     let def_map: HashMap<String, &Def> = defs.iter().map(|d| (d.name.clone(), d)).collect();
     let mut dead_params_erased = 0usize;
@@ -119,25 +384,51 @@ pub(crate) fn emit_items_to_rust(
         ));
     }
 
-    for td in types {
-        let mut variants_rs = Vec::new();
-        for v in &td.variants {
-            if v.field_types.is_empty() {
-                variants_rs.push(format!("    {},", v.name));
-            } else {
-                let mapped: Vec<String> = v
-                    .field_types
-                    .iter()
-                    .map(|t| bend_type_to_rust(t, &empty_set))
-                    .collect();
-                variants_rs.push(format!("    {}({}),", v.name, mapped.join(", ")));
+    if emit_types && type_env.uses_builtin_list {
+        blocks.push(
+            "#[derive(Debug, Clone, PartialEq, Eq)]\npub enum List<T> {\n    Nil,\n    Con(T, Box<List<T>>),\n}"
+                .to_string(),
+        );
+    }
+
+    if emit_types {
+        for td in types {
+            let mut variants_rs = Vec::new();
+            for v in &td.variants {
+                if v.field_types.is_empty() {
+                    variants_rs.push(format!("    {},", v.name));
+                } else {
+                    let info = type_env.ctor_map.get(&format!("{}.{}", td.name, v.name));
+                    let mapped: Vec<String> = v
+                        .field_types
+                        .iter()
+                        .enumerate()
+                        .map(|(idx, t)| {
+                            let rty = bend_type_to_rust(t, &empty_set);
+                            let is_boxed = info
+                                .and_then(|c| c.boxed_fields.get(idx).copied())
+                                .unwrap_or(false);
+                            if is_boxed {
+                                format!("Box<{rty}>")
+                            } else {
+                                rty
+                            }
+                        })
+                        .collect();
+                    variants_rs.push(format!("    {}({}),", v.name, mapped.join(", ")));
+                }
             }
+            let derive_line = if type_env.non_copy_types.contains(&td.name) {
+                "#[derive(Debug, Clone, PartialEq, Eq)]"
+            } else {
+                "#[derive(Debug, Clone, Copy, PartialEq, Eq)]"
+            };
+            blocks.push(format!(
+                "{derive_line}\npub enum {} {{\n{}\n}}",
+                td.name,
+                variants_rs.join("\n")
+            ));
         }
-        blocks.push(format!(
-            "#[derive(Debug, Clone, Copy, PartialEq, Eq)]\npub enum {} {{\n{}\n}}",
-            td.name,
-            variants_rs.join("\n")
-        ));
     }
 
     for def in defs {
@@ -157,7 +448,8 @@ pub(crate) fn emit_items_to_rust(
             }
         }
 
-        let generics = if type_params.is_empty() {
+        let has_generics = !type_params.is_empty();
+        let generics = if !has_generics {
             String::new()
         } else {
             format!("<{}>", type_params.join(", "))
@@ -169,8 +461,25 @@ pub(crate) fn emit_items_to_rust(
             .collect::<Vec<_>>()
             .join(", ");
 
+        let mut clone_vars = HashSet::new();
+        if !has_generics {
+            for p in &live_params {
+                if type_contains_non_copy(&p.ty, &type_env.non_copy_types)
+                    && count_ident_uses(&def.body, &p.name) > 1
+                {
+                    clone_vars.insert(p.name.clone());
+                }
+            }
+        }
+
         let default_mode = arith_mode_for_type(&def.ret, ArithMode::NatChecked);
-        let body_expr = emit_expr_with_mode(&def.body, &def_map, ctor_map, default_mode)?;
+        let ctx = EmitCtx {
+            defs: &def_map,
+            type_env,
+            clone_vars: &clone_vars,
+            has_generics,
+        };
+        let body_expr = emit_expr_with_ctx(&def.body, &ctx, default_mode)?;
         let ret_ty = infer_return_type(&def.body, &def.ret, &type_param_set);
         let guard_prefix = if step_limit.is_some() {
             "__rb_tick();\n    "
@@ -179,7 +488,7 @@ pub(crate) fn emit_items_to_rust(
         };
 
         blocks.push(format!(
-            "#[inline]\n#[allow(unused_variables, unused_parens, clippy::let_and_return, clippy::double_parens, clippy::unnecessary_cast)]\npub fn {name}{generics}({rust_params}) -> {ret_ty} {{\n    {guard_prefix}{body_expr}\n}}",
+            "#[inline]\n#[allow(unused_variables, unused_parens, unreachable_patterns, irrefutable_let_patterns, clippy::let_and_return, clippy::double_parens, clippy::unnecessary_cast, clippy::clone_on_copy, clippy::match_like_matches_macro)]\npub fn {name}{generics}({rust_params}) -> {ret_ty} {{\n    {guard_prefix}{body_expr}\n}}",
             name = def.name
         ));
     }
@@ -383,12 +692,12 @@ fn parse_variant(raw: &str) -> Result<Variant, String> {
     let inner = s[open + 1..s.len() - 1].trim();
     let mut field_types = Vec::new();
     if !inner.is_empty() {
-        for part in split_top_level(inner, ',') {
+        for part in split_type_args(inner, ',') {
             let p = part.trim();
             if p.is_empty() {
                 continue;
             }
-            if let Some((_fname, fty)) = split_top_level_once(p, ':') {
+            if let Some((_fname, fty)) = split_type_args_once(p, ':') {
                 field_types.push(fty.trim().to_string());
             } else {
                 field_types.push(p.to_string());
@@ -497,13 +806,12 @@ fn parse_def_header(header: &str, body: String) -> Result<Def, String> {
 
     let mut params = Vec::new();
     if !params_raw.is_empty() {
-        for chunk in split_top_level(params_raw, ',') {
+        for chunk in split_type_args(params_raw, ',') {
             let item = chunk.trim();
             if item.is_empty() {
                 continue;
             }
-            let (lhs, ty) = item
-                .split_once(':')
+            let (lhs, ty) = split_type_args_once(item, ':')
                 .ok_or_else(|| format!("[E_EMIT_SYNTAX] Invalid param '{item}' in 'def {name}'"))?;
             let lhs = lhs.trim();
             let (q, pname) = if let Some(stripped) = lhs.strip_prefix('-') {
@@ -547,7 +855,7 @@ pub(crate) fn bend_type_to_rust(ty: &str, type_params: &HashSet<String>) -> Stri
     let t = ty.trim();
     if is_wrapped_in_parens(t) {
         let inner = t[1..t.len() - 1].trim();
-        let parts = split_top_level(inner, ',');
+        let parts = split_type_args(inner, ',');
         if parts.len() > 1 {
             let mapped = parts
                 .into_iter()
@@ -558,7 +866,7 @@ pub(crate) fn bend_type_to_rust(ty: &str, type_params: &HashSet<String>) -> Stri
         }
         return bend_type_to_rust(inner, type_params);
     }
-    let amp_parts = split_top_level(t, '&');
+    let amp_parts = split_type_args(t, '&');
     if amp_parts.len() > 1 {
         let mapped = amp_parts
             .into_iter()
@@ -566,6 +874,9 @@ pub(crate) fn bend_type_to_rust(ty: &str, type_params: &HashSet<String>) -> Stri
             .collect::<Vec<_>>()
             .join(", ");
         return format!("({mapped})");
+    }
+    if let Some(elem) = parse_list_elem_type(t) {
+        return format!("List<{}>", bend_type_to_rust(elem, type_params));
     }
     match t {
         "Nat" | "U64" => "u64".to_string(),
@@ -678,63 +989,146 @@ fn parse_nat_succ_pattern(p: &str) -> Result<Option<NatPattern>, String> {
     }))
 }
 
-fn emit_single_pattern(
+#[derive(Default)]
+struct PatState {
+    succ_counter: usize,
+    box_counter: usize,
+    guard_counter: usize,
+    bindings: Vec<String>,
+    guards: Vec<String>,
+    bound_vars: Vec<(String, Option<String>)>,
+}
+
+fn is_nat_literal(s: &str) -> bool {
+    s.strip_suffix('n')
+        .is_some_and(|digits| !digits.is_empty() && digits.chars().all(|c| c.is_ascii_digit()))
+}
+
+fn is_plain_binder_ident(s: &str, ctors: &HashMap<String, CtorInfo>) -> bool {
+    !matches!(
+        s,
+        "_" | "true" | "false" | "True{}" | "False{}" | "Unit{}" | "()" | "[]"
+    ) && !is_nat_literal(s)
+        && !ctors.contains_key(s)
+        && !s.contains('.')
+        && is_valid_rust_ident_or_wildcard(s)
+}
+
+fn split_expected_tuple_types(expected_ty: Option<&str>) -> Option<Vec<&str>> {
+    let t = expected_ty?.trim();
+    if is_wrapped_in_parens(t) {
+        let inner = t[1..t.len() - 1].trim();
+        let parts = split_type_args(inner, ',');
+        if parts.len() > 1 {
+            return Some(parts);
+        }
+        return split_expected_tuple_types(Some(inner));
+    }
+    let amp = split_type_args(t, '&');
+    if amp.len() > 1 {
+        return Some(amp);
+    }
+    None
+}
+
+fn emit_pattern_guard(
     pat: &str,
+    target: &str,
     ctors: &HashMap<String, CtorInfo>,
-    succ_counter: &mut usize,
-) -> Result<(String, Vec<String>), String> {
+    guard_counter: &mut usize,
+) -> Result<String, String> {
     let p = pat.trim();
-    if p == "_" || p == "true" || p == "false" || p == "()" {
-        return Ok((p.to_string(), Vec::new()));
+    if p == "_" || p == "Unit{}" || p == "()" {
+        return Ok("true".to_string());
     }
-    if p == "True{}" {
-        return Ok(("true".to_string(), Vec::new()));
+    if p == "true" || p == "True{}" {
+        return Ok(format!("matches!({target}, true)"));
     }
-    if p == "False{}" {
-        return Ok(("false".to_string(), Vec::new()));
+    if p == "false" || p == "False{}" {
+        return Ok(format!("matches!({target}, false)"));
     }
-    if p == "Unit{}" {
-        return Ok(("()".to_string(), Vec::new()));
+    if p == "[]" {
+        return Ok(format!("matches!({target}, List::Nil)"));
     }
     if let Some(nat_pat) = parse_nat_succ_pattern(p)? {
-        return match nat_pat {
-            NatPattern::Const(total) => Ok((format!("{total}_u64"), Vec::new())),
-            NatPattern::Succ { offset: 0, var } => Ok((var, Vec::new())),
-            NatPattern::Succ { offset, var } if var == "_" => {
-                Ok((format!("{offset}_u64..=u64::MAX"), Vec::new()))
+        return Ok(match nat_pat {
+            NatPattern::Const(total) => format!("matches!({target}, {total}_u64)"),
+            NatPattern::Succ { offset: 0, .. } => "true".to_string(),
+            NatPattern::Succ { offset, .. } => {
+                format!("matches!({target}, {offset}_u64..=u64::MAX)")
             }
-            NatPattern::Succ { offset, var } => {
-                let idx = *succ_counter;
-                *succ_counter += 1;
-                let tmp = format!("__rb_n{idx}");
-                Ok((
-                    format!("{tmp} @ {offset}_u64..=u64::MAX"),
-                    vec![format!("let {var} = {tmp} - {offset}_u64;")],
-                ))
-            }
-        };
+        });
     }
     if let Some(digits) = p.strip_suffix('n') {
         if !digits.is_empty() && digits.chars().all(|c| c.is_ascii_digit()) {
-            return Ok((format!("{digits}_u64"), Vec::new()));
+            return Ok(format!("matches!({target}, {digits}_u64)"));
         }
     }
-    // Tuple pattern: (a, b)
     if is_wrapped_in_parens(p) {
         let inner = p[1..p.len() - 1].trim();
         let parts = split_top_level(inner, ',');
         if parts.len() > 1 {
-            let mut rust_parts = Vec::new();
-            let mut bindings = Vec::new();
+            let mut vars = Vec::with_capacity(parts.len());
+            let mut sub_guards = Vec::with_capacity(parts.len());
             for part in parts {
-                let (rp, mut b) = emit_single_pattern(part, ctors, succ_counter)?;
-                rust_parts.push(rp);
-                bindings.append(&mut b);
+                let gv = format!("__rb_g{}", *guard_counter);
+                *guard_counter += 1;
+                let sg = emit_pattern_guard(part, &gv, ctors, guard_counter)?;
+                vars.push(gv);
+                sub_guards.push(sg);
             }
-            return Ok((format!("({})", rust_parts.join(", ")), bindings));
+            return Ok(format!(
+                "match {target} {{ ({}) => {} }}",
+                vars.join(", "),
+                sub_guards.join(" && ")
+            ));
         }
     }
-    // Real Bend 2 curly-brace pattern: Draft{}, Paid{amt}, Circle{+r}
+    if let Some((head, inner, is_curly)) = split_ctor_pattern(p)? {
+        let info_opt = ctors.get(head);
+        let rust_head = resolve_ctor_path(head, ctors);
+        if inner.is_empty() {
+            return Ok(format!("matches!({target}, {rust_head})"));
+        }
+        let parts = split_top_level(inner, ',');
+        let mut vars = Vec::with_capacity(parts.len());
+        let mut sub_guards = Vec::with_capacity(parts.len());
+        for (idx, part) in parts.iter().enumerate() {
+            let rhs = extract_ctor_pattern_field_rhs(part, is_curly);
+            let is_boxed = info_opt
+                .and_then(|i| i.boxed_fields.get(idx).copied())
+                .unwrap_or(false);
+            let gv = format!("__rb_g{}", *guard_counter);
+            *guard_counter += 1;
+            let sub_target = if is_boxed {
+                format!("&**{gv}")
+            } else {
+                gv.clone()
+            };
+            let sg = emit_pattern_guard(rhs, &sub_target, ctors, guard_counter)?;
+            vars.push(gv);
+            sub_guards.push(sg);
+        }
+        return Ok(format!(
+            "match {target} {{ {rust_head}({}) => {}, _ => false }}",
+            vars.join(", "),
+            sub_guards.join(" && ")
+        ));
+    }
+    let clean = p.trim_start_matches('+').trim_start_matches('-').trim();
+    if is_plain_binder_ident(clean, ctors) {
+        return Ok("true".to_string());
+    }
+    if clean.is_empty() || !clean.split('.').all(is_valid_rust_ident_or_wildcard) {
+        return Err(format!(
+            "[E_EMIT_UNSUPPORTED_PATTERN] Unsupported match pattern '{p}'"
+        ));
+    }
+    let rust_head = resolve_ctor_path(clean, ctors);
+    Ok(format!("matches!({target}, {rust_head})"))
+}
+
+fn split_ctor_pattern(p: &str) -> Result<Option<(&str, &str, bool)>, String> {
     if let Some(open) = p.find('{') {
         if p.ends_with('}') {
             let head = p[..open].trim();
@@ -743,32 +1137,7 @@ fn emit_single_pattern(
                     "[E_EMIT_UNSUPPORTED_PATTERN] Unsupported constructor pattern '{p}'"
                 ));
             }
-            let inner = p[open + 1..p.len() - 1].trim();
-            let rust_head = resolve_ctor_path(head, ctors);
-            if inner.is_empty() {
-                return Ok((rust_head, Vec::new()));
-            }
-            let mut bindings = Vec::new();
-            let mut fields = Vec::new();
-            for b in split_top_level(inner, ',') {
-                let clean = b
-                    .trim()
-                    .trim_start_matches('+')
-                    .trim_start_matches('-')
-                    .trim();
-                let rhs = if let Some((_, v)) = clean.split_once(':') {
-                    v.trim()
-                        .trim_start_matches('+')
-                        .trim_start_matches('-')
-                        .trim()
-                } else {
-                    clean
-                };
-                let (rp, mut bs) = emit_single_pattern(rhs, ctors, succ_counter)?;
-                bindings.append(&mut bs);
-                fields.push(rp);
-            }
-            return Ok((format!("{rust_head}({})", fields.join(", ")), bindings));
+            return Ok(Some((head, p[open + 1..p.len() - 1].trim(), true)));
         }
     }
     if let Some(open) = p.find('(') {
@@ -779,20 +1148,155 @@ fn emit_single_pattern(
                     "[E_EMIT_UNSUPPORTED_PATTERN] Unsupported constructor pattern '{p}'"
                 ));
             }
-            let args = p[open + 1..p.len() - 1].trim();
-            let rust_head = resolve_ctor_path(head, ctors);
-            if args.is_empty() {
-                return Ok((rust_head, Vec::new()));
-            }
-            let mut bindings = Vec::new();
-            let mut fields = Vec::new();
-            for arg in split_top_level(args, ',') {
-                let (rp, mut bs) = emit_single_pattern(arg, ctors, succ_counter)?;
-                bindings.append(&mut bs);
-                fields.push(rp);
-            }
-            return Ok((format!("{rust_head}({})", fields.join(", ")), bindings));
+            return Ok(Some((head, p[open + 1..p.len() - 1].trim(), false)));
         }
+    }
+    Ok(None)
+}
+
+fn extract_ctor_pattern_field_rhs(raw: &str, is_curly: bool) -> &str {
+    let clean = raw
+        .trim()
+        .trim_start_matches('+')
+        .trim_start_matches('-')
+        .trim();
+    if is_curly {
+        if let Some((_, v)) = split_top_level_once(clean, ':') {
+            return v
+                .trim()
+                .trim_start_matches('+')
+                .trim_start_matches('-')
+                .trim();
+        }
+    }
+    clean
+}
+
+fn emit_single_pattern(
+    pat: &str,
+    ctors: &HashMap<String, CtorInfo>,
+    expected_ty: Option<&str>,
+    state: &mut PatState,
+) -> Result<String, String> {
+    let p = pat.trim();
+    if p == "_" || p == "true" || p == "false" || p == "()" {
+        return Ok(p.to_string());
+    }
+    if p == "True{}" {
+        return Ok("true".to_string());
+    }
+    if p == "False{}" {
+        return Ok("false".to_string());
+    }
+    if p == "Unit{}" {
+        return Ok("()".to_string());
+    }
+    if p == "[]" {
+        return Ok("List::Nil".to_string());
+    }
+    if let Some(nat_pat) = parse_nat_succ_pattern(p)? {
+        return match nat_pat {
+            NatPattern::Const(total) => Ok(format!("{total}_u64")),
+            NatPattern::Succ { offset: 0, var } => {
+                if var != "_" {
+                    state
+                        .bound_vars
+                        .push((var.clone(), Some("Nat".to_string())));
+                }
+                Ok(var)
+            }
+            NatPattern::Succ { offset, var } if var == "_" => {
+                Ok(format!("{offset}_u64..=u64::MAX"))
+            }
+            NatPattern::Succ { offset, var } => {
+                let idx = state.succ_counter;
+                state.succ_counter += 1;
+                let tmp = format!("__rb_n{idx}");
+                state
+                    .bindings
+                    .push(format!("let {var} = {tmp} - {offset}_u64;"));
+                state.bound_vars.push((var, Some("Nat".to_string())));
+                Ok(format!("{tmp} @ {offset}_u64..=u64::MAX"))
+            }
+        };
+    }
+    if let Some(digits) = p.strip_suffix('n') {
+        if !digits.is_empty() && digits.chars().all(|c| c.is_ascii_digit()) {
+            return Ok(format!("{digits}_u64"));
+        }
+    }
+    // Tuple pattern: (a, b)
+    if is_wrapped_in_parens(p) {
+        let inner = p[1..p.len() - 1].trim();
+        let parts = split_top_level(inner, ',');
+        if parts.len() > 1 {
+            let elem_tys = split_expected_tuple_types(expected_ty);
+            let mut rust_parts = Vec::new();
+            for (idx, part) in parts.iter().enumerate() {
+                let sub_ty = elem_tys.as_ref().and_then(|ts| ts.get(idx).copied());
+                let rp = emit_single_pattern(part, ctors, sub_ty, state)?;
+                rust_parts.push(rp);
+            }
+            return Ok(format!("({})", rust_parts.join(", ")));
+        }
+    }
+    // Real Bend 2 curly-brace or paren constructor pattern
+    if let Some((head, inner, is_curly)) = split_ctor_pattern(p)? {
+        let info_opt = ctors.get(head);
+        let rust_head = resolve_ctor_path(head, ctors);
+        if inner.is_empty() {
+            return Ok(rust_head);
+        }
+        let mut fields = Vec::new();
+        for (idx, b) in split_top_level(inner, ',').iter().enumerate() {
+            let rhs = extract_ctor_pattern_field_rhs(b, is_curly);
+            let is_boxed = info_opt
+                .and_then(|i| i.boxed_fields.get(idx).copied())
+                .unwrap_or(false);
+            let field_ty = info_opt.and_then(|i| i.field_types.get(idx).cloned());
+            if !is_boxed {
+                fields.push(emit_single_pattern(rhs, ctors, field_ty.as_deref(), state)?);
+            } else if rhs == "_" {
+                fields.push("_".to_string());
+            } else if is_plain_binder_ident(rhs, ctors) {
+                let box_tmp = format!("__rb_box{}", state.box_counter);
+                state.box_counter += 1;
+                state.bindings.push(format!("let {rhs} = *{box_tmp};"));
+                state.bound_vars.push((rhs.to_string(), field_ty));
+                fields.push(box_tmp);
+            } else {
+                let box_tmp = format!("__rb_box{}", state.box_counter);
+                state.box_counter += 1;
+                let guard = emit_pattern_guard(
+                    rhs,
+                    &format!("&*{box_tmp}"),
+                    ctors,
+                    &mut state.guard_counter,
+                )?;
+                state.guards.push(guard);
+
+                let mut sub_state = PatState {
+                    succ_counter: state.succ_counter,
+                    box_counter: state.box_counter,
+                    guard_counter: state.guard_counter,
+                    ..Default::default()
+                };
+                let inner_pat =
+                    emit_single_pattern(rhs, ctors, field_ty.as_deref(), &mut sub_state)?;
+                state.succ_counter = sub_state.succ_counter;
+                state.box_counter = sub_state.box_counter;
+                state.guard_counter = sub_state.guard_counter;
+                if !sub_state.bound_vars.is_empty() || !sub_state.bindings.is_empty() {
+                    state.bindings.push(format!(
+                        "let {inner_pat} = *{box_tmp} else {{ unreachable!() }};"
+                    ));
+                    state.bindings.extend(sub_state.bindings);
+                    state.bound_vars.extend(sub_state.bound_vars);
+                }
+                fields.push(box_tmp);
+            }
+        }
+        return Ok(format!("{rust_head}({})", fields.join(", ")));
     }
     let clean = p.trim_start_matches('+').trim_start_matches('-').trim();
     if clean.is_empty() || !clean.split('.').all(is_valid_rust_ident_or_wildcard) {
@@ -800,29 +1304,33 @@ fn emit_single_pattern(
             "[E_EMIT_UNSUPPORTED_PATTERN] Unsupported match pattern '{p}'"
         ));
     }
-    Ok((resolve_ctor_path(clean, ctors), Vec::new()))
+    if is_plain_binder_ident(clean, ctors) {
+        state
+            .bound_vars
+            .push((clean.to_string(), expected_ty.map(str::to_string)));
+    }
+    Ok(resolve_ctor_path(clean, ctors))
 }
 
 fn emit_match_pattern(
     pat: &str,
     scrut_count: usize,
     ctors: &HashMap<String, CtorInfo>,
-) -> Result<(String, Vec<String>), String> {
-    let mut succ_counter = 0usize;
+) -> Result<(String, PatState), String> {
+    let mut state = PatState::default();
     if scrut_count > 1 {
         let parts = split_pattern_tokens(pat);
         if parts.len() > 1 {
             let mut rust_parts = Vec::new();
-            let mut bindings = Vec::new();
             for part in &parts {
-                let (rp, mut b) = emit_single_pattern(part, ctors, &mut succ_counter)?;
+                let rp = emit_single_pattern(part, ctors, None, &mut state)?;
                 rust_parts.push(rp);
-                bindings.append(&mut b);
             }
-            return Ok((format!("({})", rust_parts.join(", ")), bindings));
+            return Ok((format!("({})", rust_parts.join(", ")), state));
         }
     }
-    emit_single_pattern(pat, ctors, &mut succ_counter)
+    let rp = emit_single_pattern(pat, ctors, None, &mut state)?;
+    Ok((rp, state))
 }
 
 fn resolve_ctor_path(name: &str, ctors: &HashMap<String, CtorInfo>) -> String {
@@ -855,19 +1363,108 @@ fn clean_let_binding(raw: &str) -> String {
         .to_string()
 }
 
+fn extract_let_bound_names(raw: &str) -> Vec<String> {
+    let t = raw.trim();
+    if is_wrapped_in_parens(t) {
+        let inner = t[1..t.len() - 1].trim();
+        return split_top_level(inner, ',')
+            .into_iter()
+            .flat_map(extract_let_bound_names)
+            .collect();
+    }
+    let clean = t.trim_start_matches('+').trim_start_matches('-').trim();
+    if !clean.is_empty() && clean != "_" && is_valid_rust_ident_or_wildcard(clean) {
+        vec![clean.to_string()]
+    } else {
+        Vec::new()
+    }
+}
+
+fn is_obviously_copy_expr(expr: &str) -> bool {
+    let s = expr.trim();
+    s == "True{}"
+        || s == "False{}"
+        || s == "Unit{}"
+        || s == "()"
+        || is_nat_literal(s)
+        || s.starts_with("Nat.is_")
+        || s.starts_with("Nat.add(")
+        || s.starts_with("Nat.sub(")
+        || s.starts_with("Nat.mul(")
+        || s.starts_with("Nat.div(")
+        || s.starts_with("Nat.mod(")
+        || s.starts_with("Nat.min(")
+        || s.starts_with("Nat.max(")
+        || s.starts_with("Nat.succ(")
+        || s.starts_with("Nat.pred(")
+        || s.starts_with("Bool.")
+}
+
+pub(crate) fn count_ident_uses(src: &str, name: &str) -> usize {
+    if name.is_empty() {
+        return 0;
+    }
+    let bytes = src.as_bytes();
+    let nbytes = name.as_bytes();
+    let mut count = 0usize;
+    let mut i = 0usize;
+    let mut in_string = false;
+
+    while i < bytes.len() {
+        if in_string {
+            if bytes[i] == b'\\' && i + 1 < bytes.len() {
+                i += 2;
+                continue;
+            }
+            if bytes[i] == b'"' {
+                in_string = false;
+            }
+            i += 1;
+            continue;
+        }
+        if bytes[i] == b'"' {
+            in_string = true;
+            i += 1;
+            continue;
+        }
+        if bytes[i] == b'#' || (bytes[i] == b'-' && i + 1 < bytes.len() && bytes[i + 1] == b'-') {
+            while i < bytes.len() && bytes[i] != b'\n' {
+                i += 1;
+            }
+            continue;
+        }
+        if bytes[i..].starts_with(nbytes) {
+            let prev_ok = i == 0
+                || (!bytes[i - 1].is_ascii_alphanumeric()
+                    && bytes[i - 1] != b'_'
+                    && bytes[i - 1] != b'.');
+            let end = i + nbytes.len();
+            let next_ok =
+                end == bytes.len() || (!bytes[end].is_ascii_alphanumeric() && bytes[end] != b'_');
+            if prev_ok && next_ok {
+                count += 1;
+                i = end;
+                continue;
+            }
+        }
+        i += 1;
+    }
+    count
+}
+
 fn split_top_level_ws(s: &str) -> Vec<&str> {
     let mut out = Vec::new();
     let mut depth = 0i32;
     let mut start: Option<usize> = None;
     for (idx, ch) in s.char_indices() {
         match ch {
-            '(' | '{' => {
+            '(' | '{' | '[' => {
                 if start.is_none() {
                     start = Some(idx);
                 }
                 depth += 1;
             }
-            ')' | '}' => {
+            ')' | '}' | ']' => {
                 depth -= 1;
             }
             c if c.is_whitespace() && depth == 0 => {
@@ -978,12 +1575,32 @@ fn parse_indented_case_arms(lines: &[&str]) -> Vec<(String, String)> {
     arms
 }
 
+pub(crate) struct EmitCtx<'a> {
+    pub(crate) defs: &'a HashMap<String, &'a Def>,
+    pub(crate) type_env: &'a TypeEnv,
+    pub(crate) clone_vars: &'a HashSet<String>,
+    pub(crate) has_generics: bool,
+}
+
 pub(crate) fn emit_expr_with_mode(
     expr: &str,
     defs: &HashMap<String, &Def>,
-    ctors: &HashMap<String, CtorInfo>,
+    type_env: &TypeEnv,
+    clone_vars: &HashSet<String>,
     mode: ArithMode,
 ) -> Result<String, String> {
+    let ctx = EmitCtx {
+        defs,
+        type_env,
+        clone_vars,
+        has_generics: false,
+    };
+    emit_expr_with_ctx(expr, &ctx, mode)
+}
+
+fn emit_expr_with_ctx(expr: &str, ctx: &EmitCtx<'_>, mode: ArithMode) -> Result<String, String> {
+    let defs = ctx.defs;
+    let ctors = &ctx.type_env.ctor_map;
     let lines: Vec<&str> = expr.lines().filter(|l| !l.trim().is_empty()).collect();
     if lines.is_empty() {
         return Ok("()".to_string());
@@ -1014,11 +1631,32 @@ pub(crate) fn emit_expr_with_mode(
             if split_idx < lines.len() {
                 let val_src = val_lines.join("\n");
                 let rest_src = lines[split_idx..].join("\n");
+                let mut body_clone_vars = ctx.clone_vars.clone();
+                let bound_names = extract_let_bound_names(lhs_raw);
+                for b in &bound_names {
+                    body_clone_vars.remove(b);
+                }
+                if !ctx.has_generics
+                    && !ctx.type_env.non_copy_types.is_empty()
+                    && !is_obviously_copy_expr(&val_src)
+                {
+                    for b in bound_names {
+                        if count_ident_uses(&rest_src, &b) > 1 {
+                            body_clone_vars.insert(b);
+                        }
+                    }
+                }
+                let body_ctx = EmitCtx {
+                    defs: ctx.defs,
+                    type_env: ctx.type_env,
+                    clone_vars: &body_clone_vars,
+                    has_generics: ctx.has_generics,
+                };
                 return Ok(format!(
                     "{{\n        let {} = {};\n        {}\n    }}",
                     clean_let_binding(lhs_raw),
-                    emit_expr_with_mode(&val_src, defs, ctors, mode)?,
-                    emit_expr_with_mode(&rest_src, defs, ctors, mode)?
+                    emit_expr_with_ctx(&val_src, ctx, mode)?,
+                    emit_expr_with_ctx(&rest_src, &body_ctx, mode)?
                 ));
             }
         }
@@ -1031,11 +1669,11 @@ pub(crate) fn emit_expr_with_mode(
             let rust_scrut = if scrut_parts.len() > 1 {
                 let mut emitted = Vec::with_capacity(scrut_parts.len());
                 for p in &scrut_parts {
-                    emitted.push(emit_expr_with_mode(p, defs, ctors, mode)?);
+                    emitted.push(emit_expr_with_ctx(p, ctx, mode)?);
                 }
                 format!("({})", emitted.join(", "))
             } else {
-                emit_expr_with_mode(scrut_raw, defs, ctors, mode)?
+                emit_expr_with_ctx(scrut_raw, ctx, mode)?
             };
 
             let parsed_arms: Vec<(String, String)> = if lines.len() > 1 {
@@ -1051,17 +1689,51 @@ pub(crate) fn emit_expr_with_mode(
             };
 
             let mut rust_arms = Vec::new();
+            let mut any_guarded = false;
             for (pat, arm_body) in parsed_arms {
-                let (rust_pat, bindings) = emit_match_pattern(&pat, scrut_parts.len(), ctors)?;
-                let emitted_body = emit_expr_with_mode(&arm_body, defs, ctors, mode)?;
-                if bindings.is_empty() {
-                    rust_arms.push(format!("        {rust_pat} => {emitted_body},"));
+                let (rust_pat, pat_state) = emit_match_pattern(&pat, scrut_parts.len(), ctors)?;
+                let mut arm_clone_vars = ctx.clone_vars.clone();
+                for (var, _) in &pat_state.bound_vars {
+                    arm_clone_vars.remove(var);
+                }
+                if !ctx.has_generics {
+                    for (var, field_ty) in &pat_state.bound_vars {
+                        let maybe_non_copy = match field_ty.as_deref() {
+                            Some("_") => !ctx.type_env.non_copy_types.is_empty(),
+                            Some(ty) => type_contains_non_copy(ty, &ctx.type_env.non_copy_types),
+                            None => false,
+                        };
+                        if maybe_non_copy && count_ident_uses(&arm_body, var) > 1 {
+                            arm_clone_vars.insert(var.clone());
+                        }
+                    }
+                }
+                let arm_ctx = EmitCtx {
+                    defs: ctx.defs,
+                    type_env: ctx.type_env,
+                    clone_vars: &arm_clone_vars,
+                    has_generics: ctx.has_generics,
+                };
+                let emitted_body = emit_expr_with_ctx(&arm_body, &arm_ctx, mode)?;
+                let guard_clause = if pat_state.guards.is_empty() {
+                    String::new()
+                } else {
+                    any_guarded = true;
+                    format!(" if {}", pat_state.guards.join(" && "))
+                };
+                if pat_state.bindings.is_empty() {
+                    rust_arms.push(format!(
+                        "        {rust_pat}{guard_clause} => {emitted_body},"
+                    ));
                 } else {
                     rust_arms.push(format!(
-                        "        {rust_pat} => {{ {} {emitted_body} }},",
-                        bindings.join(" ")
+                        "        {rust_pat}{guard_clause} => {{ {} {emitted_body} }},",
+                        pat_state.bindings.join(" ")
                     ));
                 }
+            }
+            if any_guarded {
+                rust_arms.push("        _ => unreachable!(),".to_string());
             }
             return Ok(format!(
                 "match {rust_scrut} {{\n{}\n    }}",
@@ -1095,9 +1767,9 @@ pub(crate) fn emit_expr_with_mode(
             if let Some((cond, then_b)) = split_top_level_once(before_else, ':') {
                 return Ok(format!(
                     "if {} {{ {} }} else {{ {} }}",
-                    emit_expr_with_mode(cond, defs, ctors, mode)?,
-                    emit_expr_with_mode(then_b, defs, ctors, mode)?,
-                    emit_expr_with_mode(after_else, defs, ctors, mode)?
+                    emit_expr_with_ctx(cond, ctx, mode)?,
+                    emit_expr_with_ctx(then_b, ctx, mode)?,
+                    emit_expr_with_ctx(after_else, ctx, mode)?
                 ));
             }
         }
@@ -1110,26 +1782,62 @@ pub(crate) fn emit_expr_with_mode(
         if tuple_parts.len() >= 2 {
             let mut emitted = Vec::with_capacity(tuple_parts.len());
             for p in &tuple_parts {
-                emitted.push(emit_expr_with_mode(p, defs, ctors, mode)?);
+                emitted.push(emit_expr_with_ctx(p, ctx, mode)?);
             }
             return Ok(format!("({})", emitted.join(", ")));
         }
         if let Some((term_part, ty_part)) = split_top_level_once(inner, ':') {
             let inner_mode = arith_mode_for_type(ty_part, mode);
-            return emit_expr_with_mode(term_part, defs, ctors, inner_mode);
+            return emit_expr_with_ctx(term_part, ctx, inner_mode);
         }
-        return emit_expr_with_mode(inner, defs, ctors, mode);
+        return emit_expr_with_ctx(inner, ctx, mode);
+    }
+
+    // List literal sugar: [] or [e1, e2, ...]
+    if is_wrapped_in_brackets(s) {
+        let inner = s[1..s.len() - 1].trim();
+        if inner.is_empty() {
+            return Ok("List::Nil".to_string());
+        }
+        let elems = split_top_level(inner, ',');
+        let mut acc = "List::Nil".to_string();
+        for elem in elems.into_iter().rev() {
+            let emitted = emit_expr_with_ctx(elem, ctx, mode)?;
+            acc = format!("List::Con({emitted}, Box::new({acc}))");
+        }
+        return Ok(acc);
     }
 
     // Handle single-line let bindings: let x = val; body
     if let Some(rest) = s.strip_prefix("let ") {
         if let Some((binding, body)) = split_top_level_once(rest, ';') {
             if let Some((name, val)) = split_top_level_once(binding, '=') {
+                let mut body_clone_vars = ctx.clone_vars.clone();
+                let bound_names = extract_let_bound_names(name);
+                for b in &bound_names {
+                    body_clone_vars.remove(b);
+                }
+                if !ctx.has_generics
+                    && !ctx.type_env.non_copy_types.is_empty()
+                    && !is_obviously_copy_expr(val)
+                {
+                    for b in bound_names {
+                        if count_ident_uses(body, &b) > 1 {
+                            body_clone_vars.insert(b);
+                        }
+                    }
+                }
+                let body_ctx = EmitCtx {
+                    defs: ctx.defs,
+                    type_env: ctx.type_env,
+                    clone_vars: &body_clone_vars,
+                    has_generics: ctx.has_generics,
+                };
                 return Ok(format!(
                     "{{\n        let {} = {};\n        {}\n    }}",
                     clean_let_binding(name),
-                    emit_expr_with_mode(val, defs, ctors, mode)?,
-                    emit_expr_with_mode(body, defs, ctors, mode)?
+                    emit_expr_with_ctx(val, ctx, mode)?,
+                    emit_expr_with_ctx(body, &body_ctx, mode)?
                 ));
             }
         }
@@ -1140,16 +1848,16 @@ pub(crate) fn emit_expr_with_mode(
         if let Some((lhs, rhs)) = split_top_level_str(s, op) {
             return Ok(format!(
                 "({} {op} {})",
-                emit_expr_with_mode(lhs, defs, ctors, mode)?,
-                emit_expr_with_mode(rhs, defs, ctors, mode)?
+                emit_expr_with_ctx(lhs, ctx, mode)?,
+                emit_expr_with_ctx(rhs, ctx, mode)?
             ));
         }
     }
 
     // Right-to-left top-level '+' or '-' (checked add / saturating sub for Nat; wrapping for U32/U64/I32/I64)
     if let Some((op, lhs, rhs)) = split_last_additive(s) {
-        let l = emit_expr_with_mode(lhs, defs, ctors, mode)?;
-        let r = emit_expr_with_mode(rhs, defs, ctors, mode)?;
+        let l = emit_expr_with_ctx(lhs, ctx, mode)?;
+        let r = emit_expr_with_ctx(rhs, ctx, mode)?;
         return Ok(match (mode, op) {
             (ArithMode::NatChecked, '+') => {
                 format!("({l}).checked_add({r}).expect(\"rusty-bends: Nat overflow\")")
@@ -1163,8 +1871,8 @@ pub(crate) fn emit_expr_with_mode(
 
     // Right-to-left top-level '*', '/', '%'
     if let Some((op, lhs, rhs)) = split_last_multiplicative(s) {
-        let l = emit_expr_with_mode(lhs, defs, ctors, mode)?;
-        let r = emit_expr_with_mode(rhs, defs, ctors, mode)?;
+        let l = emit_expr_with_ctx(lhs, ctx, mode)?;
+        let r = emit_expr_with_ctx(rhs, ctx, mode)?;
         return Ok(match (mode, op) {
             (ArithMode::NatChecked, '*') => {
                 format!("({l}).checked_mul({r}).expect(\"rusty-bends: Nat overflow\")")
@@ -1188,10 +1896,7 @@ pub(crate) fn emit_expr_with_mode(
 
     // Unary boolean negation
     if let Some(operand) = s.strip_prefix('!') {
-        return Ok(format!(
-            "!({})",
-            emit_expr_with_mode(operand, defs, ctors, mode)?
-        ));
+        return Ok(format!("!({})", emit_expr_with_ctx(operand, ctx, mode)?));
     }
 
     // Real Bend 2 curly-brace ADT constructor: Draft{}, Paid{amt}, OrderState.Paid{10n}
@@ -1203,16 +1908,25 @@ pub(crate) fn emit_expr_with_mode(
             if args_inner.is_empty() {
                 return Ok(rust_ctor);
             }
+            let info_opt = ctors.get(callee);
             let parts = split_top_level(args_inner, ',');
             let mut emitted_args = Vec::with_capacity(parts.len());
-            for a in parts {
+            for (idx, a) in parts.iter().enumerate() {
                 let trimmed = a.trim();
                 let val = if let Some((_, v)) = split_top_level_once(trimmed, ':') {
                     v
                 } else {
                     trimmed
                 };
-                emitted_args.push(emit_expr_with_mode(val, defs, ctors, mode)?);
+                let emitted = emit_expr_with_ctx(val, ctx, mode)?;
+                let is_boxed = info_opt
+                    .and_then(|i| i.boxed_fields.get(idx).copied())
+                    .unwrap_or(false);
+                if is_boxed {
+                    emitted_args.push(format!("Box::new({emitted})"));
+                } else {
+                    emitted_args.push(emitted);
+                }
             }
             return Ok(format!("{rust_ctor}({})", emitted_args.join(", ")));
         }
@@ -1230,14 +1944,20 @@ pub(crate) fn emit_expr_with_mode(
             };
 
             // Built-in Bend 2.0.40 Base stdlib helpers (Nat.*, Bool.*, Pair.*) -> zero-overhead Rust
-            if let Some(builtin) = emit_base_builtin(callee, &raw_args, defs, ctors, mode)? {
+            if let Some(builtin) = emit_base_builtin(callee, &raw_args, ctx, mode)? {
                 return Ok(builtin);
             }
 
             if let Some(info) = ctors.get(callee) {
                 let mut emitted_args = Vec::with_capacity(raw_args.len());
-                for a in &raw_args {
-                    emitted_args.push(emit_expr_with_mode(a, defs, ctors, mode)?);
+                for (idx, a) in raw_args.iter().enumerate() {
+                    let emitted = emit_expr_with_ctx(a, ctx, mode)?;
+                    let is_boxed = info.boxed_fields.get(idx).copied().unwrap_or(false);
+                    if is_boxed {
+                        emitted_args.push(format!("Box::new({emitted})"));
+                    } else {
+                        emitted_args.push(emitted);
+                    }
                 }
                 return Ok(format!(
                     "{}::{}({})",
@@ -1257,7 +1977,7 @@ pub(crate) fn emit_expr_with_mode(
                         }
                     }
                 }
-                emitted_args.push(emit_expr_with_mode(arg, defs, ctors, mode)?);
+                emitted_args.push(emit_expr_with_ctx(arg, ctx, mode)?);
             }
             return Ok(format!(
                 "{}({})",
@@ -1281,17 +2001,20 @@ pub(crate) fn emit_expr_with_mode(
         }
     }
 
+    if ctx.clone_vars.contains(s) {
+        return Ok(format!("{s}.clone()"));
+    }
+
     Ok(s.replace('.', "::"))
 }
 
 fn emit_base_builtin(
     callee: &str,
     raw_args: &[&str],
-    defs: &HashMap<String, &Def>,
-    ctors: &HashMap<String, CtorInfo>,
+    ctx: &EmitCtx<'_>,
     mode: ArithMode,
 ) -> Result<Option<String>, String> {
-    let e = |a: &str, m: ArithMode| emit_expr_with_mode(a, defs, ctors, m);
+    let e = |a: &str, m: ArithMode| emit_expr_with_ctx(a, ctx, m);
     Ok(match (callee, raw_args.len()) {
         // Unary Bool / Nat / Pair helpers
         ("Bool.not", 1) => Some(format!("(!({}))", e(raw_args[0], mode)?)),
@@ -1445,8 +2168,8 @@ fn split_case_arms(arms_str: &str) -> Vec<String> {
         }
         for ch in tok.chars() {
             match ch {
-                '(' | '{' => depth += 1,
-                ')' | '}' => depth -= 1,
+                '(' | '{' | '[' => depth += 1,
+                ')' | '}' | ']' => depth -= 1,
                 _ => {}
             }
         }
@@ -1473,8 +2196,8 @@ fn split_fat_arrow(arm: &str) -> Option<(&str, &str)> {
     let bytes = arm.as_bytes();
     for i in 0..bytes.len().saturating_sub(1) {
         match bytes[i] {
-            b'(' | b'{' => depth += 1,
-            b')' | b'}' => depth -= 1,
+            b'(' | b'{' | b'[' => depth += 1,
+            b')' | b'}' | b']' => depth -= 1,
             b'=' if depth == 0 && bytes[i + 1] == b'>' => {
                 return Some((arm[..i].trim(), arm[i + 2..].trim()));
             }
@@ -1489,8 +2212,8 @@ fn split_keyword<'a>(s: &'a str, needle: &str) -> Option<(&'a str, &'a str)> {
     let bytes = s.as_bytes();
     for i in 0..bytes.len() {
         match bytes[i] {
-            b'(' | b'{' => depth += 1,
-            b')' | b'}' => depth -= 1,
+            b'(' | b'{' | b'[' => depth += 1,
+            b')' | b'}' | b']' => depth -= 1,
             _ if depth == 0 && s[i..].starts_with(needle) => {
                 return Some((s[..i].trim(), s[i + needle.len()..].trim()));
             }
@@ -1505,8 +2228,8 @@ pub(crate) fn split_top_level_str<'a>(s: &'a str, op: &str) -> Option<(&'a str, 
     let bytes = s.as_bytes();
     for i in 0..bytes.len() {
         match bytes[i] {
-            b'(' | b'{' => depth += 1,
-            b')' | b'}' => depth -= 1,
+            b'(' | b'{' | b'[' => depth += 1,
+            b')' | b'}' | b']' => depth -= 1,
             _ if depth == 0 && i > 0 && s[i..].starts_with(op) => {
                 if (op == "<" || op == ">") && i + 1 < bytes.len() && bytes[i + 1] == b'=' {
                     continue;
@@ -1529,14 +2252,44 @@ fn is_valid_path_ident(s: &str) -> bool {
 }
 
 pub(crate) fn is_wrapped_in_parens(s: &str) -> bool {
-    if !(s.starts_with('(') && s.ends_with(')')) {
+    is_wrapped_in_delims(s, '(', ')')
+}
+
+fn is_wrapped_in_brackets(s: &str) -> bool {
+    is_wrapped_in_delims(s, '[', ']')
+}
+
+fn is_wrapped_in_delims(s: &str, open: char, close: char) -> bool {
+    if !(s.starts_with(open) && s.ends_with(close)) {
         return false;
     }
     let mut depth = 0i32;
     for (idx, ch) in s.char_indices() {
+        if ch == open {
+            depth += 1;
+        } else if ch == close {
+            depth -= 1;
+            if depth == 0 && idx < s.len() - close.len_utf8() {
+                return false;
+            }
+        }
+    }
+    depth == 0
+}
+
+fn is_wrapped_in_angles(s: &str) -> bool {
+    if !(s.starts_with('<') && s.ends_with('>')) {
+        return false;
+    }
+    let bytes = s.as_bytes();
+    let mut depth = 0i32;
+    for (idx, ch) in s.char_indices() {
         match ch {
-            '(' => depth += 1,
-            ')' => {
+            '<' => depth += 1,
+            '>' => {
+                if idx > 0 && bytes[idx - 1] == b'-' {
+                    continue;
+                }
                 depth -= 1;
                 if depth == 0 && idx < s.len() - 1 {
                     return false;
@@ -1546,6 +2299,54 @@ pub(crate) fn is_wrapped_in_parens(s: &str) -> bool {
         }
     }
     depth == 0
+}
+
+pub(crate) fn split_type_args(s: &str, delim: char) -> Vec<&str> {
+    let mut parts = Vec::new();
+    let mut depth = 0i32;
+    let mut start = 0;
+    let bytes = s.as_bytes();
+    for (idx, ch) in s.char_indices() {
+        match ch {
+            '(' | '{' | '[' | '<' => depth += 1,
+            ')' | '}' | ']' => depth -= 1,
+            '>' => {
+                if idx > 0 && bytes[idx - 1] == b'-' {
+                    continue;
+                }
+                depth -= 1;
+            }
+            c if c == delim && depth == 0 => {
+                parts.push(s[start..idx].trim());
+                start = idx + ch.len_utf8();
+            }
+            _ => {}
+        }
+    }
+    parts.push(s[start..].trim());
+    parts
+}
+
+fn split_type_args_once(s: &str, delim: char) -> Option<(&str, &str)> {
+    let mut depth = 0i32;
+    let bytes = s.as_bytes();
+    for (idx, ch) in s.char_indices() {
+        match ch {
+            '(' | '{' | '[' | '<' => depth += 1,
+            ')' | '}' | ']' => depth -= 1,
+            '>' => {
+                if idx > 0 && bytes[idx - 1] == b'-' {
+                    continue;
+                }
+                depth -= 1;
+            }
+            c if c == delim && depth == 0 => {
+                return Some((s[..idx].trim(), s[idx + ch.len_utf8()..].trim()));
+            }
+            _ => {}
+        }
+    }
+    None
 }
 
 pub(crate) fn unwrap_outer_parens(s: &str) -> &str {
@@ -1562,8 +2363,8 @@ pub(crate) fn split_top_level(s: &str, delim: char) -> Vec<&str> {
     let mut start = 0;
     for (idx, ch) in s.char_indices() {
         match ch {
-            '(' | '{' => depth += 1,
-            ')' | '}' => depth -= 1,
+            '(' | '{' | '[' => depth += 1,
+            ')' | '}' | ']' => depth -= 1,
             c if c == delim && depth == 0 => {
                 parts.push(s[start..idx].trim());
                 start = idx + ch.len_utf8();
@@ -1579,8 +2380,8 @@ pub(crate) fn split_top_level_once(s: &str, delim: char) -> Option<(&str, &str)>
     let mut depth = 0i32;
     for (idx, ch) in s.char_indices() {
         match ch {
-            '(' | '{' => depth += 1,
-            ')' | '}' => depth -= 1,
+            '(' | '{' | '[' => depth += 1,
+            ')' | '}' | ']' => depth -= 1,
             c if c == delim && depth == 0 => {
                 return Some((s[..idx].trim(), s[idx + ch.len_utf8()..].trim()));
             }
@@ -1596,8 +2397,8 @@ fn split_last_additive(s: &str) -> Option<(char, &str, &str)> {
     let bytes = s.as_bytes();
     for (idx, ch) in s.char_indices() {
         match ch {
-            '(' | '{' => depth += 1,
-            ')' | '}' => depth -= 1,
+            '(' | '{' | '[' => depth += 1,
+            ')' | '}' | ']' => depth -= 1,
             '+' | '-' if depth == 0 && idx > 0 => {
                 if ch == '-' && idx + 1 < bytes.len() && bytes[idx + 1] == b'>' {
                     continue;
@@ -1615,8 +2416,8 @@ fn split_last_multiplicative(s: &str) -> Option<(char, &str, &str)> {
     let mut found = None;
     for (idx, ch) in s.char_indices() {
         match ch {
-            '(' | '{' => depth += 1,
-            ')' | '}' => depth -= 1,
+            '(' | '{' | '[' => depth += 1,
+            ')' | '}' | ']' => depth -= 1,
             '*' | '/' | '%' if depth == 0 && idx > 0 => {
                 found = Some((ch, s[..idx].trim(), s[idx + ch.len_utf8()..].trim()));
             }
@@ -1996,7 +2797,7 @@ def one_liner(n: Nat) -> Nat: Nat.add(n, 1n)
             .contains("pub fn one_liner(n: u64) -> u64"));
         assert!(!summary.rust_source.contains("add_zero_eq"));
         assert!(summary.rust_source.contains(
-            "#[allow(unused_variables, unused_parens, clippy::let_and_return, clippy::double_parens, clippy::unnecessary_cast)]"
+            "#[allow(unused_variables, unused_parens, unreachable_patterns, irrefutable_let_patterns, clippy::let_and_return, clippy::double_parens, clippy::unnecessary_cast, clippy::clone_on_copy, clippy::match_like_matches_macro)]"
         ));
     }
 
@@ -2141,6 +2942,189 @@ def px_net_span_match(a: Nat, b: Nat, span: Nat) -> Bool:
         assert!(
             compile.status.success(),
             "rustc failed: {}",
+            String::from_utf8_lossy(&compile.stderr)
+        );
+        let run = std::process::Command::new(&bin_path)
+            .output()
+            .expect("run compiled binary");
+        assert!(run.status.success(), "runtime assertions failed");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn emits_recursive_adts_with_box_indirection_and_non_copy_handling() {
+        // Covers Issue #9: self-recursion (Chain), non-recursive wrapper (Wrap),
+        // mutual recursion (Tree/Forest), nested boxed patterns, and multi-use non-Copy +c.
+        let src = r#"import Base
+
+type Chain is Data:
+  ChainEnd{}
+  ChainLink{has_limit: Bool, limit: Nat, in_use: Nat, rest: Chain}
+
+type Wrap is Data:
+  Wrap{inner: Chain}
+
+type Tree is Data:
+  Leaf{val: Nat}
+  Branch{children: Forest}
+
+type Forest is Data:
+  FEmpty{}
+  FCons{head: Tree, tail: Forest}
+
+def chain_step(+so_far: Nat, has_limit: Bool, limit: Nat, in_use: Nat) -> Nat:
+  match has_limit:
+    case True{}:
+      Nat.min(so_far, Nat.sub(limit, in_use))
+    case False{}:
+      so_far
+
+def chain_available(c: Chain, +so_far: Nat) -> Nat:
+  match c:
+    case ChainEnd{}:
+      so_far
+    case ChainLink{h, l, u, rest}:
+      chain_available(rest, chain_step(so_far, h, l, u))
+
+def chain_is_two_deep(c: Chain) -> Bool:
+  match c:
+    case ChainEnd{}:
+      False{}
+    case ChainLink{_, _, _, ChainEnd{}}:
+      False{}
+    case ChainLink{_, _, _, ChainLink{_, _, _, ChainEnd{}}}:
+      True{}
+    case ChainLink{_, _, _, _}:
+      False{}
+
+def chain_head_sum_plus_rest(+c: Chain) -> Nat:
+  match c:
+    case ChainEnd{}:
+      0n
+    case ChainLink{_, l, _, rest}:
+      Nat.add(l, chain_available(rest, chain_available(c, 100n)))
+
+def unwrap_available(w: Wrap, +so_far: Nat) -> Nat:
+  match w:
+    case Wrap{inner}:
+      chain_available(inner, so_far)
+
+def sum_tree(t: Tree) -> Nat:
+  match t:
+    case Leaf{v}:
+      v
+    case Branch{children}:
+      sum_forest(children)
+
+def sum_forest(f: Forest) -> Nat:
+  match f:
+    case FEmpty{}:
+      0n
+    case FCons{head, tail}:
+      Nat.add(sum_tree(head), sum_forest(tail))
+"#;
+        let summary = emit_verified_rust(src, 0).expect("recursive ADTs should emit");
+        // Chain: non-Copy + boxed rest
+        assert!(summary.rust_source.contains(
+            "#[derive(Debug, Clone, PartialEq, Eq)]\npub enum Chain {\n    ChainEnd,\n    ChainLink(bool, u64, u64, Box<Chain>),\n}"
+        ), "got:\n{}", summary.rust_source);
+        // Wrap: non-recursive (no Box), but non-Copy because it contains Chain
+        assert!(
+            summary.rust_source.contains(
+                "#[derive(Debug, Clone, PartialEq, Eq)]\npub enum Wrap {\n    Wrap(Chain),\n}"
+            ),
+            "got:\n{}",
+            summary.rust_source
+        );
+        // Mutual recursion: Tree <-> Forest both boxed and non-Copy
+        assert!(summary.rust_source.contains("Branch(Box<Forest>),"));
+        assert!(summary
+            .rust_source
+            .contains("FCons(Box<Tree>, Box<Forest>),"));
+        // Multi-use +c clones when passed multiple times
+        assert!(summary.rust_source.contains("c.clone()"));
+
+        let dir = std::env::temp_dir().join(format!("rb_rec_adt_{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let rs_path = dir.join("rec_adt.rs");
+        let bin_path = dir.join("rec_adt_bin");
+        let harness = format!(
+            "{}\nfn main() {{\n    let c = Chain::ChainLink(true, 40, 10, Box::new(Chain::ChainLink(false, 99, 0, Box::new(Chain::ChainEnd))));\n    assert_eq!(chain_available(c.clone(), 50), 30);\n    assert!(chain_is_two_deep(c.clone()));\n    assert!(!chain_is_two_deep(Chain::ChainEnd));\n    assert!(!chain_is_two_deep(Chain::ChainLink(true, 1, 0, Box::new(Chain::ChainEnd))));\n    assert_eq!(unwrap_available(Wrap::Wrap(c.clone()), 100), 30);\n    assert_eq!(chain_head_sum_plus_rest(c), 40 + 30);\n    let tr = Tree::Branch(Box::new(Forest::FCons(Box::new(Tree::Leaf(4)), Box::new(Forest::FCons(Box::new(Tree::Leaf(6)), Box::new(Forest::FEmpty))))));\n    assert_eq!(sum_tree(tr), 10);\n}}\n",
+            summary.rust_source
+        );
+        std::fs::write(&rs_path, harness).unwrap();
+        let rustc = std::env::var("RUSTC").unwrap_or_else(|_| "rustc".to_string());
+        let compile = std::process::Command::new(&rustc)
+            .args(["--edition", "2021", "-D", "warnings", "-o"])
+            .arg(&bin_path)
+            .arg(&rs_path)
+            .output()
+            .expect("rustc must run");
+        assert!(
+            compile.status.success(),
+            "rustc failed:\n{}\nsource:\n{}",
+            String::from_utf8_lossy(&compile.stderr),
+            summary.rust_source
+        );
+        let run = std::process::Command::new(&bin_path)
+            .output()
+            .expect("run compiled binary");
+        assert!(run.status.success(), "runtime assertions failed");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn emits_base_list_and_list_literals_and_compiles_with_rustc() {
+        let src = r#"import Base
+
+def sum_list(xs: List<&2, Nat>) -> Nat:
+  match xs:
+    case Nil{}:
+      0n
+    case Con{h, t}:
+      Nat.add(h, sum_list(t))
+
+def list_cat(xs: List<&2, Nat>, ys: List<&2, Nat>) -> List<&2, Nat>:
+  match xs:
+    case Nil{}:
+      ys
+    case Con{h, t}:
+      Con{h, list_cat(t, ys)}
+
+def sample_list() -> List<&2, Nat>:
+  [1n, 2n, 3n]
+"#;
+        let summary = emit_verified_rust(src, 0).expect("Base List should emit");
+        assert!(summary.rust_source.contains("pub enum List<T>"));
+        assert!(summary.rust_source.contains("Con(T, Box<List<T>>)"));
+        assert!(summary
+            .rust_source
+            .contains("pub fn sum_list(xs: List<u64>) -> u64"));
+        assert!(summary
+            .rust_source
+            .contains("List::Con(1_u64, Box::new(List::Con(2_u64, Box::new(List::Con(3_u64, Box::new(List::Nil))))))"));
+
+        let dir = std::env::temp_dir().join(format!("rb_base_list_{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let rs_path = dir.join("list.rs");
+        let bin_path = dir.join("list_bin");
+        let harness = format!(
+            "{}\nfn main() {{\n    let s = sample_list();\n    assert_eq!(sum_list(s.clone()), 6);\n    assert_eq!(sum_list(list_cat(s.clone(), s)), 12);\n    assert_eq!(sum_list(List::Nil), 0);\n}}\n",
+            summary.rust_source
+        );
+        std::fs::write(&rs_path, harness).unwrap();
+        let rustc = std::env::var("RUSTC").unwrap_or_else(|_| "rustc".to_string());
+        let compile = std::process::Command::new(&rustc)
+            .args(["--edition", "2021", "-D", "warnings", "-o"])
+            .arg(&bin_path)
+            .arg(&rs_path)
+            .output()
+            .expect("rustc must run");
+        assert!(
+            compile.status.success(),
+            "rustc failed:\n{}",
             String::from_utf8_lossy(&compile.stderr)
         );
         let run = std::process::Command::new(&bin_path)

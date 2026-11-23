@@ -10,8 +10,9 @@
 //! one diagnostic line per law (`CAUGHT` or `SURVIVED`) without failing on them.
 
 use crate::emit::{
-    build_ctor_map, emit_items_to_rust, leading_indent, parse_book_items, split_case_arm,
-    split_top_level, split_top_level_once, CtorInfo, Def, Quantity, TypeDef,
+    collect_law_source_slices, emit_items_to_rust, leading_indent, parse_book_items,
+    split_case_arm, split_top_level, split_top_level_once, CtorInfo, Def, Quantity, TypeDef,
+    TypeEnv,
 };
 use crate::law_test::{
     create_temp_eval_dir, emit_eval_law_checker, emit_pool_runtime_helpers, law_dependency_cone,
@@ -71,7 +72,7 @@ struct MutateCtx<'a> {
     defs: &'a [Def],
     def_map: &'a HashMap<String, &'a Def>,
     type_map: &'a HashMap<String, &'a TypeDef>,
-    ctor_map: &'a HashMap<String, CtorInfo>,
+    type_env: &'a TypeEnv,
     out_dir: &'a Path,
 }
 
@@ -110,7 +111,8 @@ pub fn run_mutation_checks(
     }
 
     let (types, defs) = parse_book_items(combined_source)?;
-    let ctor_map = build_ctor_map(&types);
+    let extra_sources = collect_law_source_slices(&all_laws);
+    let type_env = TypeEnv::build(&types, &defs, &extra_sources);
     let def_map: HashMap<String, &Def> = defs.iter().map(|d| (d.name.clone(), d)).collect();
     let type_map: HashMap<String, &TypeDef> = types.iter().map(|t| (t.name.clone(), t)).collect();
 
@@ -127,7 +129,7 @@ pub fn run_mutation_checks(
         defs: &defs,
         def_map: &def_map,
         type_map: &type_map,
-        ctor_map: &ctor_map,
+        type_env: &type_env,
         out_dir,
     };
 
@@ -240,7 +242,7 @@ fn check_single_law(
         }
     }
 
-    let mutants = generate_mutants_for_cone(&cone_defs, ctx.def_map, ctx.ctor_map);
+    let mutants = generate_mutants_for_cone(&cone_defs, ctx.def_map, &ctx.type_env.ctor_map);
     if mutants.is_empty() {
         return Ok(LawMutationReport {
             law_name: law.name.clone(),
@@ -260,7 +262,7 @@ fn check_single_law(
         ctx.defs,
         ctx.def_map,
         ctx.type_map,
-        ctx.ctor_map,
+        ctx.type_env,
         true,
     ) {
         return Ok(LawMutationReport {
@@ -287,7 +289,7 @@ fn check_single_law(
         ctx.types,
         &cone_defs,
         ctx.type_map,
-        ctx.ctor_map,
+        ctx.type_env,
         ctx.out_dir,
     )?;
     Ok(LawMutationReport {
@@ -307,10 +309,10 @@ fn evaluate_mutants_batch(
     types: &[TypeDef],
     cone_defs: &[Def],
     type_map: &HashMap<String, &TypeDef>,
-    ctor_map: &HashMap<String, CtorInfo>,
+    type_env: &TypeEnv,
     out_dir: &Path,
 ) -> Result<Option<(String, String)>, String> {
-    match run_mutant_harness(law, mutants, types, cone_defs, type_map, ctor_map, out_dir) {
+    match run_mutant_harness(law, mutants, types, cone_defs, type_map, type_env, out_dir) {
         Ok(res) => Ok(res),
         Err(_) => {
             // If one mutant produced a Rust compile/type error inside a combined module,
@@ -322,7 +324,7 @@ fn evaluate_mutants_batch(
                     types,
                     cone_defs,
                     type_map,
-                    ctor_map,
+                    type_env,
                     out_dir,
                 ) {
                     return Ok(Some(hit));
@@ -339,16 +341,16 @@ fn run_mutant_harness(
     types: &[TypeDef],
     cone_defs: &[Def],
     type_map: &HashMap<String, &TypeDef>,
-    ctor_map: &HashMap<String, CtorInfo>,
+    type_env: &TypeEnv,
     out_dir: &Path,
 ) -> Result<Option<(String, String)>, String> {
     let mut program = String::new();
     program.push_str("#![allow(clippy::all, non_snake_case, unused_variables, unused_parens, dead_code, unused_mut)]\n");
 
-    let types_only = emit_items_to_rust(types, &[], ctor_map, 0, None)?;
+    let types_only = emit_items_to_rust(types, &[], type_env, 0, None, true)?;
     program.push_str(&types_only.rust_source);
     program.push('\n');
-    program.push_str(&emit_pool_runtime_helpers(types, type_map, true));
+    program.push_str(&emit_pool_runtime_helpers(types, type_map, type_env, true));
     program.push('\n');
 
     let mut active_indices = Vec::new();
@@ -359,7 +361,8 @@ fn run_mutant_harness(
                 d.body = mutant.mutated_body.clone();
             }
         }
-        let Ok(defs_rs) = emit_items_to_rust(&[], &mut_defs, ctor_map, 0, Some(10_000)) else {
+        let Ok(defs_rs) = emit_items_to_rust(&[], &mut_defs, type_env, 0, Some(10_000), false)
+        else {
             continue;
         };
         let mut_def_map: HashMap<String, &Def> =
@@ -370,7 +373,7 @@ fn run_mutant_harness(
             &mut_defs,
             &mut_def_map,
             type_map,
-            ctor_map,
+            type_env,
             true,
         ) else {
             continue;

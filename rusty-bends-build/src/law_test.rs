@@ -5,10 +5,10 @@
 //! the emitted Rust code (catching translation bugs and `Nat`/`u64` edge divergence).
 
 use crate::emit::{
-    arith_mode_for_type, bend_type_to_rust, build_ctor_map, emit_expr_with_mode,
+    arith_mode_for_type, bend_type_to_rust, collect_law_source_slices, emit_expr_with_mode,
     emit_items_to_rust, is_top_level_start, is_wrapped_in_parens, parse_book_items,
-    split_top_level, split_top_level_once, split_top_level_str, strip_comment, ArithMode, CtorInfo,
-    Def, TypeDef,
+    parse_list_elem_type, split_top_level_once, split_top_level_str, split_type_args,
+    strip_comment, type_contains_non_copy, ArithMode, Def, TypeDef, TypeEnv,
 };
 use crate::lock;
 use std::collections::{BTreeSet, HashMap, HashSet, VecDeque};
@@ -95,7 +95,7 @@ fn parse_single_law_block(block: &str) -> Option<ParsedLaw> {
         if header_raw.trim_end().ends_with(')') {
             let inner = header_raw[open + 1..header_raw.trim_end().len() - 1].trim();
             if !inner.is_empty() {
-                for clause in split_top_level(inner, ',') {
+                for clause in split_type_args(inner, ',') {
                     let c = clause.trim();
                     if let Some(after_for) = c.strip_prefix("for ") {
                         parse_clause_binder(after_for, &mut vars, &mut hypotheses);
@@ -410,7 +410,7 @@ pub(crate) fn emit_law_tests_module(
     laws: &[ParsedLaw],
     types: &[TypeDef],
     defs: &[Def],
-    ctor_map: &HashMap<String, CtorInfo>,
+    type_env: &TypeEnv,
 ) -> String {
     if laws.is_empty() {
         return String::new();
@@ -424,7 +424,9 @@ pub(crate) fn emit_law_tests_module(
     out.push_str("#[allow(clippy::all, non_snake_case, unused_variables, unused_parens, dead_code, unused_mut)]\n");
     out.push_str("mod __rusty_bends_law_tests {\n");
     out.push_str("    use super::*;\n\n");
-    out.push_str(&emit_pool_runtime_helpers(types, &type_map, false));
+    out.push_str(&emit_pool_runtime_helpers(
+        types, &type_map, type_env, false,
+    ));
 
     let mut used_fn_names: HashSet<String> = HashSet::new();
     for (idx, law) in laws.iter().enumerate() {
@@ -434,7 +436,7 @@ pub(crate) fn emit_law_tests_module(
             used_fn_names.insert(fn_name.clone());
         }
         out.push_str(&emit_single_law_test(
-            &fn_name, law, types, defs, &def_map, &type_map, ctor_map,
+            &fn_name, law, types, defs, &def_map, &type_map, type_env,
         ));
         out.push('\n');
     }
@@ -463,6 +465,7 @@ pub(crate) fn sanitize_ident(s: &str) -> String {
 pub(crate) fn emit_pool_runtime_helpers(
     types: &[TypeDef],
     type_map: &HashMap<String, &TypeDef>,
+    type_env: &TypeEnv,
     eval_mode: bool,
 ) -> String {
     let mut s = String::new();
@@ -623,17 +626,59 @@ pub(crate) fn emit_pool_runtime_helpers(
 "#,
     );
 
+    if type_env.uses_builtin_list {
+        s.push_str(
+            r#"
+    fn __rb_pool_list<T: Clone>(elems: &[T], depth: usize) -> Vec<List<T>> {
+        let mut out = vec![List::Nil];
+        if depth == 0 || elems.is_empty() {
+            return out;
+        }
+        let sub = __rb_pool_list(elems, depth - 1);
+        for e in &elems[..elems.len().min(4)] {
+            out.push(List::Con(e.clone(), Box::new(List::Nil)));
+        }
+        for (i, e) in elems[..elems.len().min(4)].iter().enumerate() {
+            if let Some(tail) = sub.get((i + 1) % sub.len()) {
+                out.push(List::Con(e.clone(), Box::new(tail.clone())));
+            }
+            if sub.len() > 1 {
+                out.push(List::Con(e.clone(), Box::new(sub[sub.len() - 1].clone())));
+            }
+        }
+        out
+    }
+
+"#,
+        );
+    }
+
     let empty_params = HashSet::new();
     for td in types {
-        s.push_str(&emit_adt_pool_fn(td, type_map, &empty_params, eval_mode));
+        s.push_str(&emit_adt_pool_fn(
+            td,
+            type_map,
+            type_env,
+            &empty_params,
+            eval_mode,
+        ));
         s.push('\n');
     }
     s
 }
 
+fn wrap_ctor_pool_arg(arg_expr: String, is_boxed: bool) -> String {
+    if is_boxed {
+        format!("Box::new({arg_expr})")
+    } else {
+        arg_expr
+    }
+}
+
 fn emit_adt_pool_fn(
     td: &TypeDef,
     type_map: &HashMap<String, &TypeDef>,
+    type_env: &TypeEnv,
     type_params: &HashSet<String>,
     eval_mode: bool,
 ) -> String {
@@ -654,6 +699,12 @@ fn emit_adt_pool_fn(
             "        "
         };
         let next_depth = if has_adt_field { "depth - 1" } else { "depth" };
+        let info_opt = type_env.ctor_map.get(&format!("{}.{}", td.name, v.name));
+        let field_is_boxed = |fi: usize| -> bool {
+            info_opt
+                .and_then(|c| c.boxed_fields.get(fi).copied())
+                .unwrap_or(false)
+        };
         let supported_fields = v
             .field_types
             .iter()
@@ -673,9 +724,10 @@ fn emit_adt_pool_fn(
                 "recursive",
                 next_depth,
             );
+            let pushed = wrap_ctor_pool_arg("f0".to_string(), field_is_boxed(0));
             s.push_str(&format!("{indent}for f0 in {expr} {{\n"));
             s.push_str(&format!(
-                "{indent}    out.push({}::{}(f0));\n",
+                "{indent}    out.push({}::{}({pushed}));\n",
                 td.name, v.name
             ));
             s.push_str(&format!("{indent}}}\n"));
@@ -700,7 +752,7 @@ fn emit_adt_pool_fn(
                 loop_ind.push_str("    ");
             }
             let small_args = (0..v.field_types.len())
-                .map(|fi| format!("__s{fi}.clone()"))
+                .map(|fi| wrap_ctor_pool_arg(format!("__s{fi}.clone()"), field_is_boxed(fi)))
                 .collect::<Vec<_>>()
                 .join(", ");
             s.push_str(&format!(
@@ -719,7 +771,12 @@ fn emit_adt_pool_fn(
             ));
             s.push_str(&format!("{inner_indent}for __i in 0..__limit {{\n"));
             let args_sweep = (0..v.field_types.len())
-                .map(|fi| format!("__f{fi}[__i % __f{fi}.len()].clone()"))
+                .map(|fi| {
+                    wrap_ctor_pool_arg(
+                        format!("__f{fi}[__i % __f{fi}.len()].clone()"),
+                        field_is_boxed(fi),
+                    )
+                })
                 .collect::<Vec<_>>()
                 .join(", ");
             s.push_str(&format!(
@@ -728,7 +785,12 @@ fn emit_adt_pool_fn(
             ));
             s.push_str(&format!("{inner_indent}}}\n"));
             let edge_args = (0..v.field_types.len())
-                .map(|fi| format!("__f{fi}[__f{fi}.len() - 1].clone()"))
+                .map(|fi| {
+                    wrap_ctor_pool_arg(
+                        format!("__f{fi}[__f{fi}.len() - 1].clone()"),
+                        field_is_boxed(fi),
+                    )
+                })
                 .collect::<Vec<_>>()
                 .join(", ");
             s.push_str(&format!(
@@ -739,7 +801,12 @@ fn emit_adt_pool_fn(
                 s.push_str(&format!("{inner_indent}for _ in 0..4 {{\n"));
                 let args_rng = (0..v.field_types.len())
                     .map(|fi| {
-                        format!("__f{fi}[(__rb_next_u64(rng) as usize) % __f{fi}.len()].clone()")
+                        wrap_ctor_pool_arg(
+                            format!(
+                                "__f{fi}[(__rb_next_u64(rng) as usize) % __f{fi}.len()].clone()"
+                            ),
+                            field_is_boxed(fi),
+                        )
                     })
                     .collect::<Vec<_>>()
                     .join(", ");
@@ -766,12 +833,15 @@ fn type_references_adt(ty: &str, type_map: &HashMap<String, &TypeDef>) -> bool {
     }
     if is_wrapped_in_parens(t) {
         let inner = t[1..t.len() - 1].trim();
-        let parts = split_top_level(inner, ',');
+        let parts = split_type_args(inner, ',');
         return parts.iter().any(|p| type_references_adt(p, type_map));
     }
-    let amp = split_top_level(t, '&');
+    let amp = split_type_args(t, '&');
     if amp.len() > 1 {
         return amp.iter().any(|p| type_references_adt(p, type_map));
+    }
+    if let Some(elem) = parse_list_elem_type(t) {
+        return type_references_adt(elem, type_map);
     }
     false
 }
@@ -787,7 +857,7 @@ pub(crate) fn can_generate_pool(
     }
     if is_wrapped_in_parens(t) {
         let inner = t[1..t.len() - 1].trim();
-        let parts = split_top_level(inner, ',');
+        let parts = split_type_args(inner, ',');
         if parts.len() > 1 {
             return parts
                 .iter()
@@ -795,11 +865,14 @@ pub(crate) fn can_generate_pool(
         }
         return can_generate_pool(inner, type_map, type_params);
     }
-    let amp = split_top_level(t, '&');
+    let amp = split_type_args(t, '&');
     if amp.len() > 1 {
         return amp
             .iter()
             .all(|p| can_generate_pool(p, type_map, type_params));
+    }
+    if let Some(elem) = parse_list_elem_type(t) {
+        return can_generate_pool(elem, type_map, type_params);
     }
     matches!(
         t,
@@ -818,15 +891,19 @@ pub(crate) fn emit_pool_expr(
     let t = ty.trim();
     if is_wrapped_in_parens(t) {
         let inner = t[1..t.len() - 1].trim();
-        let parts = split_top_level(inner, ',');
+        let parts = split_type_args(inner, ',');
         if parts.len() > 1 {
             return emit_tuple_pool_expr(&parts, type_map, type_params, recursive_expr, depth_expr);
         }
         return emit_pool_expr(inner, type_map, type_params, recursive_expr, depth_expr);
     }
-    let amp = split_top_level(t, '&');
+    let amp = split_type_args(t, '&');
     if amp.len() > 1 {
         return emit_tuple_pool_expr(&amp, type_map, type_params, recursive_expr, depth_expr);
+    }
+    if let Some(elem) = parse_list_elem_type(t) {
+        let elem_pool = emit_pool_expr(elem, type_map, type_params, recursive_expr, depth_expr);
+        return format!("__rb_pool_list(&{elem_pool}, {depth_expr})");
     }
     match t {
         "Nat" => format!("__rb_pool_nat(rng, {recursive_expr})"),
@@ -889,7 +966,7 @@ fn emit_single_law_test(
     defs: &[Def],
     def_map: &HashMap<String, &Def>,
     type_map: &HashMap<String, &TypeDef>,
-    ctor_map: &HashMap<String, CtorInfo>,
+    type_env: &TypeEnv,
 ) -> String {
     if let Some(reason) = &law.unsupported_reason {
         return format!("    // Skipped law {}: {reason}\n", law.name);
@@ -912,24 +989,32 @@ fn emit_single_law_test(
         }
     }
 
+    let law_clone_vars: HashSet<String> = runtime_vars
+        .iter()
+        .filter(|v| type_contains_non_copy(&v.ty, &type_env.non_copy_types))
+        .map(|v| v.name.clone())
+        .collect();
+
     let default_mode = arith_mode_for_type(&law.eq_ty, ArithMode::NatChecked);
-    let lhs_rs = match emit_expr_with_mode(&law.lhs, def_map, ctor_map, default_mode) {
-        Ok(s) => s,
-        Err(e) => return format!("    // Skipped law {}: {e}\n", law.name),
-    };
-    let rhs_rs = match emit_expr_with_mode(&law.rhs, def_map, ctor_map, default_mode) {
-        Ok(s) => s,
-        Err(e) => return format!("    // Skipped law {}: {e}\n", law.name),
-    };
+    let lhs_rs =
+        match emit_expr_with_mode(&law.lhs, def_map, type_env, &law_clone_vars, default_mode) {
+            Ok(s) => s,
+            Err(e) => return format!("    // Skipped law {}: {e}\n", law.name),
+        };
+    let rhs_rs =
+        match emit_expr_with_mode(&law.rhs, def_map, type_env, &law_clone_vars, default_mode) {
+            Ok(s) => s,
+            Err(e) => return format!("    // Skipped law {}: {e}\n", law.name),
+        };
 
     let mut hyp_pairs = Vec::new();
     for h in &law.hypotheses {
         let h_mode = arith_mode_for_type(&h.ty, ArithMode::NatChecked);
-        let hl = match emit_expr_with_mode(&h.lhs, def_map, ctor_map, h_mode) {
+        let hl = match emit_expr_with_mode(&h.lhs, def_map, type_env, &law_clone_vars, h_mode) {
             Ok(s) => s,
             Err(e) => return format!("    // Skipped law {}: {e}\n", law.name),
         };
-        let hr = match emit_expr_with_mode(&h.rhs, def_map, ctor_map, h_mode) {
+        let hr = match emit_expr_with_mode(&h.rhs, def_map, type_env, &law_clone_vars, h_mode) {
             Ok(s) => s,
             Err(e) => return format!("    // Skipped law {}: {e}\n", law.name),
         };
@@ -1096,7 +1181,7 @@ fn bend_type_to_rust_with_u64_params(ty: &str, type_params: &HashSet<String>) ->
     }
     if is_wrapped_in_parens(t) {
         let inner = t[1..t.len() - 1].trim();
-        let parts = split_top_level(inner, ',');
+        let parts = split_type_args(inner, ',');
         if parts.len() > 1 {
             let mapped = parts
                 .into_iter()
@@ -1107,7 +1192,7 @@ fn bend_type_to_rust_with_u64_params(ty: &str, type_params: &HashSet<String>) ->
         }
         return bend_type_to_rust_with_u64_params(inner, type_params);
     }
-    let amp = split_top_level(t, '&');
+    let amp = split_type_args(t, '&');
     if amp.len() > 1 {
         let mapped = amp
             .into_iter()
@@ -1115,6 +1200,12 @@ fn bend_type_to_rust_with_u64_params(ty: &str, type_params: &HashSet<String>) ->
             .collect::<Vec<_>>()
             .join(", ");
         return format!("({mapped})");
+    }
+    if let Some(elem) = parse_list_elem_type(t) {
+        return format!(
+            "List<{}>",
+            bend_type_to_rust_with_u64_params(elem, type_params)
+        );
     }
     bend_type_to_rust(t, type_params)
 }
@@ -1201,8 +1292,9 @@ pub fn evaluate_laws_for_counterexamples(
     out_dir: &Path,
 ) -> Result<Vec<LawEvalOutcome>, String> {
     let (types, defs) = parse_book_items(combined_source)?;
-    let ctor_map = build_ctor_map(&types);
     let all_laws = parse_laws(combined_source);
+    let extra_sources = collect_law_source_slices(&all_laws);
+    let type_env = TypeEnv::build(&types, &defs, &extra_sources);
 
     let targets: Vec<&ParsedLaw> = if target_law_names.is_empty() {
         all_laws.iter().collect()
@@ -1220,7 +1312,7 @@ pub fn evaluate_laws_for_counterexamples(
     let def_map: HashMap<String, &Def> = defs.iter().map(|d| (d.name.clone(), d)).collect();
     let type_map: HashMap<String, &TypeDef> = types.iter().map(|t| (t.name.clone(), t)).collect();
 
-    let runtime = emit_items_to_rust(&types, &defs, &ctor_map, 0, Some(10_000))?;
+    let runtime = emit_items_to_rust(&types, &defs, &type_env, 0, Some(10_000), true)?;
     let mut outcomes: Vec<LawEvalOutcome> = Vec::new();
     let mut runnable: Vec<(&ParsedLaw, String)> = Vec::new();
     let mut law_by_name: HashMap<String, &ParsedLaw> = HashMap::new();
@@ -1233,7 +1325,7 @@ pub fn evaluate_laws_for_counterexamples(
             &defs,
             &def_map,
             &type_map,
-            &ctor_map,
+            &type_env,
             false,
         ) {
             Ok(code) => runnable.push((law, code)),
@@ -1252,7 +1344,9 @@ pub fn evaluate_laws_for_counterexamples(
     program.push_str("#![allow(clippy::all, non_snake_case, unused_variables, unused_parens, dead_code, unused_mut)]\n");
     program.push_str(&runtime.rust_source);
     program.push('\n');
-    program.push_str(&emit_pool_runtime_helpers(&types, &type_map, true));
+    program.push_str(&emit_pool_runtime_helpers(
+        &types, &type_map, &type_env, true,
+    ));
     for (_, code) in &runnable {
         program.push_str(code);
         program.push('\n');
@@ -1308,7 +1402,7 @@ pub(crate) fn emit_eval_law_checker(
     defs: &[Def],
     def_map: &HashMap<String, &Def>,
     type_map: &HashMap<String, &TypeDef>,
-    ctor_map: &HashMap<String, CtorInfo>,
+    type_env: &TypeEnv,
     compact_mutant_mode: bool,
 ) -> Result<String, String> {
     if let Some(reason) = &law.unsupported_reason {
@@ -1329,15 +1423,21 @@ pub(crate) fn emit_eval_law_checker(
         }
     }
 
+    let law_clone_vars: HashSet<String> = runtime_vars
+        .iter()
+        .filter(|v| type_contains_non_copy(&v.ty, &type_env.non_copy_types))
+        .map(|v| v.name.clone())
+        .collect();
+
     let default_mode = arith_mode_for_type(&law.eq_ty, ArithMode::NatChecked);
-    let lhs_rs = emit_expr_with_mode(&law.lhs, def_map, ctor_map, default_mode)?;
-    let rhs_rs = emit_expr_with_mode(&law.rhs, def_map, ctor_map, default_mode)?;
+    let lhs_rs = emit_expr_with_mode(&law.lhs, def_map, type_env, &law_clone_vars, default_mode)?;
+    let rhs_rs = emit_expr_with_mode(&law.rhs, def_map, type_env, &law_clone_vars, default_mode)?;
 
     let mut hyp_pairs = Vec::new();
     for h in &law.hypotheses {
         let h_mode = arith_mode_for_type(&h.ty, ArithMode::NatChecked);
-        let hl = emit_expr_with_mode(&h.lhs, def_map, ctor_map, h_mode)?;
-        let hr = emit_expr_with_mode(&h.rhs, def_map, ctor_map, h_mode)?;
+        let hl = emit_expr_with_mode(&h.lhs, def_map, type_env, &law_clone_vars, h_mode)?;
+        let hr = emit_expr_with_mode(&h.rhs, def_map, type_env, &law_clone_vars, h_mode)?;
         hyp_pairs.push((hl, hr));
     }
 

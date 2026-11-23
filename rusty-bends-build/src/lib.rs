@@ -869,4 +869,141 @@ def deposit_zero(bal):
 
         let _ = fs::remove_dir_all(&root);
     }
+
+    #[test]
+    fn issue9_recursive_chain_and_base_list_laws_verify_and_run_generated_rust_tests() {
+        let root = temp_workspace("issue9_recursive");
+        let chain_file = root.join("verified/chain.bend");
+        let list_file = root.join("verified/lists.bend");
+
+        fs::write(
+            &chain_file,
+            r#"import Base
+
+type Chain is Data:
+  ChainEnd{}
+  ChainLink{has_limit: Bool, limit: Nat, in_use: Nat, rest: Chain}
+
+def chain_step(+so_far: Nat, has_limit: Bool, limit: Nat, in_use: Nat) -> Nat:
+  match has_limit:
+    case True{}:
+      Nat.min(so_far, Nat.sub(limit, in_use))
+    case False{}:
+      so_far
+
+def chain_available(c: Chain, +so_far: Nat) -> Nat:
+  match c:
+    case ChainEnd{}:
+      so_far
+    case ChainLink{h, l, u, rest}:
+      chain_available(rest, chain_step(so_far, h, l, u))
+
+# promise: zero starting host capacity stays zero along any cgroup chain
+law chain_available_zero:
+  for c: Chain
+  {chain_available(c, 0n) == 0n : Nat}
+
+def chain_available_zero(c):
+  match c:
+    case ChainEnd{}:
+      {==}
+    case ChainLink{h, l, u, rest}:
+      match h:
+        case True{}:
+          chain_available_zero(rest)
+        case False{}:
+          chain_available_zero(rest)
+"#,
+        )
+        .unwrap();
+
+        fs::write(
+            &list_file,
+            r#"import Base
+
+def sum_list(xs: List<&2, Nat>) -> Nat:
+  match xs:
+    case Nil{}:
+      0n
+    case Con{h, t}:
+      Nat.add(h, sum_list(t))
+
+def list_cat(xs: List<&2, Nat>, ys: List<&2, Nat>) -> List<&2, Nat>:
+  match xs:
+    case Nil{}:
+      ys
+    case Con{h, t}:
+      Con{h, list_cat(t, ys)}
+
+def add_assoc(a: Nat, b: Nat, c: Nat) -> {Nat.add(a, Nat.add(b, c)) == Nat.add(Nat.add(a, b), c) : Nat}:
+  match a:
+    case 0n:
+      {==}
+    case 1n+ap:
+      %add_assoc(ap, b, c) : {1n+Nat.add(ap, Nat.add(b, c)) == 1n+_ : Nat}
+      {==}
+
+# promise: summing two concatenated lists equals the sum of their individual sums
+law sum_list_cat:
+  for +xs: List<&2, Nat>
+  for +ys: List<&2, Nat>
+  {sum_list(list_cat(xs, ys)) == Nat.add(sum_list(xs), sum_list(ys)) : Nat}
+
+def sum_list_cat(xs, ys):
+  match xs:
+    case Nil{}:
+      {==}
+    case Con{+h, +t}:
+      %Equal.sym(Nat, sum_list(list_cat(t, ys)), Nat.add(sum_list(t), sum_list(ys)), sum_list_cat(t, ys)) : {Nat.add(h, _) == Nat.add(Nat.add(h, sum_list(t)), sum_list(ys)) : Nat}
+      add_assoc(h, sum_list(t), sum_list(ys))
+"#,
+        )
+        .unwrap();
+
+        let mut cfg = make_cfg(&root);
+        cfg.bend_bin = resolve_bend_bin(
+            env::var("BEND_BIN").ok(),
+            env::var_os("PATH"),
+            env::var_os("HOME").map(PathBuf::from),
+        );
+        cfg.verdict_mode = if has_verdict_runtime() {
+            VerdictMode::Require
+        } else {
+            VerdictMode::Off
+        };
+
+        let out_rs = run(&cfg)
+            .expect("recursive Chain and Base List laws must pass bend, mutation check, and emit")
+            .expect("expected emitted verified.rs");
+        let emitted = fs::read_to_string(&out_rs).unwrap();
+        assert!(emitted.contains("ChainLink(bool, u64, u64, Box<Chain>),"));
+        assert!(emitted.contains("pub enum List<T>"));
+        assert!(emitted.contains("fn law_chain_available_zero()"));
+        assert!(emitted.contains("fn law_sum_list_cat()"));
+
+        let bin_path = root.join("out/test_bin");
+        let rustc = env::var("RUSTC").unwrap_or_else(|_| "rustc".to_string());
+        let compile = Command::new(&rustc)
+            .args(["--edition", "2021", "--test", "-D", "warnings", "-o"])
+            .arg(&bin_path)
+            .arg(&out_rs)
+            .output()
+            .expect("rustc --test must execute");
+        assert!(
+            compile.status.success(),
+            "rustc --test failed:\n{}",
+            String::from_utf8_lossy(&compile.stderr)
+        );
+        let run_tests = Command::new(&bin_path)
+            .output()
+            .expect("generated law test binary must run");
+        assert!(
+            run_tests.status.success(),
+            "generated law tests failed:\n{}{}",
+            String::from_utf8_lossy(&run_tests.stdout),
+            String::from_utf8_lossy(&run_tests.stderr)
+        );
+
+        let _ = fs::remove_dir_all(&root);
+    }
 }
