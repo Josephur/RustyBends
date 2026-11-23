@@ -710,7 +710,7 @@ fn find_matching_brace(s: &str) -> Option<usize> {
 
 /// SiblingCtor: replaces a constructor of the function's return type with each sibling
 /// constructor of the same type (same fields when the shapes match, small filler values
-/// otherwise), so absorbing-state laws like `step(Stopped{}, e) == Stopped{}` are caught.
+/// otherwise), so absorbing-state laws like `step(Done{}, e) == Done{}` are caught.
 fn mutate_sibling_ctor(
     def: &Def,
     ctor_map: &HashMap<String, CtorInfo>,
@@ -899,7 +899,7 @@ fn mutate_return_ctor(
 
 /// NatLit: changes a `Nat` literal `k` to `0n`, `k + 1`, and `k - 1` (at most
 /// `MAX_NAT_LIT_SITES_PER_DEF` sites per function). All `-> 0n` mutants come first, so
-/// "zero is rejected" laws guarded by a constant such as `Nat.is_eq(dh, 256n)` are caught.
+/// "zero is rejected" laws guarded by a constant such as `Nat.is_eq(width, 256n)` are caught.
 fn mutate_nat_lit(body: &str, protected: &[(usize, usize)]) -> Vec<(String, String)> {
     let bytes = body.as_bytes();
     let is_ident = |b: u8| b.is_ascii_alphanumeric() || b == b'_';
@@ -969,7 +969,7 @@ fn is_bare_var_ident(
 
 /// BoolConst: replaces a `Bool` variable with `True{}` / `False{}`. Applies to every use of a
 /// live `Bool` parameter, and to bare variables in returned positions of a `Bool` function, so
-/// implication laws such as `Bool.or(valid(c), Bool.not(forces(c)))` are caught.
+/// implication laws such as `Bool.or(allowed(c), Bool.not(requires(c)))` are caught.
 fn mutate_bool_const(
     def: &Def,
     def_map: &HashMap<String, &Def>,
@@ -1903,25 +1903,25 @@ law f_reflexive:
 
         let src = r#"import Base
 
-type Pool is Data:
-  Pool{alloc: Nat, free: Nat}
+type Bin is Data:
+  Bin{alloc: Nat, free: Nat}
 
-def pool_cap(+p: Pool) -> Nat:
+def bin_capacity(+p: Bin) -> Nat:
   match p:
-    case Pool{alloc, free}:
+    case Bin{alloc, free}:
       Nat.add(alloc, free)
 
-def pool_alloc_if(+alloc: Nat, +free: Nat, +req: Nat, ok: Bool) -> Pool:
+def bin_take_if(+alloc: Nat, +free: Nat, +req: Nat, ok: Bool) -> Bin:
   match ok:
     case True{}:
-      Pool{Nat.add(alloc, req), Nat.sub(free, req)}
+      Bin{Nat.add(alloc, req), Nat.sub(free, req)}
     case False{}:
-      Pool{alloc, free}
+      Bin{alloc, free}
 
-def pool_alloc(+p: Pool, +req: Nat) -> Pool:
+def bin_take(+p: Bin, +req: Nat) -> Bin:
   match p:
-    case Pool{alloc, +free}:
-      pool_alloc_if(alloc, free, req, Nat.is_le(req, free))
+    case Bin{alloc, +free}:
+      bin_take_if(alloc, free, req, Nat.is_le(req, free))
 
 def add_zero_sym(+a: Nat) -> {a == Nat.add(a, 0n) : Nat}:
   match a:
@@ -1939,13 +1939,13 @@ def add_succ_sym(+a: Nat, +b: Nat) -> {1n+Nat.add(a, b) == Nat.add(a, 1n+b) : Na
       %add_succ_sym(ap, b) : {1n+1n+Nat.add(ap, b) == 1n+_ : Nat}
       {==}
 
-def alloc_step(
+def take_step(
   +rp: Nat,
   +fp: Nat,
   +alloc: Nat,
   ok: Bool,
-  ih: {pool_cap(pool_alloc_if(alloc, fp, rp, ok)) == Nat.add(alloc, fp) : Nat}
-) -> {pool_cap(pool_alloc_if(alloc, 1n+fp, 1n+rp, ok)) == Nat.add(alloc, 1n+fp) : Nat}:
+  ih: {bin_capacity(bin_take_if(alloc, fp, rp, ok)) == Nat.add(alloc, fp) : Nat}
+) -> {bin_capacity(bin_take_if(alloc, 1n+fp, 1n+rp, ok)) == Nat.add(alloc, 1n+fp) : Nat}:
   match ok:
     case False{}:
       {==}
@@ -1955,7 +1955,7 @@ def alloc_step(
       %ih : {1n+Nat.add(Nat.add(alloc, rp), Nat.sub(fp, rp)) == 1n+_ : Nat}
       {==}
 
-def alloc_if_shift(+req: Nat, +free: Nat, +alloc: Nat) -> {pool_cap(pool_alloc_if(alloc, free, req, Nat.is_le(req, free))) == Nat.add(alloc, free) : Nat}:
+def take_if_shift(+req: Nat, +free: Nat, +alloc: Nat) -> {bin_capacity(bin_take_if(alloc, free, req, Nat.is_le(req, free))) == Nat.add(alloc, free) : Nat}:
   match req free:
     case 0n 0n:
       %add_zero_sym(Nat.add(alloc, 0n)) : {_ == Nat.add(alloc, 0n) : Nat}
@@ -1966,17 +1966,17 @@ def alloc_if_shift(+req: Nat, +free: Nat, +alloc: Nat) -> {pool_cap(pool_alloc_i
     case 1n+rp 0n:
       {==}
     case 1n+rp 1n+fp:
-      alloc_step(rp, fp, alloc, Nat.is_le(rp, fp), alloc_if_shift(rp, fp, alloc))
+      take_step(rp, fp, alloc, Nat.is_le(rp, fp), take_if_shift(rp, fp, alloc))
 
-# promise: allocation conserves total pool capacity
-law alloc_conserves_capacity:
+# promise: taking from a bin conserves its total capacity
+law take_conserves_capacity:
   for +alloc: Nat
   for +free: Nat
   for +req: Nat
-  {pool_cap(pool_alloc(Pool{alloc, free}, req)) == Nat.add(alloc, free) : Nat}
+  {bin_capacity(bin_take(Bin{alloc, free}, req)) == Nat.add(alloc, free) : Nat}
 
-def alloc_conserves_capacity(alloc, free, req):
-  alloc_if_shift(req, free, alloc)
+def take_conserves_capacity(alloc, free, req):
+  take_if_shift(req, free, alloc)
 "#;
         fs::write(&core, src).unwrap();
 
@@ -2174,88 +2174,88 @@ law empty_tautology:
     fn nat_bound_catches_one_direction_bound_law() {
         let src = r#"import Base
 
-def px_redirect_left(+l: Nat) -> Nat:
+def budget_after_step(+l: Nat) -> Nat:
   match l:
     case 0n:
       0n
     case 1n+p:
       p
 
-# promise: following a redirect never grows the remaining redirect budget
-law px_redirect_budget_never_grows:
+# promise: taking a step never grows the remaining budget
+law step_budget_never_grows:
   for +l: Nat
-  {Nat.is_le(px_redirect_left(l), l) == True{} : Bool}
+  {Nat.is_le(budget_after_step(l), l) == True{} : Bool}
 "#;
-        assert_new_operator_catches(src, "px_redirect_budget_never_grows", "NatBound", "bound");
+        assert_new_operator_catches(src, "step_budget_never_grows", "NatBound", "bound");
     }
 
     #[test]
     fn sibling_ctor_catches_absorbing_state_law() {
         let src = r#"import Base
 
-type Phase is Data:
-  Ringing{n: Nat}
-  Talking{n: Nat}
-  Stopped{}
+type Job is Data:
+  Queued{n: Nat}
+  Running{n: Nat}
+  Done{}
 
-def call_step(+s: Phase, +ev: Nat) -> Phase:
+def job_step(+s: Job, +ev: Nat) -> Job:
   match s:
-    case Ringing{n}:
-      Talking{Nat.add(n, ev)}
-    case Talking{n}:
-      Talking{n}
-    case Stopped{}:
-      Stopped{}
+    case Queued{n}:
+      Running{Nat.add(n, ev)}
+    case Running{n}:
+      Running{n}
+    case Done{}:
+      Done{}
 
-# promise: a stopped call stays stopped whatever event arrives
-law call_stopped_absorbing:
+# promise: a finished job stays finished whatever event arrives
+law done_job_absorbing:
   for +ev: Nat
-  {call_step(Stopped{}, ev) == Stopped{} : Phase}
+  {job_step(Done{}, ev) == Done{} : Job}
 "#;
-        assert_new_operator_catches(src, "call_stopped_absorbing", "SiblingCtor", "absorb");
+        assert_new_operator_catches(src, "done_job_absorbing", "SiblingCtor", "absorb");
     }
 
     #[test]
     fn bool_const_catches_implication_law() {
         let src = r#"import Base
 
-def valid(+c: Nat, +tools_given: Bool) -> Bool:
+def allowed(+c: Nat, +granted: Bool) -> Bool:
   match c:
     case 0n:
       True{}
     case 1n+k:
-      tools_given
+      granted
 
-def forces(+c: Nat, +tools_given: Bool) -> Bool:
+def requires(+c: Nat, +granted: Bool) -> Bool:
   match c:
     case 0n:
       False{}
     case 1n+k:
-      tools_given
+      granted
 
-# promise: whenever a config forces tools, it is valid
-law forced_implies_valid:
+# promise: whenever a request requires a grant, it is allowed
+law required_implies_allowed:
   for +c: Nat
   for +g: Bool
-  {Bool.or(valid(c, g), Bool.not(forces(c, g))) == True{} : Bool}
+  {Bool.or(allowed(c, g), Bool.not(requires(c, g))) == True{} : Bool}
 "#;
-        assert_new_operator_catches(src, "forced_implies_valid", "BoolConst", "implies");
+        assert_new_operator_catches(src, "required_implies_allowed", "BoolConst", "implies");
     }
 
     #[test]
     fn flip_cmp_catches_strict_refusal_law() {
         let src = r#"import Base
 
-def media_count_ok(+count: Nat, +max: Nat) -> Bool:
+def count_within_limit(+count: Nat, +max: Nat) -> Bool:
   Nat.is_le(count, max)
 
-# promise: a media count above the limit is always refused
-law media_count_refuses_overflow:
+# promise: a count above the limit is always refused
+law count_above_limit_refused:
   for +m: Nat
   for +extra: Nat
-  {media_count_ok(Nat.add(Nat.add(1n, m), extra), m) == False{} : Bool}
+  {count_within_limit(Nat.add(Nat.add(1n, m), extra), m) == False{} : Bool}
 "#;
-        assert_new_operator_catches(src, "media_count_refuses_overflow", "FlipCmp", "refuse");
+        assert_new_operator_catches(src, "count_above_limit_refused", "FlipCmp", "refuse");
     }
 
     #[test]
@@ -2294,32 +2294,32 @@ law media_count_refuses_overflow:
     fn return_ctor_catches_fallthrough_variable_absorbing_law() {
         let src = r#"import Base
 
-type CallPhase is Data:
-  CpText{}
-  CpBlock{}
-  CpStopped{}
+type Stage is Data:
+  Draft{}
+  Review{}
+  Final{}
 
-type CallEvent is Data:
-  CeOpen{}
-  CeClose{}
+type StageEvent is Data:
+  Submit{}
+  Approve{}
 
-def call_step(p: CallPhase, ev: CallEvent) -> CallPhase:
+def stage_step(p: Stage, ev: StageEvent) -> Stage:
   match p ev:
-    case CpText{} CeOpen{}:
-      CpBlock{}
-    case CpBlock{} CeClose{}:
-      CpStopped{}
+    case Draft{} Submit{}:
+      Review{}
+    case Review{} Approve{}:
+      Final{}
     case st _:
       st
 
-# promise: a stopped call stays stopped whatever event arrives
-law call_stopped_absorbing:
-  for ev: CallEvent
-  {call_step(CpStopped{}, ev) == CpStopped{} : CallPhase}
+# promise: a final stage stays final whatever event arrives
+law final_stage_absorbing:
+  for ev: StageEvent
+  {stage_step(Final{}, ev) == Final{} : Stage}
 "#;
         assert_operator_closes_gap(
             src,
-            "call_stopped_absorbing",
+            "final_stage_absorbing",
             "ReturnCtor",
             "fallthrough",
             PRE_ISSUE15_OPS,
@@ -2330,71 +2330,71 @@ law call_stopped_absorbing:
     fn return_ctor_catches_delegated_call_classifier_law() {
         let src = r#"import Base
 
-type PxAddrClass is Data:
-  PxAcPublic{}
-  PxAcPrivate{}
-  PxAcLoopback{}
+type Size is Data:
+  Small{}
+  Medium{}
+  Large{}
 
-type PxV6 is Data:
-  PxMapped{a: Nat, b: Nat}
-  PxNative{hi: Nat}
+type Input is Data:
+  Wrapped{a: Nat, b: Nat}
+  Raw{hi: Nat}
 
-def px_v4_class(+a: Nat, +b: Nat) -> PxAddrClass:
+def pair_size(+a: Nat, +b: Nat) -> Size:
   match a:
     case 10n:
-      PxAcPrivate{}
+      Medium{}
     case 127n:
-      PxAcLoopback{}
+      Large{}
     case _:
-      PxAcPublic{}
+      Small{}
 
-def px_native_class(+hi: Nat) -> PxAddrClass:
+def raw_size(+hi: Nat) -> Size:
   match hi:
     case 0n:
-      PxAcLoopback{}
+      Large{}
     case _:
-      PxAcPublic{}
+      Small{}
 
-def px_v6_class(+v: PxV6) -> PxAddrClass:
+def input_size(+v: Input) -> Size:
   match v:
-    case PxMapped{a, b}:
-      px_v4_class(a, b)
-    case PxNative{hi}:
-      px_native_class(hi)
+    case Wrapped{a, b}:
+      pair_size(a, b)
+    case Raw{hi}:
+      raw_size(hi)
 
-# promise: an IPv4-mapped IPv6 address is classified exactly like its IPv4 address
-law px_v6_mapped_no_wider:
+# promise: a wrapped pair is sized exactly like the pair itself
+law wrapped_sized_like_pair:
   for +a: Nat
   for +b: Nat
-  {px_v6_class(PxMapped{a, b}) == px_v4_class(a, b) : PxAddrClass}
+  {input_size(Wrapped{a, b}) == pair_size(a, b) : Size}
 "#;
         assert_operator_closes_gap(
             src,
-            "px_v6_mapped_no_wider",
+            "wrapped_sized_like_pair",
             "ReturnCtor",
-            "v6call",
+            "delegated_call",
             PRE_ISSUE15_OPS,
         );
     }
 
     #[test]
     fn nat_lit_catches_zero_rejected_law() {
-        // `dh = 0` is refused because dh must equal 256n or 512n; changing a literal
+        // `width = 0` is refused because width must equal 256n or 512n; changing a literal
         // (256n -> 0n) is what breaks the law.
         let src = r#"import Base
 
-def g4_heads_valid(+nh: Nat, +nkv: Nat, +dh: Nat, +pairs: Nat) -> Bool:
-  Bool.and(Bool.or(Nat.is_eq(dh, 256n), Nat.is_eq(dh, 512n)), Nat.is_le(nkv, nh))
+def config_valid(+n: Nat, +m: Nat, +width: Nat, +extra: Nat) -> Bool:
+  Bool.and(Bool.or(Nat.is_eq(width, 256n), Nat.is_eq(width, 512n)), Nat.is_le(m, n))
 
-# promise: a zero head dimension is always rejected
-law g4_heads_zero_dh_rejected:
-  for +nh: Nat
-  for +nkv: Nat
-  for +p: Nat
-  {g4_heads_valid(nh, nkv, 0n, p) == False{} : Bool}
+# promise: a zero width is always rejected
+law zero_width_rejected:
+  for +n: Nat
+  for +m: Nat
+  for +e: Nat
+  {config_valid(n, m, 0n, e) == False{} : Bool}
 "#;
-        let dir = tmp_dir("zero_dh");
-        let caught = eval_with_ops(src, "g4_heads_zero_dh_rejected", &["NatLit"], &dir)
+        let dir = tmp_dir("zero_width");
+        let caught = eval_with_ops(src, "zero_width_rejected", &["NatLit"], &dir)
             .expect("harness compiles")
             .expect("NatLit catches the literal-guarded law");
         assert!(caught.0.contains("256n -> 0n [NatLit]"), "{caught:?}");

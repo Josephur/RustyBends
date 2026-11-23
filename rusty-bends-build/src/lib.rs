@@ -898,35 +898,35 @@ mod tests {
         );
         cfg.verdict_mode = VerdictMode::Off;
 
-        // 1. Valid locked pool_free_conserved first
+        // 1. Valid locked release_conserves_total first
         let valid_src = r#"import Base
 
-type PoolAcct is Data:
-  PoolAcct{a: Nat, f: Nat}
+type Ledger is Data:
+  Ledger{a: Nat, f: Nat}
 
-def pool_total(+p: PoolAcct) -> Nat:
+def ledger_total(+p: Ledger) -> Nat:
   match p:
-    case PoolAcct{a, f}:
+    case Ledger{a, f}:
       Nat.add(a, f)
 
-def pool_free_if(+a: Nat, +f: Nat, +rel: Nat, ok: Bool) -> PoolAcct:
+def ledger_release_if(+a: Nat, +f: Nat, +rel: Nat, ok: Bool) -> Ledger:
   match ok:
     case True{}:
-      PoolAcct{Nat.sub(a, rel), Nat.add(f, rel)}
+      Ledger{Nat.sub(a, rel), Nat.add(f, rel)}
     case False{}:
-      PoolAcct{a, f}
+      Ledger{a, f}
 
-def pool_free(+p: PoolAcct, +rel: Nat) -> PoolAcct:
+def ledger_release(+p: Ledger, +rel: Nat) -> Ledger:
   match p:
-    case PoolAcct{+a, f}:
-      pool_free_if(a, f, rel, Nat.is_le(rel, a))
+    case Ledger{+a, f}:
+      ledger_release_if(a, f, rel, Nat.is_le(rel, a))
 
-# promise: freeing from a pool conserves total capacity
-law pool_free_conserved:
+# promise: releasing from a ledger conserves its total
+law release_conserves_total:
   for +a: Nat
   for +f: Nat
   for +rel: Nat
-  {pool_total(pool_free(PoolAcct{a, f}, rel)) == Nat.add(a, f) : Nat}
+  {ledger_total(ledger_release(Ledger{a, f}, rel)) == Nat.add(a, f) : Nat}
 "#;
         // Seed the lock as if the law was previously sealed, then break the function (False{} drops sub, adding rel unconditionally).
         fs::write(&core, valid_src).unwrap();
@@ -934,43 +934,43 @@ law pool_free_conserved:
 
         let broken_src = r#"import Base
 
-type PoolAcct is Data:
-  PoolAcct{a: Nat, f: Nat}
+type Ledger is Data:
+  Ledger{a: Nat, f: Nat}
 
-def pool_total(+p: PoolAcct) -> Nat:
+def ledger_total(+p: Ledger) -> Nat:
   match p:
-    case PoolAcct{a, f}:
+    case Ledger{a, f}:
       Nat.add(a, f)
 
-def pool_free_if(+a: Nat, +f: Nat, +rel: Nat, ok: Bool) -> PoolAcct:
+def ledger_release_if(+a: Nat, +f: Nat, +rel: Nat, ok: Bool) -> Ledger:
   match ok:
     case True{}:
-      PoolAcct{Nat.sub(a, rel), Nat.add(f, rel)}
+      Ledger{Nat.sub(a, rel), Nat.add(f, rel)}
     case False{}:
-      PoolAcct{a, Nat.add(f, rel)}
+      Ledger{a, Nat.add(f, rel)}
 
-def pool_free(+p: PoolAcct, +rel: Nat) -> PoolAcct:
+def ledger_release(+p: Ledger, +rel: Nat) -> Ledger:
   match p:
-    case PoolAcct{+a, f}:
-      pool_free_if(a, f, rel, Nat.is_le(rel, a))
+    case Ledger{+a, f}:
+      ledger_release_if(a, f, rel, Nat.is_le(rel, a))
 
-# promise: freeing from a pool conserves total capacity
-law pool_free_conserved:
+# promise: releasing from a ledger conserves its total
+law release_conserves_total:
   for +a: Nat
   for +f: Nat
   for +rel: Nat
-  {pool_total(pool_free(PoolAcct{a, f}, rel)) == Nat.add(a, f) : Nat}
+  {ledger_total(ledger_release(Ledger{a, f}, rel)) == Nat.add(a, f) : Nat}
 
-def pool_free_conserved(a, f, rel):
+def release_conserves_total(a, f, rel):
   {==}
 "#;
         fs::write(&core, broken_src).unwrap();
         let err_false = run(&cfg).expect_err("broken function must fail build");
         assert!(
-            err_false.contains("[E_LAW_FALSE] law pool_free_conserved is FALSE for this code (evaluated with emitted Rust)"),
+            err_false.contains("[E_LAW_FALSE] law release_conserves_total is FALSE for this code (evaluated with emitted Rust)"),
             "expected counterexample header, got:\n{err_false}"
         );
-        assert!(err_false.contains("lhs pool_total(pool_free(PoolAcct{"));
+        assert!(err_false.contains("lhs ledger_total(ledger_release(Ledger{"));
         assert!(err_false.contains("rhs Nat.add("));
         assert!(err_false.contains("stop: the law is locked"));
 
@@ -1197,7 +1197,7 @@ type Status is Data:
   Open{}
   Closed{}
 
-def br_within(pos: Nat, limit: Nat) -> Bool:
+def within_limit(pos: Nat, limit: Nat) -> Bool:
   Nat.is_le(pos, limit)
 "#,
         )
@@ -1208,34 +1208,34 @@ def br_within(pos: Nat, limit: Nat) -> Bool:
             r#"import Base
 import base_rules.bend as B
 
-def us_both(+pos: Nat, a: Nat, b: Nat) -> Bool:
-  Bool.and(B.br_within(pos, a), Nat.is_le(pos, b))
+def within_both(+pos: Nat, a: Nat, b: Nat) -> Bool:
+  Bool.and(B.within_limit(pos, a), Nat.is_le(pos, b))
 
-def us_open_or(s: B.Status, flag: Bool) -> Bool:
+def open_or(s: B.Status, flag: Bool) -> Bool:
   match s:
     case B.Open{}: True{}
     case B.Closed{}: flag
 
-def us_diag_aux(a: Bool) -> {Bool.and(a, a) == a : Bool}:
+def diag_aux(a: Bool) -> {Bool.and(a, a) == a : Bool}:
   match a:
     case True{}: {==}
     case False{}: {==}
 
-# promise: checking both limits when they are equal matches br_within
-law us_both_diag:
+# promise: checking both limits when they are equal matches within_limit
+law within_both_diag:
   for +pos: Nat
   for +a: Nat
-  {us_both(pos, a, a) == B.br_within(pos, a) : Bool}
+  {within_both(pos, a, a) == B.within_limit(pos, a) : Bool}
 
-def us_both_diag(pos, a):
-  us_diag_aux(B.br_within(pos, a))
+def within_both_diag(pos, a):
+  diag_aux(B.within_limit(pos, a))
 
 # promise: an open status always permits the action regardless of fallback flag
-law us_open_or_open:
+law open_or_open:
   for flag: Bool
-  {us_open_or(B.Open{}, flag) == True{} : Bool}
+  {open_or(B.Open{}, flag) == True{} : Bool}
 
-def us_open_or_open(flag):
+def open_or_open(flag):
   {==}
 "#,
         )
@@ -1258,7 +1258,7 @@ def us_open_or_open(flag):
             .expect("expected emitted verified.rs");
         let emitted = fs::read_to_string(&out_rs).unwrap();
         assert!(!emitted.contains("B::"), "emitted leaked B::\n{emitted}");
-        assert!(emitted.contains("br_within(pos, a)"), "got:\n{emitted}");
+        assert!(emitted.contains("within_limit(pos, a)"), "got:\n{emitted}");
         assert!(emitted.contains("pub enum Status"), "got:\n{emitted}");
 
         let bin_path = root.join("out/test_bin");
@@ -1323,53 +1323,53 @@ def us_open_or_open(flag):
     }
 
     #[test]
-    fn tile_split_laws_verified_with_bundled_nat_lemmas() {
-        let root = temp_workspace("issue11_tile_split");
+    fn chunk_split_laws_verified_with_bundled_nat_lemmas() {
+        let root = temp_workspace("issue11_chunk_split");
         let _ = write_nat_lemmas(root.join("verified"))
             .expect("write_nat_lemmas should populate verified/");
-        let tiles = root.join("verified/tiles.bend");
+        let chunks_file = root.join("verified/chunks.bend");
         fs::write(
-            &tiles,
+            &chunks_file,
             r#"import Base
 import nat_lemmas.bend as L
 
-def tile_chunk(t: Nat, tpc: Nat) -> Nat:
-  Nat.div(t, 1n+tpc)
+def chunk_of(t: Nat, per: Nat) -> Nat:
+  Nat.div(t, 1n+per)
 
-def tile_place(t: Nat, tpc: Nat) -> Nat:
-  Nat.mod(t, 1n+tpc)
+def slot_of(t: Nat, per: Nat) -> Nat:
+  Nat.mod(t, 1n+per)
 
-def tile_offset(chunk: Nat, place: Nat, tpc: Nat) -> Nat:
-  Nat.add(place, Nat.mul(chunk, 1n+tpc))
+def index_of(chunk: Nat, slot: Nat, per: Nat) -> Nat:
+  Nat.add(slot, Nat.mul(chunk, 1n+per))
 
-# promise: every tile index maps to a place strictly below tiles_per_chunk
-law tile_place_lt:
+# promise: every index maps to a slot strictly below the chunk size
+law slot_below_size:
   for t: Nat
-  for tpc: Nat
-  {Nat.is_lt(tile_place(t, tpc), 1n+tpc) == True{} : Bool}
+  for per: Nat
+  {Nat.is_lt(slot_of(t, per), 1n+per) == True{} : Bool}
 
-def tile_place_lt(t, tpc):
-  L.nat_mod_lt(t, tpc)
+def slot_below_size(t, per):
+  L.nat_mod_lt(t, per)
 
-# promise: splitting a tile into chunk and place reconstructs the original tile index
-law tile_split_reconstructs:
+# promise: splitting an index into chunk and slot reconstructs the original index
+law split_reconstructs_index:
   for t: Nat
-  for tpc: Nat
-  {tile_offset(tile_chunk(t, tpc), tile_place(t, tpc), tpc) == t : Nat}
+  for per: Nat
+  {index_of(chunk_of(t, per), slot_of(t, per), per) == t : Nat}
 
-def tile_split_reconstructs(t, tpc):
-  L.nat_div_mod(t, tpc)
+def split_reconstructs_index(t, per):
+  L.nat_div_mod(t, per)
 
-# promise: every tile index below chunks * tiles_per_chunk maps to a chunk strictly below chunks
-law tile_chunk_in_bounds:
+# promise: every index below chunks * chunk size maps to a chunk strictly below chunks
+law chunk_in_bounds:
   for t: Nat
   for chunks: Nat
-  for tpc: Nat
-  for h: {Nat.is_lt(t, Nat.mul(chunks, 1n+tpc)) == True{} : Bool}
-  {Nat.is_lt(tile_chunk(t, tpc), chunks) == True{} : Bool}
+  for per: Nat
+  for h: {Nat.is_lt(t, Nat.mul(chunks, 1n+per)) == True{} : Bool}
+  {Nat.is_lt(chunk_of(t, per), chunks) == True{} : Bool}
 
-def tile_chunk_in_bounds(t, chunks, tpc, h):
-  L.nat_div_lt_of_lt_mul(t, chunks, tpc, h)
+def chunk_in_bounds(t, chunks, per, h):
+  L.nat_div_lt_of_lt_mul(t, chunks, per, h)
 "#,
         )
         .unwrap();
@@ -1387,12 +1387,12 @@ def tile_chunk_in_bounds(t, chunks, tpc, h):
         };
 
         let out_rs = run(&cfg)
-            .expect("tile split laws using nat_lemmas.bend must pass bend, mutation check, lock, and emit")
+            .expect("chunk split laws using nat_lemmas.bend must pass bend, mutation check, lock, and emit")
             .expect("expected emitted verified.rs");
         let emitted = fs::read_to_string(&out_rs).unwrap();
-        assert!(emitted.contains("pub fn tile_chunk("), "got:\n{emitted}");
-        assert!(emitted.contains("pub fn tile_place("), "got:\n{emitted}");
-        assert!(emitted.contains("pub fn tile_offset("), "got:\n{emitted}");
+        assert!(emitted.contains("pub fn chunk_of("), "got:\n{emitted}");
+        assert!(emitted.contains("pub fn slot_of("), "got:\n{emitted}");
+        assert!(emitted.contains("pub fn index_of("), "got:\n{emitted}");
         assert!(
             !emitted.contains("nat_mod_lt"),
             "emitted leaked proof helper:\n{emitted}"

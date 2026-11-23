@@ -10,15 +10,15 @@ fn main() {
     let total = verified::deposit(100, 25);
     let cancelled = verified::cancel_order(verified::OrderState::Paid(total));
     let shipped = verified::cancel_order(verified::OrderState::Shipped(total));
-    let reuse = verified::can_reuse_prefix(4, 8, 16);
+    let reuse = verified::is_between(4, 8, 16);
     println!(
-        "RustyBends v1 Verified Core OK -> deposit(100, 25) = {total}, cancel(Paid) = {cancelled:?}, cancel(Shipped) = {shipped:?}, can_reuse_prefix(4, 8, 16) = {reuse}"
+        "RustyBends v1 Verified Core OK -> deposit(100, 25) = {total}, cancel(Paid) = {cancelled:?}, cancel(Shipped) = {shipped:?}, is_between(4, 8, 16) = {reuse}"
     );
 }
 
 #[cfg(test)]
 mod tests {
-    use super::verified::{can_reuse_prefix, cancel_order, deposit, minus_two, OrderState};
+    use super::verified::{cancel_order, deposit, is_between, minus_two, OrderState};
 
     #[test]
     fn verified_module_runs_with_zero_runtime_proof_overhead() {
@@ -28,9 +28,9 @@ mod tests {
         assert_eq!(minus_two(2), 0);
         assert_eq!(minus_two(5), 3);
         assert_eq!(cancel_order(OrderState::Paid(50)), OrderState::Cancelled);
-        assert!(can_reuse_prefix(4, 8, 16));
-        assert!(!can_reuse_prefix(9, 8, 16));
-        assert!(!can_reuse_prefix(4, 8, 7));
+        assert!(is_between(4, 8, 16));
+        assert!(!is_between(9, 8, 16));
+        assert!(!is_between(4, 8, 7));
         assert_eq!(
             cancel_order(OrderState::Shipped(50)),
             OrderState::Shipped(50)

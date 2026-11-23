@@ -1927,20 +1927,20 @@ law legacy_law(for +a: Nat, for +b: Bool):
         // Exact reproducer from issue #5, completed with its Bend 2 proof.
         let bend_src = r#"import Base
 
-type PoolAcct is Data:
-  PoolAcct{a: Nat, f: Nat}
+type Ledger is Data:
+  Ledger{a: Nat, f: Nat}
 
-def pool_free_if(+a: Nat, +f: Nat, +rel: Nat, ok: Bool) -> PoolAcct:
+def ledger_release_if(+a: Nat, +f: Nat, +rel: Nat, ok: Bool) -> Ledger:
   match ok:
     case True{}:
-      PoolAcct{Nat.sub(a, rel), Nat.add(f, rel)}
+      Ledger{Nat.sub(a, rel), Nat.add(f, rel)}
     case False{}:
-      PoolAcct{a, f}
+      Ledger{a, f}
 
-def pool_free(+p: PoolAcct, +rel: Nat) -> PoolAcct:
+def ledger_release(+p: Ledger, +rel: Nat) -> Ledger:
   match p:
-    case PoolAcct{+a, f}:
-      pool_free_if(a, f, rel, Nat.is_le(rel, a))
+    case Ledger{+a, f}:
+      ledger_release_if(a, f, rel, Nat.is_le(rel, a))
 
 def add_le_false_lt(+a: Nat, +k: Nat) -> {False{} == Nat.is_le(Nat.add(a, 1n+k), a) : Bool}:
   match a:
@@ -1950,18 +1950,18 @@ def add_le_false_lt(+a: Nat, +k: Nat) -> {False{} == Nat.is_le(Nat.add(a, 1n+k),
       %add_le_false_lt(ap, k) : {False{} == _ : Bool}
       {==}
 
-law pool_double_free_noop:
+law over_release_is_noop:
   for +a: Nat
   for +f: Nat
   for +extra: Nat
-  {pool_free(PoolAcct{a, f}, Nat.add(a, 1n+extra)) == PoolAcct{a, f} : PoolAcct}
+  {ledger_release(Ledger{a, f}, Nat.add(a, 1n+extra)) == Ledger{a, f} : Ledger}
 
-def pool_double_free_noop(a, f, extra):
-  %add_le_false_lt(a, extra) : {pool_free_if(a, f, Nat.add(a, 1n+extra), _) == PoolAcct{a, f} : PoolAcct}
+def over_release_is_noop(a, f, extra):
+  %add_le_false_lt(a, extra) : {ledger_release_if(a, f, Nat.add(a, 1n+extra), _) == Ledger{a, f} : Ledger}
   {==}
 "#;
         let dir = tmp_dir("issue5");
-        let bend_file = dir.join("pool.bend");
+        let bend_file = dir.join("ledger.bend");
         fs::write(&bend_file, bend_src).unwrap();
 
         let bend_bin = crate::resolve_bend_bin(
@@ -1982,18 +1982,18 @@ def pool_double_free_noop(a, f, extra):
             );
         }
 
-        let summary = emit_verified_rust(bend_src, 1).expect("emit pool reproducer");
+        let summary = emit_verified_rust(bend_src, 1).expect("emit ledger reproducer");
         assert!(summary
             .rust_source
-            .contains("fn law_pool_double_free_noop()"));
+            .contains("fn law_over_release_is_noop()"));
 
         // 1. Checked Nat arithmetic passes the generated test AND explicitly refuses u64::MAX overflow.
         let overflow_check = format!(
-            "{}\n#[cfg(test)]\n#[test]\nfn overflow_panics_instead_of_saturating() {{\n    let res = std::panic::catch_unwind(|| pool_free(PoolAcct::PoolAcct(u64::MAX, 7), u64::MAX));\n    let _ = res;\n    let add_overflow = std::panic::catch_unwind(|| {{\n        let a = u64::MAX;\n        let rel = (a).checked_add((1_u64).checked_add(0).expect(\"rusty-bends: Nat overflow\")).expect(\"rusty-bends: Nat overflow\");\n        pool_free(PoolAcct::PoolAcct(a, 7), rel)\n    }});\n    assert!(add_overflow.is_err(), \"overflow in Nat.add must panic instead of saturating\");\n}}\n",
+            "{}\n#[cfg(test)]\n#[test]\nfn overflow_panics_instead_of_saturating() {{\n    let res = std::panic::catch_unwind(|| ledger_release(Ledger::Ledger(u64::MAX, 7), u64::MAX));\n    let _ = res;\n    let add_overflow = std::panic::catch_unwind(|| {{\n        let a = u64::MAX;\n        let rel = (a).checked_add((1_u64).checked_add(0).expect(\"rusty-bends: Nat overflow\")).expect(\"rusty-bends: Nat overflow\");\n        ledger_release(Ledger::Ledger(a, 7), rel)\n    }});\n    assert!(add_overflow.is_err(), \"overflow in Nat.add must panic instead of saturating\");\n}}\n",
             summary.rust_source
         );
-        let rs_ok = dir.join("pool_ok.rs");
-        let bin_ok = dir.join("pool_ok_bin");
+        let rs_ok = dir.join("ledger_ok.rs");
+        let bin_ok = dir.join("ledger_ok_bin");
         fs::write(&rs_ok, overflow_check).unwrap();
         let rustc = env::var("RUSTC").unwrap_or_else(|_| "rustc".to_string());
         let compile = Command::new(&rustc)
@@ -2015,7 +2015,7 @@ def pool_double_free_noop(a, f, extra):
             String::from_utf8_lossy(&run_ok.stderr)
         );
 
-        // 2. If the emitted Rust had saturating_add instead of checked_add, law_pool_double_free_noop MUST fail at u64::MAX!
+        // 2. If the emitted Rust had saturating_add instead of checked_add, law_over_release_is_noop MUST fail at u64::MAX!
         let buggy_sat = summary
             .rust_source
             .replace(
@@ -2030,8 +2030,8 @@ def pool_double_free_noop(a, f, extra):
                 ".checked_add(rel).expect(\"rusty-bends: Nat overflow\")",
                 ".saturating_add(rel)",
             );
-        let rs_bug = dir.join("pool_bug.rs");
-        let bin_bug = dir.join("pool_bug_bin");
+        let rs_bug = dir.join("ledger_bug.rs");
+        let bin_bug = dir.join("ledger_bug_bin");
         fs::write(&rs_bug, buggy_sat).unwrap();
         let compile_bug = Command::new(&rustc)
             .args(["--edition", "2021", "--test", "-o"])
@@ -2051,7 +2051,7 @@ def pool_double_free_noop(a, f, extra):
             String::from_utf8_lossy(&run_bug.stderr)
         );
         assert!(
-            combined_out.contains("law pool_double_free_noop failed on emitted Rust"),
+            combined_out.contains("law over_release_is_noop failed on emitted Rust"),
             "output should name the failing law and inputs: {combined_out}"
         );
 
@@ -2109,39 +2109,39 @@ law rec_id_same:
     fn evaluates_broken_law_counterexample_directly() {
         let broken_src = r#"import Base
 
-type PoolAcct is Data:
-  PoolAcct{a: Nat, f: Nat}
+type Ledger is Data:
+  Ledger{a: Nat, f: Nat}
 
-def pool_total(+p: PoolAcct) -> Nat:
+def ledger_total(+p: Ledger) -> Nat:
   match p:
-    case PoolAcct{a, f}:
+    case Ledger{a, f}:
       Nat.add(a, f)
 
-def pool_free_if(+a: Nat, +f: Nat, +rel: Nat, ok: Bool) -> PoolAcct:
+def ledger_release_if(+a: Nat, +f: Nat, +rel: Nat, ok: Bool) -> Ledger:
   match ok:
     case True{}:
-      PoolAcct{Nat.sub(a, rel), Nat.add(f, rel)}
+      Ledger{Nat.sub(a, rel), Nat.add(f, rel)}
     case False{}:
-      PoolAcct{a, Nat.add(f, rel)}
+      Ledger{a, Nat.add(f, rel)}
 
-def pool_free(+p: PoolAcct, +rel: Nat) -> PoolAcct:
+def ledger_release(+p: Ledger, +rel: Nat) -> Ledger:
   match p:
-    case PoolAcct{+a, f}:
-      pool_free_if(a, f, rel, Nat.is_le(rel, a))
+    case Ledger{+a, f}:
+      ledger_release_if(a, f, rel, Nat.is_le(rel, a))
 
-law pool_free_conserved:
+law release_conserves_total:
   for +a: Nat
   for +f: Nat
   for +rel: Nat
-  {pool_total(pool_free(PoolAcct{a, f}, rel)) == Nat.add(a, f) : Nat}
+  {ledger_total(ledger_release(Ledger{a, f}, rel)) == Nat.add(a, f) : Nat}
 
-def pool_free_conserved(a, f, rel):
+def release_conserves_total(a, f, rel):
   {==}
 "#;
         let dir = tmp_dir("direct_ce");
         let outcomes = evaluate_laws_for_counterexamples(
             broken_src,
-            &["pool_free_conserved".to_string()],
+            &["release_conserves_total".to_string()],
             &dir,
         )
         .expect("counterexample evaluation must succeed");

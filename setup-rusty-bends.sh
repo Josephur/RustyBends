@@ -924,35 +924,35 @@ mod tests {
         );
         cfg.verdict_mode = VerdictMode::Off;
 
-        // 1. Valid locked pool_free_conserved first
+        // 1. Valid locked release_conserves_total first
         let valid_src = r#"import Base
 
-type PoolAcct is Data:
-  PoolAcct{a: Nat, f: Nat}
+type Ledger is Data:
+  Ledger{a: Nat, f: Nat}
 
-def pool_total(+p: PoolAcct) -> Nat:
+def ledger_total(+p: Ledger) -> Nat:
   match p:
-    case PoolAcct{a, f}:
+    case Ledger{a, f}:
       Nat.add(a, f)
 
-def pool_free_if(+a: Nat, +f: Nat, +rel: Nat, ok: Bool) -> PoolAcct:
+def ledger_release_if(+a: Nat, +f: Nat, +rel: Nat, ok: Bool) -> Ledger:
   match ok:
     case True{}:
-      PoolAcct{Nat.sub(a, rel), Nat.add(f, rel)}
+      Ledger{Nat.sub(a, rel), Nat.add(f, rel)}
     case False{}:
-      PoolAcct{a, f}
+      Ledger{a, f}
 
-def pool_free(+p: PoolAcct, +rel: Nat) -> PoolAcct:
+def ledger_release(+p: Ledger, +rel: Nat) -> Ledger:
   match p:
-    case PoolAcct{+a, f}:
-      pool_free_if(a, f, rel, Nat.is_le(rel, a))
+    case Ledger{+a, f}:
+      ledger_release_if(a, f, rel, Nat.is_le(rel, a))
 
-# promise: freeing from a pool conserves total capacity
-law pool_free_conserved:
+# promise: releasing from a ledger conserves its total
+law release_conserves_total:
   for +a: Nat
   for +f: Nat
   for +rel: Nat
-  {pool_total(pool_free(PoolAcct{a, f}, rel)) == Nat.add(a, f) : Nat}
+  {ledger_total(ledger_release(Ledger{a, f}, rel)) == Nat.add(a, f) : Nat}
 "#;
         // Seed the lock as if the law was previously sealed, then break the function (False{} drops sub, adding rel unconditionally).
         fs::write(&core, valid_src).unwrap();
@@ -960,43 +960,43 @@ law pool_free_conserved:
 
         let broken_src = r#"import Base
 
-type PoolAcct is Data:
-  PoolAcct{a: Nat, f: Nat}
+type Ledger is Data:
+  Ledger{a: Nat, f: Nat}
 
-def pool_total(+p: PoolAcct) -> Nat:
+def ledger_total(+p: Ledger) -> Nat:
   match p:
-    case PoolAcct{a, f}:
+    case Ledger{a, f}:
       Nat.add(a, f)
 
-def pool_free_if(+a: Nat, +f: Nat, +rel: Nat, ok: Bool) -> PoolAcct:
+def ledger_release_if(+a: Nat, +f: Nat, +rel: Nat, ok: Bool) -> Ledger:
   match ok:
     case True{}:
-      PoolAcct{Nat.sub(a, rel), Nat.add(f, rel)}
+      Ledger{Nat.sub(a, rel), Nat.add(f, rel)}
     case False{}:
-      PoolAcct{a, Nat.add(f, rel)}
+      Ledger{a, Nat.add(f, rel)}
 
-def pool_free(+p: PoolAcct, +rel: Nat) -> PoolAcct:
+def ledger_release(+p: Ledger, +rel: Nat) -> Ledger:
   match p:
-    case PoolAcct{+a, f}:
-      pool_free_if(a, f, rel, Nat.is_le(rel, a))
+    case Ledger{+a, f}:
+      ledger_release_if(a, f, rel, Nat.is_le(rel, a))
 
-# promise: freeing from a pool conserves total capacity
-law pool_free_conserved:
+# promise: releasing from a ledger conserves its total
+law release_conserves_total:
   for +a: Nat
   for +f: Nat
   for +rel: Nat
-  {pool_total(pool_free(PoolAcct{a, f}, rel)) == Nat.add(a, f) : Nat}
+  {ledger_total(ledger_release(Ledger{a, f}, rel)) == Nat.add(a, f) : Nat}
 
-def pool_free_conserved(a, f, rel):
+def release_conserves_total(a, f, rel):
   {==}
 "#;
         fs::write(&core, broken_src).unwrap();
         let err_false = run(&cfg).expect_err("broken function must fail build");
         assert!(
-            err_false.contains("[E_LAW_FALSE] law pool_free_conserved is FALSE for this code (evaluated with emitted Rust)"),
+            err_false.contains("[E_LAW_FALSE] law release_conserves_total is FALSE for this code (evaluated with emitted Rust)"),
             "expected counterexample header, got:\n{err_false}"
         );
-        assert!(err_false.contains("lhs pool_total(pool_free(PoolAcct{"));
+        assert!(err_false.contains("lhs ledger_total(ledger_release(Ledger{"));
         assert!(err_false.contains("rhs Nat.add("));
         assert!(err_false.contains("stop: the law is locked"));
 
@@ -1223,7 +1223,7 @@ type Status is Data:
   Open{}
   Closed{}
 
-def br_within(pos: Nat, limit: Nat) -> Bool:
+def within_limit(pos: Nat, limit: Nat) -> Bool:
   Nat.is_le(pos, limit)
 "#,
         )
@@ -1234,34 +1234,34 @@ def br_within(pos: Nat, limit: Nat) -> Bool:
             r#"import Base
 import base_rules.bend as B
 
-def us_both(+pos: Nat, a: Nat, b: Nat) -> Bool:
-  Bool.and(B.br_within(pos, a), Nat.is_le(pos, b))
+def within_both(+pos: Nat, a: Nat, b: Nat) -> Bool:
+  Bool.and(B.within_limit(pos, a), Nat.is_le(pos, b))
 
-def us_open_or(s: B.Status, flag: Bool) -> Bool:
+def open_or(s: B.Status, flag: Bool) -> Bool:
   match s:
     case B.Open{}: True{}
     case B.Closed{}: flag
 
-def us_diag_aux(a: Bool) -> {Bool.and(a, a) == a : Bool}:
+def diag_aux(a: Bool) -> {Bool.and(a, a) == a : Bool}:
   match a:
     case True{}: {==}
     case False{}: {==}
 
-# promise: checking both limits when they are equal matches br_within
-law us_both_diag:
+# promise: checking both limits when they are equal matches within_limit
+law within_both_diag:
   for +pos: Nat
   for +a: Nat
-  {us_both(pos, a, a) == B.br_within(pos, a) : Bool}
+  {within_both(pos, a, a) == B.within_limit(pos, a) : Bool}
 
-def us_both_diag(pos, a):
-  us_diag_aux(B.br_within(pos, a))
+def within_both_diag(pos, a):
+  diag_aux(B.within_limit(pos, a))
 
 # promise: an open status always permits the action regardless of fallback flag
-law us_open_or_open:
+law open_or_open:
   for flag: Bool
-  {us_open_or(B.Open{}, flag) == True{} : Bool}
+  {open_or(B.Open{}, flag) == True{} : Bool}
 
-def us_open_or_open(flag):
+def open_or_open(flag):
   {==}
 "#,
         )
@@ -1284,7 +1284,7 @@ def us_open_or_open(flag):
             .expect("expected emitted verified.rs");
         let emitted = fs::read_to_string(&out_rs).unwrap();
         assert!(!emitted.contains("B::"), "emitted leaked B::\n{emitted}");
-        assert!(emitted.contains("br_within(pos, a)"), "got:\n{emitted}");
+        assert!(emitted.contains("within_limit(pos, a)"), "got:\n{emitted}");
         assert!(emitted.contains("pub enum Status"), "got:\n{emitted}");
 
         let bin_path = root.join("out/test_bin");
@@ -1349,53 +1349,53 @@ def us_open_or_open(flag):
     }
 
     #[test]
-    fn tile_split_laws_verified_with_bundled_nat_lemmas() {
-        let root = temp_workspace("issue11_tile_split");
+    fn chunk_split_laws_verified_with_bundled_nat_lemmas() {
+        let root = temp_workspace("issue11_chunk_split");
         let _ = write_nat_lemmas(root.join("verified"))
             .expect("write_nat_lemmas should populate verified/");
-        let tiles = root.join("verified/tiles.bend");
+        let chunks_file = root.join("verified/chunks.bend");
         fs::write(
-            &tiles,
+            &chunks_file,
             r#"import Base
 import nat_lemmas.bend as L
 
-def tile_chunk(t: Nat, tpc: Nat) -> Nat:
-  Nat.div(t, 1n+tpc)
+def chunk_of(t: Nat, per: Nat) -> Nat:
+  Nat.div(t, 1n+per)
 
-def tile_place(t: Nat, tpc: Nat) -> Nat:
-  Nat.mod(t, 1n+tpc)
+def slot_of(t: Nat, per: Nat) -> Nat:
+  Nat.mod(t, 1n+per)
 
-def tile_offset(chunk: Nat, place: Nat, tpc: Nat) -> Nat:
-  Nat.add(place, Nat.mul(chunk, 1n+tpc))
+def index_of(chunk: Nat, slot: Nat, per: Nat) -> Nat:
+  Nat.add(slot, Nat.mul(chunk, 1n+per))
 
-# promise: every tile index maps to a place strictly below tiles_per_chunk
-law tile_place_lt:
+# promise: every index maps to a slot strictly below the chunk size
+law slot_below_size:
   for t: Nat
-  for tpc: Nat
-  {Nat.is_lt(tile_place(t, tpc), 1n+tpc) == True{} : Bool}
+  for per: Nat
+  {Nat.is_lt(slot_of(t, per), 1n+per) == True{} : Bool}
 
-def tile_place_lt(t, tpc):
-  L.nat_mod_lt(t, tpc)
+def slot_below_size(t, per):
+  L.nat_mod_lt(t, per)
 
-# promise: splitting a tile into chunk and place reconstructs the original tile index
-law tile_split_reconstructs:
+# promise: splitting an index into chunk and slot reconstructs the original index
+law split_reconstructs_index:
   for t: Nat
-  for tpc: Nat
-  {tile_offset(tile_chunk(t, tpc), tile_place(t, tpc), tpc) == t : Nat}
+  for per: Nat
+  {index_of(chunk_of(t, per), slot_of(t, per), per) == t : Nat}
 
-def tile_split_reconstructs(t, tpc):
-  L.nat_div_mod(t, tpc)
+def split_reconstructs_index(t, per):
+  L.nat_div_mod(t, per)
 
-# promise: every tile index below chunks * tiles_per_chunk maps to a chunk strictly below chunks
-law tile_chunk_in_bounds:
+# promise: every index below chunks * chunk size maps to a chunk strictly below chunks
+law chunk_in_bounds:
   for t: Nat
   for chunks: Nat
-  for tpc: Nat
-  for h: {Nat.is_lt(t, Nat.mul(chunks, 1n+tpc)) == True{} : Bool}
-  {Nat.is_lt(tile_chunk(t, tpc), chunks) == True{} : Bool}
+  for per: Nat
+  for h: {Nat.is_lt(t, Nat.mul(chunks, 1n+per)) == True{} : Bool}
+  {Nat.is_lt(chunk_of(t, per), chunks) == True{} : Bool}
 
-def tile_chunk_in_bounds(t, chunks, tpc, h):
-  L.nat_div_lt_of_lt_mul(t, chunks, tpc, h)
+def chunk_in_bounds(t, chunks, per, h):
+  L.nat_div_lt_of_lt_mul(t, chunks, per, h)
 "#,
         )
         .unwrap();
@@ -1413,12 +1413,12 @@ def tile_chunk_in_bounds(t, chunks, tpc, h):
         };
 
         let out_rs = run(&cfg)
-            .expect("tile split laws using nat_lemmas.bend must pass bend, mutation check, lock, and emit")
+            .expect("chunk split laws using nat_lemmas.bend must pass bend, mutation check, lock, and emit")
             .expect("expected emitted verified.rs");
         let emitted = fs::read_to_string(&out_rs).unwrap();
-        assert!(emitted.contains("pub fn tile_chunk("), "got:\n{emitted}");
-        assert!(emitted.contains("pub fn tile_place("), "got:\n{emitted}");
-        assert!(emitted.contains("pub fn tile_offset("), "got:\n{emitted}");
+        assert!(emitted.contains("pub fn chunk_of("), "got:\n{emitted}");
+        assert!(emitted.contains("pub fn slot_of("), "got:\n{emitted}");
+        assert!(emitted.contains("pub fn index_of("), "got:\n{emitted}");
         assert!(
             !emitted.contains("nat_mod_lt"),
             "emitted leaked proof helper:\n{emitted}"
@@ -2196,17 +2196,17 @@ law beta:
         let src_b = r#"import Base
 import base_rules.bend as B
 
-# promise: us_both with identical bounds agrees with br_within
-law us_both_diag:
+# promise: within_both with identical bounds agrees with within_limit
+law within_both_diag:
   for +pos: Nat
   for +a: Nat
-  {us_both(pos, a, a) == B.br_within(pos, a) : Bool}
+  {within_both(pos, a, a) == B.within_limit(pos, a) : Bool}
 "#;
         fs::write(&uses, src_b).unwrap();
         enforce_law_lock(&lock, std::slice::from_ref(&uses), false).unwrap();
         let hash_b = extract_canonical_laws(std::slice::from_ref(&uses))
             .unwrap()
-            .get("us_both_diag")
+            .get("within_both_diag")
             .unwrap()
             .hash
             .clone();
@@ -2214,16 +2214,16 @@ law us_both_diag:
         let src_rules = r#"import Base
 import base_rules.bend as Rules
 
-# promise: us_both with identical bounds agrees with br_within
-law us_both_diag:
+# promise: within_both with identical bounds agrees with within_limit
+law within_both_diag:
   for +pos: Nat
   for +a: Nat
-  {us_both(pos, a, a) == Rules.br_within(pos, a) : Bool}
+  {within_both(pos, a, a) == Rules.within_limit(pos, a) : Bool}
 "#;
         fs::write(&uses, src_rules).unwrap();
         let hash_rules = extract_canonical_laws(std::slice::from_ref(&uses))
             .unwrap()
-            .get("us_both_diag")
+            .get("within_both_diag")
             .unwrap()
             .hash
             .clone();
@@ -5238,11 +5238,11 @@ import Base
 def can_fit(used: Nat, req: Nat, cap: Nat, enabled: Bool) -> Bool:
   Bool.and(enabled, Bool.or(Nat.is_le(Nat.add(used, req), cap), Bool.not(Nat.is_gt(req, 0n))))
 
-def clamp_blocks(n: Nat, lo: Nat, hi: Nat) -> Nat:
+def clamp_range(n: Nat, lo: Nat, hi: Nat) -> Nat:
   Nat.min(Nat.max(n, lo), hi)
 
-def tiles_needed(tokens: Nat, tile: Nat) -> Nat:
-  Nat.add(Nat.div(tokens, tile), Bool.pick(Nat, Nat.is_eq(Nat.mod(tokens, tile), 0n), 0n, 1n))
+def chunks_needed(items: Nat, size: Nat) -> Nat:
+  Nat.add(Nat.div(items, size), Bool.pick(Nat, Nat.is_eq(Nat.mod(items, size), 0n), 0n, 1n))
 
 def cmp_flags(a: Nat, b: Nat) -> Bool:
   Bool.and(Nat.is_lt(a, b), Nat.is_ge(b, a))
@@ -5259,7 +5259,7 @@ def cmp_flags(a: Nat, b: Nat) -> Bool:
         assert!(summary
             .rust_source
             .contains("if __b == 0_u64 { __a } else { __a % __b }"));
-        assert!(summary.rust_source.contains("if (({ let __a = tokens;"));
+        assert!(summary.rust_source.contains("if (({ let __a = items;"));
         assert!(summary
             .rust_source
             .contains("(((a) < (b))) && (((b) >= (a)))"));
@@ -5300,11 +5300,11 @@ def sub_nat(a: Nat, b: Nat) -> Nat:
         let src = r#"
 import Base
 
-type PoolState is Data:
+type Store is Data:
   Ready{free: Nat}
   Exhausted{}
 
-def try_alloc(state: PoolState, req: Nat) -> PoolState:
+def try_take(state: Store, req: Nat) -> Store:
   match state:
     case Ready{free}:
       let ok = Nat.is_le(req, free)
@@ -5335,7 +5335,7 @@ def helper_lemma(x: Nat) -> {x == x : Nat}:
         assert!(summary.rust_source.contains("match ok {"));
         assert!(summary
             .rust_source
-            .contains("true => PoolState::Ready((free).saturating_sub(req)),"));
+            .contains("true => Store::Ready((free).saturating_sub(req)),"));
         assert!(summary.rust_source.contains("match (a, b) {"));
         assert!(summary.rust_source.contains("(0_u64, _) => 0_u64,"));
         assert!(summary.rust_source.contains("(__rb_n0 @ 1_u64..=u64::MAX, __rb_n1 @ 1_u64..=u64::MAX) => { let ap = __rb_n0 - 1_u64; let bp = __rb_n1 - 1_u64;"));
@@ -5347,8 +5347,8 @@ def helper_lemma(x: Nat) -> {x == x : Nat}:
         let src = r#"
 import Base
 
-def split_tiles(n: Nat, tile: Nat) -> Nat & Nat:
-  Nat.divmod(n, tile)
+def split_chunks(n: Nat, size: Nat) -> Nat & Nat:
+  Nat.divmod(n, size)
 
 def first_of_pair(p: Nat & Nat) -> Nat:
   Pair.fst(Nat, Nat, p)
@@ -5356,7 +5356,7 @@ def first_of_pair(p: Nat & Nat) -> Nat:
         let summary = emit_verified_rust(src, 0).expect("pair emit succeeded");
         assert!(summary
             .rust_source
-            .contains("pub fn split_tiles(n: u64, tile: u64) -> (u64, u64)"));
+            .contains("pub fn split_chunks(n: u64, size: u64) -> (u64, u64)"));
         assert!(summary
             .rust_source
             .contains("if __b == 0_u64 { (0_u64, __a) } else { (__a / __b, __a % __b) }"));
@@ -5372,13 +5372,13 @@ def first_of_pair(p: Nat & Nat) -> Nat:
         let src = r#"
 import Base
 
-def pfx_reuse_valid(
-  +snap_pos: Nat,  # comment inside the header
-  +lcp: Nat,
-  prompt_len: Nat,
-  +tile: Nat
+def in_order(
+  +lo: Nat,  # comment inside the header
+  +mid: Nat,
+  hi: Nat,
+  +step: Nat
 ) -> Bool:
-  (snap_pos <= lcp : Nat) && (lcp <= prompt_len : Nat)
+  (lo <= mid : Nat) && (mid <= hi : Nat)
 
 def add_zero_eq(
   n: Nat
@@ -5394,9 +5394,9 @@ def one_liner(n: Nat) -> Nat: Nat.add(n, 1n)
 "#;
         let summary = emit_verified_rust(src, 0).expect("multi-line headers emit");
         assert_eq!(summary.defs_emitted, 2);
-        assert!(summary.rust_source.contains(
-            "pub fn pfx_reuse_valid(snap_pos: u64, lcp: u64, prompt_len: u64, tile: u64) -> bool"
-        ));
+        assert!(summary
+            .rust_source
+            .contains("pub fn in_order(lo: u64, mid: u64, hi: u64, step: u64) -> bool"));
         assert!(summary
             .rust_source
             .contains("pub fn one_liner(n: u64) -> u64"));
@@ -5423,7 +5423,7 @@ def minus_two(n: Nat) -> Nat:
     case 1n+1n+q:
       q
 
-def px_net_span_match(a: Nat, b: Nat, span: Nat) -> Bool:
+def within_span(a: Nat, b: Nat, span: Nat) -> Bool:
   match span:
     case 0n:
       True{}
@@ -5496,7 +5496,7 @@ def minus_two(n: Nat) -> Nat:
     case 1n+1n+q:
       q
 
-def px_net_span_match(a: Nat, b: Nat, span: Nat) -> Bool:
+def within_span(a: Nat, b: Nat, span: Nat) -> Bool:
   match span:
     case 0n:
       True{}
@@ -5533,7 +5533,7 @@ def px_net_span_match(a: Nat, b: Nat, span: Nat) -> Bool:
         let rs_path = dir.join("test.rs");
         let bin_path = dir.join("test_bin");
         let harness = format!(
-            "{}\nfn main() {{\n    assert_eq!(minus_two(0), 0);\n    assert_eq!(minus_two(1), 0);\n    assert_eq!(minus_two(2), 0);\n    assert_eq!(minus_two(5), 3);\n    assert!(px_net_span_match(10, 20, 0));\n    assert!(px_net_span_match(7, 7, 1));\n    assert!(!px_net_span_match(7, 8, 1));\n    assert!(px_net_span_match(5, 3, 2));\n    assert!(!px_net_span_match(10, 3, 2));\n}}\n",
+            "{}\nfn main() {{\n    assert_eq!(minus_two(0), 0);\n    assert_eq!(minus_two(1), 0);\n    assert_eq!(minus_two(2), 0);\n    assert_eq!(minus_two(5), 3);\n    assert!(within_span(10, 20, 0));\n    assert!(within_span(7, 7, 1));\n    assert!(!within_span(7, 8, 1));\n    assert!(within_span(5, 3, 2));\n    assert!(!within_span(10, 3, 2));\n}}\n",
             summary.rust_source
         );
         std::fs::write(&rs_path, harness).unwrap();
@@ -5747,36 +5747,36 @@ type Status is Data:
   Open{}
   Closed{}
 
-def br_within(pos: Nat, limit: Nat) -> Bool:
+def within_limit(pos: Nat, limit: Nat) -> Bool:
   Nat.is_le(pos, limit)
 "#;
         let uses_src = r#"import Base
 import base_rules.bend as B  # trailing comment
 
-def us_both(+pos: Nat, a: Nat, b: Nat) -> Bool:
-  Bool.and(B.br_within(pos, a), Nat.is_le(pos, b))
+def within_both(+pos: Nat, a: Nat, b: Nat) -> Bool:
+  Bool.and(B.within_limit(pos, a), Nat.is_le(pos, b))
 
-def us_open_or(s: B.Status, flag: Bool) -> Bool:
+def open_or(s: B.Status, flag: Bool) -> Bool:
   match s:
     case B.Open{}: True{}
     case B.Closed{}: flag
 
-# promise: B.br_within comment text stays untouched
-law us_both_diag:
+# promise: B.within_limit comment text stays untouched
+law within_both_diag:
   for +pos: Nat
   for +a: Nat
-  {us_both(pos, a, a) == B.br_within(pos, a) : Bool}
+  {within_both(pos, a, a) == B.within_limit(pos, a) : Bool}
 "#;
         let resolved_uses = resolve_import_aliases(uses_src);
         // Idempotent
         assert_eq!(resolve_import_aliases(&resolved_uses), resolved_uses);
         assert!(!resolved_uses.contains("import base_rules.bend"));
         assert!(resolved_uses.contains("import Base"));
-        assert!(resolved_uses.contains("br_within(pos, a)"));
+        assert!(resolved_uses.contains("within_limit(pos, a)"));
         assert!(resolved_uses.contains("s: Status, flag: Bool"));
         assert!(resolved_uses.contains("case Open{}:"));
-        assert!(resolved_uses.contains("# promise: B.br_within comment text stays untouched"));
-        assert!(!resolved_uses.contains("B.br_within(pos, a)"));
+        assert!(resolved_uses.contains("# promise: B.within_limit comment text stays untouched"));
+        assert!(!resolved_uses.contains("B.within_limit(pos, a)"));
 
         // Per-file isolation: a sibling file without `as B` can define its own `type B`
         let other_src = r#"import Base
@@ -5795,11 +5795,11 @@ def use_b(x: B) -> Nat:
             resolve_import_aliases(other_src)
         );
         let summary = emit_verified_rust(&combined, 1).expect("emit with resolved aliases");
-        assert!(!summary.rust_source.contains("B::br_within"));
+        assert!(!summary.rust_source.contains("B::within_limit"));
         assert!(!summary.rust_source.contains("B::Status"));
         assert!(!summary.rust_source.contains("B::Open"));
         assert!(summary.rust_source.contains("B::Tag"));
-        assert!(summary.rust_source.contains("br_within(pos, a)"));
+        assert!(summary.rust_source.contains("within_limit(pos, a)"));
         assert!(summary.rust_source.contains("pub enum Status"));
         assert!(summary.rust_source.contains("pub enum B"));
     }
@@ -5840,28 +5840,28 @@ def checked_id(x: Nat, -proof: {x == x : Nat}) -> Nat:
             .contains("pub fn checked_id(x: u64) -> u64"));
     }
 
-    const CANVAS_SRC: &str = r#"import Base
+    const AREA_SRC: &str = r#"import Base
 
 def area(+w: Nat, +h: Nat) -> Nat:
   Nat.mul(w, h)
 
-def media_canvas_ok(+w: Nat, +h: Nat, max_pixels: Nat) -> Bool:
-  Bool.and(Bool.and(Nat.is_gt(w, 0n), Nat.is_gt(h, 0n)), Nat.is_le(area(w, h), max_pixels))
+def fits_area_limit(+w: Nat, +h: Nat, max_area: Nat) -> Bool:
+  Bool.and(Bool.and(Nat.is_gt(w, 0n), Nat.is_gt(h, 0n)), Nat.is_le(area(w, h), max_area))
 
-def canvas_gate(+w: Nat, +h: Nat) -> Bool:
-  media_canvas_ok(w, h, 1000n)
+def fits_default_limit(+w: Nat, +h: Nat) -> Bool:
+  fits_area_limit(w, h, 1000n)
 
-# promise: a zero-width canvas is always refused
+# promise: a zero-width rectangle is always refused
 law zero_width_refused:
   for +h: Nat
   for +m: Nat
-  {media_canvas_ok(0n, h, m) == False{} : Bool}
+  {fits_area_limit(0n, h, m) == False{} : Bool}
 "#;
 
-    fn total_canvas_src() -> String {
-        CANVAS_SRC.replace(
-            "def media_canvas_ok(",
-            "# Request data reaches this check: refuse instead of panicking.\n# rusty-bends: total\ndef media_canvas_ok(",
+    fn total_area_src() -> String {
+        AREA_SRC.replace(
+            "def fits_area_limit(",
+            "# Untrusted input reaches this check: refuse instead of panicking.\n# rusty-bends: total\ndef fits_area_limit(",
         )
     }
 
@@ -5901,7 +5901,7 @@ law zero_width_refused:
 
     #[test]
     fn records_checked_growth_panic_sites_and_lists_them_with_file_and_line() {
-        let summary = emit_verified_rust(CANVAS_SRC, 1).unwrap();
+        let summary = emit_verified_rust(AREA_SRC, 1).unwrap();
         let sites: Vec<(&str, &str)> = summary
             .panic_sites
             .iter()
@@ -5909,11 +5909,11 @@ law zero_width_refused:
             .collect();
         assert_eq!(sites, vec![("area", "Nat.mul")]);
 
-        let path = std::path::Path::new("verified/media.bend");
-        let listing = crate::format_panic_sites(&summary.panic_sites, &[(path, CANVAS_SRC)]);
+        let path = std::path::Path::new("verified/shapes.bend");
+        let listing = crate::format_panic_sites(&summary.panic_sites, &[(path, AREA_SRC)]);
         assert_eq!(
             listing[0],
-            "RustyBends panic [area]: Nat.mul at verified/media.bend:4"
+            "RustyBends panic [area]: Nat.mul at verified/shapes.bend:4"
         );
         assert!(listing[1].contains("1 checked-growth panic site(s) in 1 function(s)"));
         assert!(listing[1].contains("# rusty-bends: total"));
@@ -5928,15 +5928,15 @@ law zero_width_refused:
 
     #[test]
     fn total_marker_emits_option_returning_function_that_refuses_overflow() {
-        let src = total_canvas_src();
+        let src = total_area_src();
         let (_, defs) = parse_book_items(&src).unwrap();
-        assert!(defs.iter().any(|d| d.name == "media_canvas_ok" && d.total));
+        assert!(defs.iter().any(|d| d.name == "fits_area_limit" && d.total));
         assert!(defs.iter().any(|d| d.name == "area" && !d.total));
 
         let summary = emit_verified_rust(&src, 1).unwrap();
         let rs = &summary.rust_source;
         assert!(
-            rs.contains("pub fn media_canvas_ok(w: u64, h: u64, max_pixels: u64) -> Option<bool>"),
+            rs.contains("pub fn fits_area_limit(w: u64, h: u64, max_area: u64) -> Option<bool>"),
             "{rs}"
         );
         // Callee gets a private Option shadow; its public form keeps panicking semantics.
@@ -5957,26 +5957,26 @@ law zero_width_refused:
             vec![
                 ("area".to_string(), "Nat.mul".to_string()),
                 (
-                    "canvas_gate".to_string(),
-                    "call media_canvas_ok".to_string()
+                    "fits_default_limit".to_string(),
+                    "call fits_area_limit".to_string()
                 ),
             ]
         );
-        let path = std::path::Path::new("verified/media.bend");
+        let path = std::path::Path::new("verified/shapes.bend");
         let listing = crate::format_panic_sites(&summary.panic_sites, &[(path, &src)]);
         assert!(listing.iter().any(|l| l
-            == "RustyBends panic [canvas_gate]: call media_canvas_ok at verified/media.bend:12"));
+            == "RustyBends panic [fits_default_limit]: call fits_area_limit at verified/shapes.bend:12"));
 
         let runtime_only = rs.split("#[cfg(test)]").next().unwrap();
         let harness = format!(
-            "{runtime_only}\nfn main() {{\n    assert_eq!(media_canvas_ok(u64::MAX, u64::MAX, u64::MAX - 1), None);\n    assert_eq!(media_canvas_ok(10, 10, 100), Some(true));\n    assert_eq!(media_canvas_ok(10, 11, 100), Some(false));\n    assert_eq!(media_canvas_ok(0, 5, 100), Some(false));\n    assert!(std::panic::catch_unwind(|| area(u64::MAX, 2)).is_err());\n    assert!(canvas_gate(10, 10));\n    assert!(!canvas_gate(100, 100));\n}}\n"
+            "{runtime_only}\nfn main() {{\n    assert_eq!(fits_area_limit(u64::MAX, u64::MAX, u64::MAX - 1), None);\n    assert_eq!(fits_area_limit(10, 10, 100), Some(true));\n    assert_eq!(fits_area_limit(10, 11, 100), Some(false));\n    assert_eq!(fits_area_limit(0, 5, 100), Some(false));\n    assert!(std::panic::catch_unwind(|| area(u64::MAX, 2)).is_err());\n    assert!(fits_default_limit(10, 10));\n    assert!(!fits_default_limit(100, 100));\n}}\n"
         );
         compile_and_run("runtime", &harness, &[]);
     }
 
     #[test]
     fn total_function_generated_law_test_still_runs() {
-        let summary = emit_verified_rust(&total_canvas_src(), 1).unwrap();
+        let summary = emit_verified_rust(&total_area_src(), 1).unwrap();
         assert!(summary.rust_source.contains("fn law_zero_width_refused()"));
         let out = compile_and_run(
             "lawtest",
@@ -7919,20 +7919,20 @@ law legacy_law(for +a: Nat, for +b: Bool):
         // Exact reproducer from issue #5, completed with its Bend 2 proof.
         let bend_src = r#"import Base
 
-type PoolAcct is Data:
-  PoolAcct{a: Nat, f: Nat}
+type Ledger is Data:
+  Ledger{a: Nat, f: Nat}
 
-def pool_free_if(+a: Nat, +f: Nat, +rel: Nat, ok: Bool) -> PoolAcct:
+def ledger_release_if(+a: Nat, +f: Nat, +rel: Nat, ok: Bool) -> Ledger:
   match ok:
     case True{}:
-      PoolAcct{Nat.sub(a, rel), Nat.add(f, rel)}
+      Ledger{Nat.sub(a, rel), Nat.add(f, rel)}
     case False{}:
-      PoolAcct{a, f}
+      Ledger{a, f}
 
-def pool_free(+p: PoolAcct, +rel: Nat) -> PoolAcct:
+def ledger_release(+p: Ledger, +rel: Nat) -> Ledger:
   match p:
-    case PoolAcct{+a, f}:
-      pool_free_if(a, f, rel, Nat.is_le(rel, a))
+    case Ledger{+a, f}:
+      ledger_release_if(a, f, rel, Nat.is_le(rel, a))
 
 def add_le_false_lt(+a: Nat, +k: Nat) -> {False{} == Nat.is_le(Nat.add(a, 1n+k), a) : Bool}:
   match a:
@@ -7942,18 +7942,18 @@ def add_le_false_lt(+a: Nat, +k: Nat) -> {False{} == Nat.is_le(Nat.add(a, 1n+k),
       %add_le_false_lt(ap, k) : {False{} == _ : Bool}
       {==}
 
-law pool_double_free_noop:
+law over_release_is_noop:
   for +a: Nat
   for +f: Nat
   for +extra: Nat
-  {pool_free(PoolAcct{a, f}, Nat.add(a, 1n+extra)) == PoolAcct{a, f} : PoolAcct}
+  {ledger_release(Ledger{a, f}, Nat.add(a, 1n+extra)) == Ledger{a, f} : Ledger}
 
-def pool_double_free_noop(a, f, extra):
-  %add_le_false_lt(a, extra) : {pool_free_if(a, f, Nat.add(a, 1n+extra), _) == PoolAcct{a, f} : PoolAcct}
+def over_release_is_noop(a, f, extra):
+  %add_le_false_lt(a, extra) : {ledger_release_if(a, f, Nat.add(a, 1n+extra), _) == Ledger{a, f} : Ledger}
   {==}
 "#;
         let dir = tmp_dir("issue5");
-        let bend_file = dir.join("pool.bend");
+        let bend_file = dir.join("ledger.bend");
         fs::write(&bend_file, bend_src).unwrap();
 
         let bend_bin = crate::resolve_bend_bin(
@@ -7974,18 +7974,18 @@ def pool_double_free_noop(a, f, extra):
             );
         }
 
-        let summary = emit_verified_rust(bend_src, 1).expect("emit pool reproducer");
+        let summary = emit_verified_rust(bend_src, 1).expect("emit ledger reproducer");
         assert!(summary
             .rust_source
-            .contains("fn law_pool_double_free_noop()"));
+            .contains("fn law_over_release_is_noop()"));
 
         // 1. Checked Nat arithmetic passes the generated test AND explicitly refuses u64::MAX overflow.
         let overflow_check = format!(
-            "{}\n#[cfg(test)]\n#[test]\nfn overflow_panics_instead_of_saturating() {{\n    let res = std::panic::catch_unwind(|| pool_free(PoolAcct::PoolAcct(u64::MAX, 7), u64::MAX));\n    let _ = res;\n    let add_overflow = std::panic::catch_unwind(|| {{\n        let a = u64::MAX;\n        let rel = (a).checked_add((1_u64).checked_add(0).expect(\"rusty-bends: Nat overflow\")).expect(\"rusty-bends: Nat overflow\");\n        pool_free(PoolAcct::PoolAcct(a, 7), rel)\n    }});\n    assert!(add_overflow.is_err(), \"overflow in Nat.add must panic instead of saturating\");\n}}\n",
+            "{}\n#[cfg(test)]\n#[test]\nfn overflow_panics_instead_of_saturating() {{\n    let res = std::panic::catch_unwind(|| ledger_release(Ledger::Ledger(u64::MAX, 7), u64::MAX));\n    let _ = res;\n    let add_overflow = std::panic::catch_unwind(|| {{\n        let a = u64::MAX;\n        let rel = (a).checked_add((1_u64).checked_add(0).expect(\"rusty-bends: Nat overflow\")).expect(\"rusty-bends: Nat overflow\");\n        ledger_release(Ledger::Ledger(a, 7), rel)\n    }});\n    assert!(add_overflow.is_err(), \"overflow in Nat.add must panic instead of saturating\");\n}}\n",
             summary.rust_source
         );
-        let rs_ok = dir.join("pool_ok.rs");
-        let bin_ok = dir.join("pool_ok_bin");
+        let rs_ok = dir.join("ledger_ok.rs");
+        let bin_ok = dir.join("ledger_ok_bin");
         fs::write(&rs_ok, overflow_check).unwrap();
         let rustc = env::var("RUSTC").unwrap_or_else(|_| "rustc".to_string());
         let compile = Command::new(&rustc)
@@ -8007,7 +8007,7 @@ def pool_double_free_noop(a, f, extra):
             String::from_utf8_lossy(&run_ok.stderr)
         );
 
-        // 2. If the emitted Rust had saturating_add instead of checked_add, law_pool_double_free_noop MUST fail at u64::MAX!
+        // 2. If the emitted Rust had saturating_add instead of checked_add, law_over_release_is_noop MUST fail at u64::MAX!
         let buggy_sat = summary
             .rust_source
             .replace(
@@ -8022,8 +8022,8 @@ def pool_double_free_noop(a, f, extra):
                 ".checked_add(rel).expect(\"rusty-bends: Nat overflow\")",
                 ".saturating_add(rel)",
             );
-        let rs_bug = dir.join("pool_bug.rs");
-        let bin_bug = dir.join("pool_bug_bin");
+        let rs_bug = dir.join("ledger_bug.rs");
+        let bin_bug = dir.join("ledger_bug_bin");
         fs::write(&rs_bug, buggy_sat).unwrap();
         let compile_bug = Command::new(&rustc)
             .args(["--edition", "2021", "--test", "-o"])
@@ -8043,7 +8043,7 @@ def pool_double_free_noop(a, f, extra):
             String::from_utf8_lossy(&run_bug.stderr)
         );
         assert!(
-            combined_out.contains("law pool_double_free_noop failed on emitted Rust"),
+            combined_out.contains("law over_release_is_noop failed on emitted Rust"),
             "output should name the failing law and inputs: {combined_out}"
         );
 
@@ -8101,39 +8101,39 @@ law rec_id_same:
     fn evaluates_broken_law_counterexample_directly() {
         let broken_src = r#"import Base
 
-type PoolAcct is Data:
-  PoolAcct{a: Nat, f: Nat}
+type Ledger is Data:
+  Ledger{a: Nat, f: Nat}
 
-def pool_total(+p: PoolAcct) -> Nat:
+def ledger_total(+p: Ledger) -> Nat:
   match p:
-    case PoolAcct{a, f}:
+    case Ledger{a, f}:
       Nat.add(a, f)
 
-def pool_free_if(+a: Nat, +f: Nat, +rel: Nat, ok: Bool) -> PoolAcct:
+def ledger_release_if(+a: Nat, +f: Nat, +rel: Nat, ok: Bool) -> Ledger:
   match ok:
     case True{}:
-      PoolAcct{Nat.sub(a, rel), Nat.add(f, rel)}
+      Ledger{Nat.sub(a, rel), Nat.add(f, rel)}
     case False{}:
-      PoolAcct{a, Nat.add(f, rel)}
+      Ledger{a, Nat.add(f, rel)}
 
-def pool_free(+p: PoolAcct, +rel: Nat) -> PoolAcct:
+def ledger_release(+p: Ledger, +rel: Nat) -> Ledger:
   match p:
-    case PoolAcct{+a, f}:
-      pool_free_if(a, f, rel, Nat.is_le(rel, a))
+    case Ledger{+a, f}:
+      ledger_release_if(a, f, rel, Nat.is_le(rel, a))
 
-law pool_free_conserved:
+law release_conserves_total:
   for +a: Nat
   for +f: Nat
   for +rel: Nat
-  {pool_total(pool_free(PoolAcct{a, f}, rel)) == Nat.add(a, f) : Nat}
+  {ledger_total(ledger_release(Ledger{a, f}, rel)) == Nat.add(a, f) : Nat}
 
-def pool_free_conserved(a, f, rel):
+def release_conserves_total(a, f, rel):
   {==}
 "#;
         let dir = tmp_dir("direct_ce");
         let outcomes = evaluate_laws_for_counterexamples(
             broken_src,
-            &["pool_free_conserved".to_string()],
+            &["release_conserves_total".to_string()],
             &dir,
         )
         .expect("counterexample evaluation must succeed");
@@ -8857,7 +8857,7 @@ fn find_matching_brace(s: &str) -> Option<usize> {
 
 /// SiblingCtor: replaces a constructor of the function's return type with each sibling
 /// constructor of the same type (same fields when the shapes match, small filler values
-/// otherwise), so absorbing-state laws like `step(Stopped{}, e) == Stopped{}` are caught.
+/// otherwise), so absorbing-state laws like `step(Done{}, e) == Done{}` are caught.
 fn mutate_sibling_ctor(
     def: &Def,
     ctor_map: &HashMap<String, CtorInfo>,
@@ -9046,7 +9046,7 @@ fn mutate_return_ctor(
 
 /// NatLit: changes a `Nat` literal `k` to `0n`, `k + 1`, and `k - 1` (at most
 /// `MAX_NAT_LIT_SITES_PER_DEF` sites per function). All `-> 0n` mutants come first, so
-/// "zero is rejected" laws guarded by a constant such as `Nat.is_eq(dh, 256n)` are caught.
+/// "zero is rejected" laws guarded by a constant such as `Nat.is_eq(width, 256n)` are caught.
 fn mutate_nat_lit(body: &str, protected: &[(usize, usize)]) -> Vec<(String, String)> {
     let bytes = body.as_bytes();
     let is_ident = |b: u8| b.is_ascii_alphanumeric() || b == b'_';
@@ -9116,7 +9116,7 @@ fn is_bare_var_ident(
 
 /// BoolConst: replaces a `Bool` variable with `True{}` / `False{}`. Applies to every use of a
 /// live `Bool` parameter, and to bare variables in returned positions of a `Bool` function, so
-/// implication laws such as `Bool.or(valid(c), Bool.not(forces(c)))` are caught.
+/// implication laws such as `Bool.or(allowed(c), Bool.not(requires(c)))` are caught.
 fn mutate_bool_const(
     def: &Def,
     def_map: &HashMap<String, &Def>,
@@ -10050,25 +10050,25 @@ law f_reflexive:
 
         let src = r#"import Base
 
-type Pool is Data:
-  Pool{alloc: Nat, free: Nat}
+type Bin is Data:
+  Bin{alloc: Nat, free: Nat}
 
-def pool_cap(+p: Pool) -> Nat:
+def bin_capacity(+p: Bin) -> Nat:
   match p:
-    case Pool{alloc, free}:
+    case Bin{alloc, free}:
       Nat.add(alloc, free)
 
-def pool_alloc_if(+alloc: Nat, +free: Nat, +req: Nat, ok: Bool) -> Pool:
+def bin_take_if(+alloc: Nat, +free: Nat, +req: Nat, ok: Bool) -> Bin:
   match ok:
     case True{}:
-      Pool{Nat.add(alloc, req), Nat.sub(free, req)}
+      Bin{Nat.add(alloc, req), Nat.sub(free, req)}
     case False{}:
-      Pool{alloc, free}
+      Bin{alloc, free}
 
-def pool_alloc(+p: Pool, +req: Nat) -> Pool:
+def bin_take(+p: Bin, +req: Nat) -> Bin:
   match p:
-    case Pool{alloc, +free}:
-      pool_alloc_if(alloc, free, req, Nat.is_le(req, free))
+    case Bin{alloc, +free}:
+      bin_take_if(alloc, free, req, Nat.is_le(req, free))
 
 def add_zero_sym(+a: Nat) -> {a == Nat.add(a, 0n) : Nat}:
   match a:
@@ -10086,13 +10086,13 @@ def add_succ_sym(+a: Nat, +b: Nat) -> {1n+Nat.add(a, b) == Nat.add(a, 1n+b) : Na
       %add_succ_sym(ap, b) : {1n+1n+Nat.add(ap, b) == 1n+_ : Nat}
       {==}
 
-def alloc_step(
+def take_step(
   +rp: Nat,
   +fp: Nat,
   +alloc: Nat,
   ok: Bool,
-  ih: {pool_cap(pool_alloc_if(alloc, fp, rp, ok)) == Nat.add(alloc, fp) : Nat}
-) -> {pool_cap(pool_alloc_if(alloc, 1n+fp, 1n+rp, ok)) == Nat.add(alloc, 1n+fp) : Nat}:
+  ih: {bin_capacity(bin_take_if(alloc, fp, rp, ok)) == Nat.add(alloc, fp) : Nat}
+) -> {bin_capacity(bin_take_if(alloc, 1n+fp, 1n+rp, ok)) == Nat.add(alloc, 1n+fp) : Nat}:
   match ok:
     case False{}:
       {==}
@@ -10102,7 +10102,7 @@ def alloc_step(
       %ih : {1n+Nat.add(Nat.add(alloc, rp), Nat.sub(fp, rp)) == 1n+_ : Nat}
       {==}
 
-def alloc_if_shift(+req: Nat, +free: Nat, +alloc: Nat) -> {pool_cap(pool_alloc_if(alloc, free, req, Nat.is_le(req, free))) == Nat.add(alloc, free) : Nat}:
+def take_if_shift(+req: Nat, +free: Nat, +alloc: Nat) -> {bin_capacity(bin_take_if(alloc, free, req, Nat.is_le(req, free))) == Nat.add(alloc, free) : Nat}:
   match req free:
     case 0n 0n:
       %add_zero_sym(Nat.add(alloc, 0n)) : {_ == Nat.add(alloc, 0n) : Nat}
@@ -10113,17 +10113,17 @@ def alloc_if_shift(+req: Nat, +free: Nat, +alloc: Nat) -> {pool_cap(pool_alloc_i
     case 1n+rp 0n:
       {==}
     case 1n+rp 1n+fp:
-      alloc_step(rp, fp, alloc, Nat.is_le(rp, fp), alloc_if_shift(rp, fp, alloc))
+      take_step(rp, fp, alloc, Nat.is_le(rp, fp), take_if_shift(rp, fp, alloc))
 
-# promise: allocation conserves total pool capacity
-law alloc_conserves_capacity:
+# promise: taking from a bin conserves its total capacity
+law take_conserves_capacity:
   for +alloc: Nat
   for +free: Nat
   for +req: Nat
-  {pool_cap(pool_alloc(Pool{alloc, free}, req)) == Nat.add(alloc, free) : Nat}
+  {bin_capacity(bin_take(Bin{alloc, free}, req)) == Nat.add(alloc, free) : Nat}
 
-def alloc_conserves_capacity(alloc, free, req):
-  alloc_if_shift(req, free, alloc)
+def take_conserves_capacity(alloc, free, req):
+  take_if_shift(req, free, alloc)
 "#;
         fs::write(&core, src).unwrap();
 
@@ -10321,88 +10321,88 @@ law empty_tautology:
     fn nat_bound_catches_one_direction_bound_law() {
         let src = r#"import Base
 
-def px_redirect_left(+l: Nat) -> Nat:
+def budget_after_step(+l: Nat) -> Nat:
   match l:
     case 0n:
       0n
     case 1n+p:
       p
 
-# promise: following a redirect never grows the remaining redirect budget
-law px_redirect_budget_never_grows:
+# promise: taking a step never grows the remaining budget
+law step_budget_never_grows:
   for +l: Nat
-  {Nat.is_le(px_redirect_left(l), l) == True{} : Bool}
+  {Nat.is_le(budget_after_step(l), l) == True{} : Bool}
 "#;
-        assert_new_operator_catches(src, "px_redirect_budget_never_grows", "NatBound", "bound");
+        assert_new_operator_catches(src, "step_budget_never_grows", "NatBound", "bound");
     }
 
     #[test]
     fn sibling_ctor_catches_absorbing_state_law() {
         let src = r#"import Base
 
-type Phase is Data:
-  Ringing{n: Nat}
-  Talking{n: Nat}
-  Stopped{}
+type Job is Data:
+  Queued{n: Nat}
+  Running{n: Nat}
+  Done{}
 
-def call_step(+s: Phase, +ev: Nat) -> Phase:
+def job_step(+s: Job, +ev: Nat) -> Job:
   match s:
-    case Ringing{n}:
-      Talking{Nat.add(n, ev)}
-    case Talking{n}:
-      Talking{n}
-    case Stopped{}:
-      Stopped{}
+    case Queued{n}:
+      Running{Nat.add(n, ev)}
+    case Running{n}:
+      Running{n}
+    case Done{}:
+      Done{}
 
-# promise: a stopped call stays stopped whatever event arrives
-law call_stopped_absorbing:
+# promise: a finished job stays finished whatever event arrives
+law done_job_absorbing:
   for +ev: Nat
-  {call_step(Stopped{}, ev) == Stopped{} : Phase}
+  {job_step(Done{}, ev) == Done{} : Job}
 "#;
-        assert_new_operator_catches(src, "call_stopped_absorbing", "SiblingCtor", "absorb");
+        assert_new_operator_catches(src, "done_job_absorbing", "SiblingCtor", "absorb");
     }
 
     #[test]
     fn bool_const_catches_implication_law() {
         let src = r#"import Base
 
-def valid(+c: Nat, +tools_given: Bool) -> Bool:
+def allowed(+c: Nat, +granted: Bool) -> Bool:
   match c:
     case 0n:
       True{}
     case 1n+k:
-      tools_given
+      granted
 
-def forces(+c: Nat, +tools_given: Bool) -> Bool:
+def requires(+c: Nat, +granted: Bool) -> Bool:
   match c:
     case 0n:
       False{}
     case 1n+k:
-      tools_given
+      granted
 
-# promise: whenever a config forces tools, it is valid
-law forced_implies_valid:
+# promise: whenever a request requires a grant, it is allowed
+law required_implies_allowed:
   for +c: Nat
   for +g: Bool
-  {Bool.or(valid(c, g), Bool.not(forces(c, g))) == True{} : Bool}
+  {Bool.or(allowed(c, g), Bool.not(requires(c, g))) == True{} : Bool}
 "#;
-        assert_new_operator_catches(src, "forced_implies_valid", "BoolConst", "implies");
+        assert_new_operator_catches(src, "required_implies_allowed", "BoolConst", "implies");
     }
 
     #[test]
     fn flip_cmp_catches_strict_refusal_law() {
         let src = r#"import Base
 
-def media_count_ok(+count: Nat, +max: Nat) -> Bool:
+def count_within_limit(+count: Nat, +max: Nat) -> Bool:
   Nat.is_le(count, max)
 
-# promise: a media count above the limit is always refused
-law media_count_refuses_overflow:
+# promise: a count above the limit is always refused
+law count_above_limit_refused:
   for +m: Nat
   for +extra: Nat
-  {media_count_ok(Nat.add(Nat.add(1n, m), extra), m) == False{} : Bool}
+  {count_within_limit(Nat.add(Nat.add(1n, m), extra), m) == False{} : Bool}
 "#;
-        assert_new_operator_catches(src, "media_count_refuses_overflow", "FlipCmp", "refuse");
+        assert_new_operator_catches(src, "count_above_limit_refused", "FlipCmp", "refuse");
     }
 
     #[test]
@@ -10441,32 +10441,32 @@ law media_count_refuses_overflow:
     fn return_ctor_catches_fallthrough_variable_absorbing_law() {
         let src = r#"import Base
 
-type CallPhase is Data:
-  CpText{}
-  CpBlock{}
-  CpStopped{}
+type Stage is Data:
+  Draft{}
+  Review{}
+  Final{}
 
-type CallEvent is Data:
-  CeOpen{}
-  CeClose{}
+type StageEvent is Data:
+  Submit{}
+  Approve{}
 
-def call_step(p: CallPhase, ev: CallEvent) -> CallPhase:
+def stage_step(p: Stage, ev: StageEvent) -> Stage:
   match p ev:
-    case CpText{} CeOpen{}:
-      CpBlock{}
-    case CpBlock{} CeClose{}:
-      CpStopped{}
+    case Draft{} Submit{}:
+      Review{}
+    case Review{} Approve{}:
+      Final{}
     case st _:
       st
 
-# promise: a stopped call stays stopped whatever event arrives
-law call_stopped_absorbing:
-  for ev: CallEvent
-  {call_step(CpStopped{}, ev) == CpStopped{} : CallPhase}
+# promise: a final stage stays final whatever event arrives
+law final_stage_absorbing:
+  for ev: StageEvent
+  {stage_step(Final{}, ev) == Final{} : Stage}
 "#;
         assert_operator_closes_gap(
             src,
-            "call_stopped_absorbing",
+            "final_stage_absorbing",
             "ReturnCtor",
             "fallthrough",
             PRE_ISSUE15_OPS,
@@ -10477,71 +10477,71 @@ law call_stopped_absorbing:
     fn return_ctor_catches_delegated_call_classifier_law() {
         let src = r#"import Base
 
-type PxAddrClass is Data:
-  PxAcPublic{}
-  PxAcPrivate{}
-  PxAcLoopback{}
+type Size is Data:
+  Small{}
+  Medium{}
+  Large{}
 
-type PxV6 is Data:
-  PxMapped{a: Nat, b: Nat}
-  PxNative{hi: Nat}
+type Input is Data:
+  Wrapped{a: Nat, b: Nat}
+  Raw{hi: Nat}
 
-def px_v4_class(+a: Nat, +b: Nat) -> PxAddrClass:
+def pair_size(+a: Nat, +b: Nat) -> Size:
   match a:
     case 10n:
-      PxAcPrivate{}
+      Medium{}
     case 127n:
-      PxAcLoopback{}
+      Large{}
     case _:
-      PxAcPublic{}
+      Small{}
 
-def px_native_class(+hi: Nat) -> PxAddrClass:
+def raw_size(+hi: Nat) -> Size:
   match hi:
     case 0n:
-      PxAcLoopback{}
+      Large{}
     case _:
-      PxAcPublic{}
+      Small{}
 
-def px_v6_class(+v: PxV6) -> PxAddrClass:
+def input_size(+v: Input) -> Size:
   match v:
-    case PxMapped{a, b}:
-      px_v4_class(a, b)
-    case PxNative{hi}:
-      px_native_class(hi)
+    case Wrapped{a, b}:
+      pair_size(a, b)
+    case Raw{hi}:
+      raw_size(hi)
 
-# promise: an IPv4-mapped IPv6 address is classified exactly like its IPv4 address
-law px_v6_mapped_no_wider:
+# promise: a wrapped pair is sized exactly like the pair itself
+law wrapped_sized_like_pair:
   for +a: Nat
   for +b: Nat
-  {px_v6_class(PxMapped{a, b}) == px_v4_class(a, b) : PxAddrClass}
+  {input_size(Wrapped{a, b}) == pair_size(a, b) : Size}
 "#;
         assert_operator_closes_gap(
             src,
-            "px_v6_mapped_no_wider",
+            "wrapped_sized_like_pair",
             "ReturnCtor",
-            "v6call",
+            "delegated_call",
             PRE_ISSUE15_OPS,
         );
     }
 
     #[test]
     fn nat_lit_catches_zero_rejected_law() {
-        // `dh = 0` is refused because dh must equal 256n or 512n; changing a literal
+        // `width = 0` is refused because width must equal 256n or 512n; changing a literal
         // (256n -> 0n) is what breaks the law.
         let src = r#"import Base
 
-def g4_heads_valid(+nh: Nat, +nkv: Nat, +dh: Nat, +pairs: Nat) -> Bool:
-  Bool.and(Bool.or(Nat.is_eq(dh, 256n), Nat.is_eq(dh, 512n)), Nat.is_le(nkv, nh))
+def config_valid(+n: Nat, +m: Nat, +width: Nat, +extra: Nat) -> Bool:
+  Bool.and(Bool.or(Nat.is_eq(width, 256n), Nat.is_eq(width, 512n)), Nat.is_le(m, n))
 
-# promise: a zero head dimension is always rejected
-law g4_heads_zero_dh_rejected:
-  for +nh: Nat
-  for +nkv: Nat
-  for +p: Nat
-  {g4_heads_valid(nh, nkv, 0n, p) == False{} : Bool}
+# promise: a zero width is always rejected
+law zero_width_rejected:
+  for +n: Nat
+  for +m: Nat
+  for +e: Nat
+  {config_valid(n, m, 0n, e) == False{} : Bool}
 "#;
-        let dir = tmp_dir("zero_dh");
-        let caught = eval_with_ops(src, "g4_heads_zero_dh_rejected", &["NatLit"], &dir)
+        let dir = tmp_dir("zero_width");
+        let caught = eval_with_ops(src, "zero_width_rejected", &["NatLit"], &dir)
             .expect("harness compiles")
             .expect("NatLit catches the literal-guarded law");
         assert!(caught.0.contains("256n -> 0n [NatLit]"), "{caught:?}");
@@ -11618,12 +11618,12 @@ def minus_two(n: Nat) -> Nat:
       q
 
 # Multi-line parameter lists are valid Bend 2 and emit like single-line headers.
-def can_reuse_prefix(
-  +snap_pos: Nat,
-  +lcp: Nat,
-  prompt_len: Nat
+def is_between(
+  +lo: Nat,
+  +x: Nat,
+  hi: Nat
 ) -> Bool:
-  (snap_pos <= lcp : Nat) && (lcp <= prompt_len : Nat)
+  (lo <= x : Nat) && (x <= hi : Nat)
 
 def cancel_order(s: OrderState) -> OrderState:
   match s:
@@ -11693,15 +11693,15 @@ fn main() {
     let total = verified::deposit(100, 25);
     let cancelled = verified::cancel_order(verified::OrderState::Paid(total));
     let shipped = verified::cancel_order(verified::OrderState::Shipped(total));
-    let reuse = verified::can_reuse_prefix(4, 8, 16);
+    let reuse = verified::is_between(4, 8, 16);
     println!(
-        "RustyBends v1 Verified Core OK -> deposit(100, 25) = {total}, cancel(Paid) = {cancelled:?}, cancel(Shipped) = {shipped:?}, can_reuse_prefix(4, 8, 16) = {reuse}"
+        "RustyBends v1 Verified Core OK -> deposit(100, 25) = {total}, cancel(Paid) = {cancelled:?}, cancel(Shipped) = {shipped:?}, is_between(4, 8, 16) = {reuse}"
     );
 }
 
 #[cfg(test)]
 mod tests {
-    use super::verified::{can_reuse_prefix, cancel_order, deposit, minus_two, OrderState};
+    use super::verified::{cancel_order, deposit, is_between, minus_two, OrderState};
 
     #[test]
     fn verified_module_runs_with_zero_runtime_proof_overhead() {
@@ -11711,9 +11711,9 @@ mod tests {
         assert_eq!(minus_two(2), 0);
         assert_eq!(minus_two(5), 3);
         assert_eq!(cancel_order(OrderState::Paid(50)), OrderState::Cancelled);
-        assert!(can_reuse_prefix(4, 8, 16));
-        assert!(!can_reuse_prefix(9, 8, 16));
-        assert!(!can_reuse_prefix(4, 8, 7));
+        assert!(is_between(4, 8, 16));
+        assert!(!is_between(9, 8, 16));
+        assert!(!is_between(4, 8, 7));
         assert_eq!(
             cancel_order(OrderState::Shipped(50)),
             OrderState::Shipped(50)
@@ -11820,15 +11820,15 @@ def cancel_idempotent(s):
   - `Nat.add`, `Nat.mul`, `Nat.succ` -> `checked_add` / `checked_mul` (panics with `"rusty-bends: Nat overflow"` on `u64` overflow, so emitted Rust agrees with mathematical `Nat` wherever it returns and never silently saturates past `u64::MAX` into a law-violating state).
   - **List the panic sites:** `RUSTY_BENDS_LIST_PANICS=1 cargo check` prints every checked-growth op as `RustyBends panic [function]: Nat.mul at verified/file.bend:12`, so you can review which functions take untrusted input.
   - **Refuse instead of panicking (`# rusty-bends: total`):** put `# rusty-bends: total` in the comment block directly above a `def` and it emits as `Option<T>`, returning `None` on overflow anywhere in its call tree (callees get private `Option` variants; their public versions are unchanged). Callers in other `def`s keep panicking semantics (listed as `call <f>`). Its generated per-law tests still run.
-  - **Write limit checks that cannot overflow.** Compare against a quotient instead of building a product from request data:
+  - **Write limit checks that cannot overflow.** Compare against a quotient instead of building a product from untrusted input:
     ```bend
     # Panics (checked_mul) when w * h overflows u64:
-    def media_canvas_ok(+w: Nat, +h: Nat, max_pixels: Nat) -> Bool:
-      Bool.and(Bool.and(Nat.is_gt(w, 0n), Nat.is_gt(h, 0n)), Nat.is_le(Nat.mul(w, h), max_pixels))
+    def fits_area_limit(+w: Nat, +h: Nat, max_area: Nat) -> Bool:
+      Bool.and(Bool.and(Nat.is_gt(w, 0n), Nat.is_gt(h, 0n)), Nat.is_le(Nat.mul(w, h), max_area))
 
     # Never overflows: w > 0, so w * h <= max  <=>  h <= max / w
-    def media_canvas_ok(+w: Nat, +h: Nat, max_pixels: Nat) -> Bool:
-      Bool.and(Bool.and(Nat.is_gt(w, 0n), Nat.is_gt(h, 0n)), Nat.is_le(h, Nat.div(max_pixels, w)))
+    def fits_area_limit(+w: Nat, +h: Nat, max_area: Nat) -> Bool:
+      Bool.and(Bool.and(Nat.is_gt(w, 0n), Nat.is_gt(h, 0n)), Nat.is_le(h, Nat.div(max_area, w)))
     ```
   - `Nat.sub`, `Nat.pred` -> `saturating_sub` (exact match for Peano `0n - x == 0n`).
   - `Nat.div(a, b)` / `Nat.mod(a, b)` / `Nat.divmod(a, b)` -> total div/mod matching Bend 2 (`Nat.div(a, 0n) == 0n`, `Nat.mod(a, 0n) == a`)

@@ -10,9 +10,6 @@ the proofs, and emits the remaining functions and data types as plain Rust that 
 The pattern is called **"Verified Core, Rust Shell"**: the verified core is `verified/*.bend`,
 and the Rust shell (I/O, FFI, threads, networking, CLI) calls into it.
 
-It is used by [Gaudium](https://github.com/Josephur/Gaudium), an inference engine for the
-Intel Gaudi 2, whose `rusty-bends-build/` directory is a copy of the crate in this repository.
-
 ## What `rusty-bends-build` does
 
 On each build, for every `.bend` file in the verified directory:

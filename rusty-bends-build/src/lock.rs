@@ -729,17 +729,17 @@ law beta:
         let src_b = r#"import Base
 import base_rules.bend as B
 
-# promise: us_both with identical bounds agrees with br_within
-law us_both_diag:
+# promise: within_both with identical bounds agrees with within_limit
+law within_both_diag:
   for +pos: Nat
   for +a: Nat
-  {us_both(pos, a, a) == B.br_within(pos, a) : Bool}
+  {within_both(pos, a, a) == B.within_limit(pos, a) : Bool}
 "#;
         fs::write(&uses, src_b).unwrap();
         enforce_law_lock(&lock, std::slice::from_ref(&uses), false).unwrap();
         let hash_b = extract_canonical_laws(std::slice::from_ref(&uses))
             .unwrap()
-            .get("us_both_diag")
+            .get("within_both_diag")
             .unwrap()
             .hash
             .clone();
@@ -747,16 +747,16 @@ law us_both_diag:
         let src_rules = r#"import Base
 import base_rules.bend as Rules
 
-# promise: us_both with identical bounds agrees with br_within
-law us_both_diag:
+# promise: within_both with identical bounds agrees with within_limit
+law within_both_diag:
   for +pos: Nat
   for +a: Nat
-  {us_both(pos, a, a) == Rules.br_within(pos, a) : Bool}
+  {within_both(pos, a, a) == Rules.within_limit(pos, a) : Bool}
 "#;
         fs::write(&uses, src_rules).unwrap();
         let hash_rules = extract_canonical_laws(std::slice::from_ref(&uses))
             .unwrap()
-            .get("us_both_diag")
+            .get("within_both_diag")
             .unwrap()
             .hash
             .clone();

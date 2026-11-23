@@ -23,12 +23,12 @@ def minus_two(n: Nat) -> Nat:
       q
 
 # Multi-line parameter lists are valid Bend 2 and emit like single-line headers.
-def can_reuse_prefix(
-  +snap_pos: Nat,
-  +lcp: Nat,
-  prompt_len: Nat
+def is_between(
+  +lo: Nat,
+  +x: Nat,
+  hi: Nat
 ) -> Bool:
-  (snap_pos <= lcp : Nat) && (lcp <= prompt_len : Nat)
+  (lo <= x : Nat) && (x <= hi : Nat)
 
 def cancel_order(s: OrderState) -> OrderState:
   match s:

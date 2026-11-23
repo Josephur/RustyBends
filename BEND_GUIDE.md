@@ -95,15 +95,15 @@ def cancel_idempotent(s):
   - `Nat.add`, `Nat.mul`, `Nat.succ` -> `checked_add` / `checked_mul` (panics with `"rusty-bends: Nat overflow"` on `u64` overflow, so emitted Rust agrees with mathematical `Nat` wherever it returns and never silently saturates past `u64::MAX` into a law-violating state).
   - **List the panic sites:** `RUSTY_BENDS_LIST_PANICS=1 cargo check` prints every checked-growth op as `RustyBends panic [function]: Nat.mul at verified/file.bend:12`, so you can review which functions take untrusted input.
   - **Refuse instead of panicking (`# rusty-bends: total`):** put `# rusty-bends: total` in the comment block directly above a `def` and it emits as `Option<T>`, returning `None` on overflow anywhere in its call tree (callees get private `Option` variants; their public versions are unchanged). Callers in other `def`s keep panicking semantics (listed as `call <f>`). Its generated per-law tests still run.
-  - **Write limit checks that cannot overflow.** Compare against a quotient instead of building a product from request data:
+  - **Write limit checks that cannot overflow.** Compare against a quotient instead of building a product from untrusted input:
     ```bend
     # Panics (checked_mul) when w * h overflows u64:
-    def media_canvas_ok(+w: Nat, +h: Nat, max_pixels: Nat) -> Bool:
-      Bool.and(Bool.and(Nat.is_gt(w, 0n), Nat.is_gt(h, 0n)), Nat.is_le(Nat.mul(w, h), max_pixels))
+    def fits_area_limit(+w: Nat, +h: Nat, max_area: Nat) -> Bool:
+      Bool.and(Bool.and(Nat.is_gt(w, 0n), Nat.is_gt(h, 0n)), Nat.is_le(Nat.mul(w, h), max_area))
 
     # Never overflows: w > 0, so w * h <= max  <=>  h <= max / w
-    def media_canvas_ok(+w: Nat, +h: Nat, max_pixels: Nat) -> Bool:
-      Bool.and(Bool.and(Nat.is_gt(w, 0n), Nat.is_gt(h, 0n)), Nat.is_le(h, Nat.div(max_pixels, w)))
+    def fits_area_limit(+w: Nat, +h: Nat, max_area: Nat) -> Bool:
+      Bool.and(Bool.and(Nat.is_gt(w, 0n), Nat.is_gt(h, 0n)), Nat.is_le(h, Nat.div(max_area, w)))
     ```
   - `Nat.sub`, `Nat.pred` -> `saturating_sub` (exact match for Peano `0n - x == 0n`).
   - `Nat.div(a, b)` / `Nat.mod(a, b)` / `Nat.divmod(a, b)` -> total div/mod matching Bend 2 (`Nat.div(a, 0n) == 0n`, `Nat.mod(a, 0n) == a`)

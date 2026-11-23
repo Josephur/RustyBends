@@ -2999,11 +2999,11 @@ import Base
 def can_fit(used: Nat, req: Nat, cap: Nat, enabled: Bool) -> Bool:
   Bool.and(enabled, Bool.or(Nat.is_le(Nat.add(used, req), cap), Bool.not(Nat.is_gt(req, 0n))))
 
-def clamp_blocks(n: Nat, lo: Nat, hi: Nat) -> Nat:
+def clamp_range(n: Nat, lo: Nat, hi: Nat) -> Nat:
   Nat.min(Nat.max(n, lo), hi)
 
-def tiles_needed(tokens: Nat, tile: Nat) -> Nat:
-  Nat.add(Nat.div(tokens, tile), Bool.pick(Nat, Nat.is_eq(Nat.mod(tokens, tile), 0n), 0n, 1n))
+def chunks_needed(items: Nat, size: Nat) -> Nat:
+  Nat.add(Nat.div(items, size), Bool.pick(Nat, Nat.is_eq(Nat.mod(items, size), 0n), 0n, 1n))
 
 def cmp_flags(a: Nat, b: Nat) -> Bool:
   Bool.and(Nat.is_lt(a, b), Nat.is_ge(b, a))
@@ -3020,7 +3020,7 @@ def cmp_flags(a: Nat, b: Nat) -> Bool:
         assert!(summary
             .rust_source
             .contains("if __b == 0_u64 { __a } else { __a % __b }"));
-        assert!(summary.rust_source.contains("if (({ let __a = tokens;"));
+        assert!(summary.rust_source.contains("if (({ let __a = items;"));
         assert!(summary
             .rust_source
             .contains("(((a) < (b))) && (((b) >= (a)))"));
@@ -3061,11 +3061,11 @@ def sub_nat(a: Nat, b: Nat) -> Nat:
         let src = r#"
 import Base
 
-type PoolState is Data:
+type Store is Data:
   Ready{free: Nat}
   Exhausted{}
 
-def try_alloc(state: PoolState, req: Nat) -> PoolState:
+def try_take(state: Store, req: Nat) -> Store:
   match state:
     case Ready{free}:
       let ok = Nat.is_le(req, free)
@@ -3096,7 +3096,7 @@ def helper_lemma(x: Nat) -> {x == x : Nat}:
         assert!(summary.rust_source.contains("match ok {"));
         assert!(summary
             .rust_source
-            .contains("true => PoolState::Ready((free).saturating_sub(req)),"));
+            .contains("true => Store::Ready((free).saturating_sub(req)),"));
         assert!(summary.rust_source.contains("match (a, b) {"));
         assert!(summary.rust_source.contains("(0_u64, _) => 0_u64,"));
         assert!(summary.rust_source.contains("(__rb_n0 @ 1_u64..=u64::MAX, __rb_n1 @ 1_u64..=u64::MAX) => { let ap = __rb_n0 - 1_u64; let bp = __rb_n1 - 1_u64;"));
@@ -3108,8 +3108,8 @@ def helper_lemma(x: Nat) -> {x == x : Nat}:
         let src = r#"
 import Base
 
-def split_tiles(n: Nat, tile: Nat) -> Nat & Nat:
-  Nat.divmod(n, tile)
+def split_chunks(n: Nat, size: Nat) -> Nat & Nat:
+  Nat.divmod(n, size)
 
 def first_of_pair(p: Nat & Nat) -> Nat:
   Pair.fst(Nat, Nat, p)
@@ -3117,7 +3117,7 @@ def first_of_pair(p: Nat & Nat) -> Nat:
         let summary = emit_verified_rust(src, 0).expect("pair emit succeeded");
         assert!(summary
             .rust_source
-            .contains("pub fn split_tiles(n: u64, tile: u64) -> (u64, u64)"));
+            .contains("pub fn split_chunks(n: u64, size: u64) -> (u64, u64)"));
         assert!(summary
             .rust_source
             .contains("if __b == 0_u64 { (0_u64, __a) } else { (__a / __b, __a % __b) }"));
@@ -3133,13 +3133,13 @@ def first_of_pair(p: Nat & Nat) -> Nat:
         let src = r#"
 import Base
 
-def pfx_reuse_valid(
-  +snap_pos: Nat,  # comment inside the header
-  +lcp: Nat,
-  prompt_len: Nat,
-  +tile: Nat
+def in_order(
+  +lo: Nat,  # comment inside the header
+  +mid: Nat,
+  hi: Nat,
+  +step: Nat
 ) -> Bool:
-  (snap_pos <= lcp : Nat) && (lcp <= prompt_len : Nat)
+  (lo <= mid : Nat) && (mid <= hi : Nat)
 
 def add_zero_eq(
   n: Nat
@@ -3155,9 +3155,9 @@ def one_liner(n: Nat) -> Nat: Nat.add(n, 1n)
 "#;
         let summary = emit_verified_rust(src, 0).expect("multi-line headers emit");
         assert_eq!(summary.defs_emitted, 2);
-        assert!(summary.rust_source.contains(
-            "pub fn pfx_reuse_valid(snap_pos: u64, lcp: u64, prompt_len: u64, tile: u64) -> bool"
-        ));
+        assert!(summary
+            .rust_source
+            .contains("pub fn in_order(lo: u64, mid: u64, hi: u64, step: u64) -> bool"));
         assert!(summary
             .rust_source
             .contains("pub fn one_liner(n: u64) -> u64"));
@@ -3184,7 +3184,7 @@ def minus_two(n: Nat) -> Nat:
     case 1n+1n+q:
       q
 
-def px_net_span_match(a: Nat, b: Nat, span: Nat) -> Bool:
+def within_span(a: Nat, b: Nat, span: Nat) -> Bool:
   match span:
     case 0n:
       True{}
@@ -3257,7 +3257,7 @@ def minus_two(n: Nat) -> Nat:
     case 1n+1n+q:
       q
 
-def px_net_span_match(a: Nat, b: Nat, span: Nat) -> Bool:
+def within_span(a: Nat, b: Nat, span: Nat) -> Bool:
   match span:
     case 0n:
       True{}
@@ -3294,7 +3294,7 @@ def px_net_span_match(a: Nat, b: Nat, span: Nat) -> Bool:
         let rs_path = dir.join("test.rs");
         let bin_path = dir.join("test_bin");
         let harness = format!(
-            "{}\nfn main() {{\n    assert_eq!(minus_two(0), 0);\n    assert_eq!(minus_two(1), 0);\n    assert_eq!(minus_two(2), 0);\n    assert_eq!(minus_two(5), 3);\n    assert!(px_net_span_match(10, 20, 0));\n    assert!(px_net_span_match(7, 7, 1));\n    assert!(!px_net_span_match(7, 8, 1));\n    assert!(px_net_span_match(5, 3, 2));\n    assert!(!px_net_span_match(10, 3, 2));\n}}\n",
+            "{}\nfn main() {{\n    assert_eq!(minus_two(0), 0);\n    assert_eq!(minus_two(1), 0);\n    assert_eq!(minus_two(2), 0);\n    assert_eq!(minus_two(5), 3);\n    assert!(within_span(10, 20, 0));\n    assert!(within_span(7, 7, 1));\n    assert!(!within_span(7, 8, 1));\n    assert!(within_span(5, 3, 2));\n    assert!(!within_span(10, 3, 2));\n}}\n",
             summary.rust_source
         );
         std::fs::write(&rs_path, harness).unwrap();
@@ -3508,36 +3508,36 @@ type Status is Data:
   Open{}
   Closed{}
 
-def br_within(pos: Nat, limit: Nat) -> Bool:
+def within_limit(pos: Nat, limit: Nat) -> Bool:
   Nat.is_le(pos, limit)
 "#;
         let uses_src = r#"import Base
 import base_rules.bend as B  # trailing comment
 
-def us_both(+pos: Nat, a: Nat, b: Nat) -> Bool:
-  Bool.and(B.br_within(pos, a), Nat.is_le(pos, b))
+def within_both(+pos: Nat, a: Nat, b: Nat) -> Bool:
+  Bool.and(B.within_limit(pos, a), Nat.is_le(pos, b))
 
-def us_open_or(s: B.Status, flag: Bool) -> Bool:
+def open_or(s: B.Status, flag: Bool) -> Bool:
   match s:
     case B.Open{}: True{}
     case B.Closed{}: flag
 
-# promise: B.br_within comment text stays untouched
-law us_both_diag:
+# promise: B.within_limit comment text stays untouched
+law within_both_diag:
   for +pos: Nat
   for +a: Nat
-  {us_both(pos, a, a) == B.br_within(pos, a) : Bool}
+  {within_both(pos, a, a) == B.within_limit(pos, a) : Bool}
 "#;
         let resolved_uses = resolve_import_aliases(uses_src);
         // Idempotent
         assert_eq!(resolve_import_aliases(&resolved_uses), resolved_uses);
         assert!(!resolved_uses.contains("import base_rules.bend"));
         assert!(resolved_uses.contains("import Base"));
-        assert!(resolved_uses.contains("br_within(pos, a)"));
+        assert!(resolved_uses.contains("within_limit(pos, a)"));
         assert!(resolved_uses.contains("s: Status, flag: Bool"));
         assert!(resolved_uses.contains("case Open{}:"));
-        assert!(resolved_uses.contains("# promise: B.br_within comment text stays untouched"));
-        assert!(!resolved_uses.contains("B.br_within(pos, a)"));
+        assert!(resolved_uses.contains("# promise: B.within_limit comment text stays untouched"));
+        assert!(!resolved_uses.contains("B.within_limit(pos, a)"));
 
         // Per-file isolation: a sibling file without `as B` can define its own `type B`
         let other_src = r#"import Base
@@ -3556,11 +3556,11 @@ def use_b(x: B) -> Nat:
             resolve_import_aliases(other_src)
         );
         let summary = emit_verified_rust(&combined, 1).expect("emit with resolved aliases");
-        assert!(!summary.rust_source.contains("B::br_within"));
+        assert!(!summary.rust_source.contains("B::within_limit"));
         assert!(!summary.rust_source.contains("B::Status"));
         assert!(!summary.rust_source.contains("B::Open"));
         assert!(summary.rust_source.contains("B::Tag"));
-        assert!(summary.rust_source.contains("br_within(pos, a)"));
+        assert!(summary.rust_source.contains("within_limit(pos, a)"));
         assert!(summary.rust_source.contains("pub enum Status"));
         assert!(summary.rust_source.contains("pub enum B"));
     }
@@ -3601,28 +3601,28 @@ def checked_id(x: Nat, -proof: {x == x : Nat}) -> Nat:
             .contains("pub fn checked_id(x: u64) -> u64"));
     }
 
-    const CANVAS_SRC: &str = r#"import Base
+    const AREA_SRC: &str = r#"import Base
 
 def area(+w: Nat, +h: Nat) -> Nat:
   Nat.mul(w, h)
 
-def media_canvas_ok(+w: Nat, +h: Nat, max_pixels: Nat) -> Bool:
-  Bool.and(Bool.and(Nat.is_gt(w, 0n), Nat.is_gt(h, 0n)), Nat.is_le(area(w, h), max_pixels))
+def fits_area_limit(+w: Nat, +h: Nat, max_area: Nat) -> Bool:
+  Bool.and(Bool.and(Nat.is_gt(w, 0n), Nat.is_gt(h, 0n)), Nat.is_le(area(w, h), max_area))
 
-def canvas_gate(+w: Nat, +h: Nat) -> Bool:
-  media_canvas_ok(w, h, 1000n)
+def fits_default_limit(+w: Nat, +h: Nat) -> Bool:
+  fits_area_limit(w, h, 1000n)
 
-# promise: a zero-width canvas is always refused
+# promise: a zero-width rectangle is always refused
 law zero_width_refused:
   for +h: Nat
   for +m: Nat
-  {media_canvas_ok(0n, h, m) == False{} : Bool}
+  {fits_area_limit(0n, h, m) == False{} : Bool}
 "#;
 
-    fn total_canvas_src() -> String {
-        CANVAS_SRC.replace(
-            "def media_canvas_ok(",
-            "# Request data reaches this check: refuse instead of panicking.\n# rusty-bends: total\ndef media_canvas_ok(",
+    fn total_area_src() -> String {
+        AREA_SRC.replace(
+            "def fits_area_limit(",
+            "# Untrusted input reaches this check: refuse instead of panicking.\n# rusty-bends: total\ndef fits_area_limit(",
         )
     }
 
@@ -3662,7 +3662,7 @@ law zero_width_refused:
 
     #[test]
     fn records_checked_growth_panic_sites_and_lists_them_with_file_and_line() {
-        let summary = emit_verified_rust(CANVAS_SRC, 1).unwrap();
+        let summary = emit_verified_rust(AREA_SRC, 1).unwrap();
         let sites: Vec<(&str, &str)> = summary
             .panic_sites
             .iter()
@@ -3670,11 +3670,11 @@ law zero_width_refused:
             .collect();
         assert_eq!(sites, vec![("area", "Nat.mul")]);
 
-        let path = std::path::Path::new("verified/media.bend");
-        let listing = crate::format_panic_sites(&summary.panic_sites, &[(path, CANVAS_SRC)]);
+        let path = std::path::Path::new("verified/shapes.bend");
+        let listing = crate::format_panic_sites(&summary.panic_sites, &[(path, AREA_SRC)]);
         assert_eq!(
             listing[0],
-            "RustyBends panic [area]: Nat.mul at verified/media.bend:4"
+            "RustyBends panic [area]: Nat.mul at verified/shapes.bend:4"
         );
         assert!(listing[1].contains("1 checked-growth panic site(s) in 1 function(s)"));
         assert!(listing[1].contains("# rusty-bends: total"));
@@ -3689,15 +3689,15 @@ law zero_width_refused:
 
     #[test]
     fn total_marker_emits_option_returning_function_that_refuses_overflow() {
-        let src = total_canvas_src();
+        let src = total_area_src();
         let (_, defs) = parse_book_items(&src).unwrap();
-        assert!(defs.iter().any(|d| d.name == "media_canvas_ok" && d.total));
+        assert!(defs.iter().any(|d| d.name == "fits_area_limit" && d.total));
         assert!(defs.iter().any(|d| d.name == "area" && !d.total));
 
         let summary = emit_verified_rust(&src, 1).unwrap();
         let rs = &summary.rust_source;
         assert!(
-            rs.contains("pub fn media_canvas_ok(w: u64, h: u64, max_pixels: u64) -> Option<bool>"),
+            rs.contains("pub fn fits_area_limit(w: u64, h: u64, max_area: u64) -> Option<bool>"),
             "{rs}"
         );
         // Callee gets a private Option shadow; its public form keeps panicking semantics.
@@ -3718,26 +3718,26 @@ law zero_width_refused:
             vec![
                 ("area".to_string(), "Nat.mul".to_string()),
                 (
-                    "canvas_gate".to_string(),
-                    "call media_canvas_ok".to_string()
+                    "fits_default_limit".to_string(),
+                    "call fits_area_limit".to_string()
                 ),
             ]
         );
-        let path = std::path::Path::new("verified/media.bend");
+        let path = std::path::Path::new("verified/shapes.bend");
         let listing = crate::format_panic_sites(&summary.panic_sites, &[(path, &src)]);
         assert!(listing.iter().any(|l| l
-            == "RustyBends panic [canvas_gate]: call media_canvas_ok at verified/media.bend:12"));
+            == "RustyBends panic [fits_default_limit]: call fits_area_limit at verified/shapes.bend:12"));
 
         let runtime_only = rs.split("#[cfg(test)]").next().unwrap();
         let harness = format!(
-            "{runtime_only}\nfn main() {{\n    assert_eq!(media_canvas_ok(u64::MAX, u64::MAX, u64::MAX - 1), None);\n    assert_eq!(media_canvas_ok(10, 10, 100), Some(true));\n    assert_eq!(media_canvas_ok(10, 11, 100), Some(false));\n    assert_eq!(media_canvas_ok(0, 5, 100), Some(false));\n    assert!(std::panic::catch_unwind(|| area(u64::MAX, 2)).is_err());\n    assert!(canvas_gate(10, 10));\n    assert!(!canvas_gate(100, 100));\n}}\n"
+            "{runtime_only}\nfn main() {{\n    assert_eq!(fits_area_limit(u64::MAX, u64::MAX, u64::MAX - 1), None);\n    assert_eq!(fits_area_limit(10, 10, 100), Some(true));\n    assert_eq!(fits_area_limit(10, 11, 100), Some(false));\n    assert_eq!(fits_area_limit(0, 5, 100), Some(false));\n    assert!(std::panic::catch_unwind(|| area(u64::MAX, 2)).is_err());\n    assert!(fits_default_limit(10, 10));\n    assert!(!fits_default_limit(100, 100));\n}}\n"
         );
         compile_and_run("runtime", &harness, &[]);
     }
 
     #[test]
     fn total_function_generated_law_test_still_runs() {
-        let summary = emit_verified_rust(&total_canvas_src(), 1).unwrap();
+        let summary = emit_verified_rust(&total_area_src(), 1).unwrap();
         assert!(summary.rust_source.contains("fn law_zero_width_refused()"));
         let out = compile_and_run(
             "lawtest",
