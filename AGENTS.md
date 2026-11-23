@@ -6,13 +6,15 @@ If it compiles, the laws hold.
 
 ## Layout
 
-- `crates/` — our code. All new Rust code lives here, one crate per
-  directory. Tests live next to the code (`#[cfg(test)]` or `tests/`).
+- `rusty-bends-build/` — the build crate (proof gate, law lock, Rust
+  emitter); `example-app/` — a crate that uses it. Tests live next to the
+  code (`#[cfg(test)]` or `tests/`).
+- `src/` — the BendTT Kernel Workbench web app (React + Vite).
 - `upstream/` — read-only reference checkouts (git submodules). **Never
   edit, never commit inside them.** The Bend 2 compiler sources are at
   `upstream/bend/bend2/`; the language kernel spec is
   `upstream/bend/bend2/bendtt.lean`.
-- `Cargo.toml` (root) — workspace only. No code at the root.
+- `Cargo.toml` (root) — Rust workspace only. No Rust code at the root.
 
 ## Upstream rules
 
