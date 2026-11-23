@@ -800,18 +800,11 @@ pub fn parse_book_items(source: &str) -> Result<(Vec<TypeDef>, Vec<Def>), String
             }
 
             let body = body_lines.join("\n");
-            let def_name = header_part.split('(').next().unwrap_or("").trim();
-            let is_eq_proof_ret = header_part
-                .split_once("->")
-                .map(|(_, ret)| ret.trim().starts_with('{'))
-                .unwrap_or(false);
 
-            // Real Bend 2 proof definitions share their law's name, return an equality type '{...}',
-            // or omit '->' and return '{==}'. Erase all proof definitions before Rust codegen.
-            if law_names.contains(def_name)
-                || is_eq_proof_ret
-                || (!header_part.contains("->") && body.contains("{==}"))
-            {
+            // Real Bend 2 proof and type-level definitions (matching law names, equality
+            // return types '{...}', Type/Data/Empty/Kind return types, equality/Empty proof
+            // arguments, or body '{==}' without '->') are q=0 and erased before codegen.
+            if is_erased_proof_or_type_def(header_part, &body, &law_names) {
                 continue;
             }
 
@@ -828,6 +821,67 @@ pub fn parse_book_items(source: &str) -> Result<(Vec<TypeDef>, Vec<Def>), String
     }
 
     Ok((types, defs))
+}
+
+fn is_erased_proof_or_type_def(header_part: &str, body: &str, law_names: &HashSet<String>) -> bool {
+    let def_name = header_part.split('(').next().unwrap_or("").trim();
+    if law_names.contains(def_name) {
+        return true;
+    }
+
+    let mut params_raw = "";
+    let mut tail = header_part;
+    if let Some(open) = header_part.find('(') {
+        let mut depth = 0i32;
+        let mut close = None;
+        for (idx, ch) in header_part[open..].char_indices() {
+            match ch {
+                '(' => depth += 1,
+                ')' => {
+                    depth -= 1;
+                    if depth == 0 {
+                        close = Some(open + idx);
+                        break;
+                    }
+                }
+                _ => {}
+            }
+        }
+        if let Some(c) = close {
+            params_raw = header_part[open + 1..c].trim();
+            tail = header_part[c + 1..].trim();
+        }
+    }
+
+    if let Some(ret) = tail.strip_prefix("->").map(str::trim) {
+        if ret.starts_with('{')
+            || matches!(ret, "Type" | "Data" | "Empty" | "*0" | "*1" | "*2")
+            || ret.starts_with("Kind(")
+            || (ret.contains('{') && ret.contains("=="))
+        {
+            return true;
+        }
+    } else if body.contains("{==}") {
+        return true;
+    }
+
+    if !params_raw.is_empty() {
+        for chunk in split_type_args(params_raw, ',') {
+            let item = chunk.trim();
+            if item.is_empty() {
+                continue;
+            }
+            if let Some((lhs, ty)) = split_type_args_once(item, ':') {
+                let lhs = lhs.trim();
+                let ty = ty.trim();
+                if !lhs.starts_with('-') && (ty.starts_with('{') || ty == "Empty") {
+                    return true;
+                }
+            }
+        }
+    }
+
+    false
 }
 
 fn parse_variant(raw: &str) -> Result<Variant, String> {
@@ -3356,5 +3410,41 @@ def use_b(x: B) -> Nat:
         assert!(summary.rust_source.contains("br_within(pos, a)"));
         assert!(summary.rust_source.contains("pub enum Status"));
         assert!(summary.rust_source.contains("pub enum B"));
+    }
+
+    #[test]
+    fn erases_type_level_and_proof_only_helper_defs() {
+        let bundled = emit_verified_rust(include_str!("../lemmas/nat_lemmas.bend"), 0)
+            .expect("bundled nat_lemmas.bend should parse and erase cleanly");
+        assert_eq!(bundled.types_emitted, 0);
+        assert_eq!(bundled.defs_emitted, 0);
+
+        let mixed = r#"import Base
+
+def bool_pick_type(b: Bool, t: Type, f: Type) -> Type:
+  match b:
+    case True{}:
+      t
+    case False{}:
+      f
+
+def bool_false_ne_true(h: {False{} == True{} : Bool}) -> Empty:
+  %h : bool_pick_type(_, Empty, Unit)
+  Unit{}
+
+def bool_absurd(-A: Type, h: {False{} == True{} : Bool}) -> A:
+  Empty.absurd(A, bool_false_ne_true(h))
+
+def checked_id(x: Nat, -proof: {x == x : Nat}) -> Nat:
+  x
+"#;
+        let summary = emit_verified_rust(mixed, 0).expect("mixed source should emit");
+        assert_eq!(summary.defs_emitted, 1);
+        assert!(!summary.rust_source.contains("bool_pick_type"));
+        assert!(!summary.rust_source.contains("bool_false_ne_true"));
+        assert!(!summary.rust_source.contains("bool_absurd"));
+        assert!(summary
+            .rust_source
+            .contains("pub fn checked_id(x: u64) -> u64"));
     }
 }

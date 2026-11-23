@@ -112,7 +112,7 @@ test('starter kit and AI kickoff prompt generate all required v1.0.0 artifacts',
     'pub fn f(n: u64) -> u64 { n }',
     'bend-lock:1234'
   );
-  assert.equal(files.length, 13);
+  assert.equal(files.length, 14);
   const byPath = new Map(files.map((f) => [f.path, f]));
 
   assert.ok(byPath.has('rusty-bends-build/Cargo.toml'));
@@ -122,6 +122,7 @@ test('starter kit and AI kickoff prompt generate all required v1.0.0 artifacts',
   assert.ok(byPath.has('rusty-bends-build/src/law_test.rs'));
   assert.ok(byPath.has('rusty-bends-build/src/mutate.rs'));
   assert.ok(byPath.has('rusty-bends-build/src/bin/rusty-bends-laws.rs'));
+  assert.ok(byPath.has('rusty-bends-build/lemmas/nat_lemmas.bend'));
   assert.ok(byPath.has('example-app/Cargo.toml'));
   assert.ok(byPath.has('example-app/build.rs'));
   assert.ok(byPath.has('example-app/bend.pin'));
@@ -134,6 +135,8 @@ test('starter kit and AI kickoff prompt generate all required v1.0.0 artifacts',
   assert.ok(libRs.includes('pub mod emit;'));
   assert.ok(libRs.includes('--check-only'));
   assert.ok(libRs.includes('--verdict'));
+  assert.ok(libRs.includes('pub const NAT_LEMMAS_BEND'));
+  assert.ok(libRs.includes('pub fn write_nat_lemmas'));
   assert.ok(libRs.includes('pub fn verify_and_emit'));
   assert.ok(libRs.includes('verify_bend_version_str'));
   assert.ok(libRs.includes('E_BEND_VERSION_MISMATCH'));

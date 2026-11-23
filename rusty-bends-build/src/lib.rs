@@ -97,6 +97,36 @@ impl Default for Config {
     }
 }
 
+/// Shared Bend 2 Nat arithmetic, order, and division lemma library (`nat_lemmas.bend`).
+/// Every definition is a `q=0` proof/type helper and is completely erased before Rust codegen.
+pub const NAT_LEMMAS_BEND: &str = include_str!("../lemmas/nat_lemmas.bend");
+
+/// Writes the bundled `nat_lemmas.bend` into `dir` (typically `"verified"`), creating
+/// the directory if needed. Only writes when the file is missing or differs, keeping
+/// mtime stable for Cargo incremental rebuilds.
+pub fn write_nat_lemmas(dir: impl AsRef<Path>) -> Result<PathBuf, String> {
+    let dir = dir.as_ref();
+    fs::create_dir_all(dir).map_err(|e| {
+        format!(
+            "[E_NAT_LEMMAS_WRITE] Failed to create '{}': {e}",
+            dir.display()
+        )
+    })?;
+    let dest = dir.join("nat_lemmas.bend");
+    let unchanged = fs::read_to_string(&dest)
+        .map(|existing| existing == NAT_LEMMAS_BEND)
+        .unwrap_or(false);
+    if !unchanged {
+        fs::write(&dest, NAT_LEMMAS_BEND).map_err(|e| {
+            format!(
+                "[E_NAT_LEMMAS_WRITE] Failed to write '{}': {e}",
+                dest.display()
+            )
+        })?;
+    }
+    Ok(dest)
+}
+
 /// Primary build.rs entry point: checks bend.pin, enforces token-canonical law lock,
 /// runs real 'bend <file> --check-only' (plus '--verdict' when Lean/$BENDTT is available),
 /// and emits pure Rust into OUT_DIR/verified.rs.
@@ -1084,6 +1114,155 @@ def us_open_or_open(flag):
         assert!(!emitted.contains("B::"), "emitted leaked B::\n{emitted}");
         assert!(emitted.contains("br_within(pos, a)"), "got:\n{emitted}");
         assert!(emitted.contains("pub enum Status"), "got:\n{emitted}");
+
+        let bin_path = root.join("out/test_bin");
+        let rustc = env::var("RUSTC").unwrap_or_else(|_| "rustc".to_string());
+        let compile = Command::new(&rustc)
+            .args(["--edition", "2021", "--test", "-D", "warnings", "-o"])
+            .arg(&bin_path)
+            .arg(&out_rs)
+            .output()
+            .expect("rustc --test must execute");
+        assert!(
+            compile.status.success(),
+            "rustc --test failed:\n{}",
+            String::from_utf8_lossy(&compile.stderr)
+        );
+        let run_tests = Command::new(&bin_path)
+            .output()
+            .expect("generated law test binary must run");
+        assert!(
+            run_tests.status.success(),
+            "generated law tests failed:\n{}{}",
+            String::from_utf8_lossy(&run_tests.stdout),
+            String::from_utf8_lossy(&run_tests.stderr)
+        );
+
+        let _ = fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn nat_lemmas_bend_checks_with_bend_verdict_and_erases_completely() {
+        let root = temp_workspace("issue11_lemmas_only");
+        let lemma_path = write_nat_lemmas(root.join("verified"))
+            .expect("write_nat_lemmas should create nat_lemmas.bend");
+        assert!(lemma_path.ends_with("verified/nat_lemmas.bend"));
+        assert_eq!(fs::read_to_string(&lemma_path).unwrap(), NAT_LEMMAS_BEND);
+
+        // Idempotent second write preserves content.
+        let lemma_path_2 =
+            write_nat_lemmas(root.join("verified")).expect("idempotent write_nat_lemmas");
+        assert_eq!(lemma_path_2, lemma_path);
+
+        let erased =
+            emit::emit_verified_rust(NAT_LEMMAS_BEND, 0).expect("nat_lemmas.bend must emit");
+        assert_eq!(erased.types_emitted, 0);
+        assert_eq!(erased.defs_emitted, 0);
+
+        let bend_bin = resolve_bend_bin(
+            env::var("BEND_BIN").ok(),
+            env::var_os("PATH"),
+            env::var_os("HOME").map(PathBuf::from),
+        );
+        if Path::new(&bend_bin).is_file() || env::var("BEND_BIN").is_ok() {
+            run_bend_step(&bend_bin, "--check-only", &lemma_path)
+                .expect("nat_lemmas.bend must pass bend --check-only");
+            if has_verdict_runtime() {
+                run_bend_step(&bend_bin, "--verdict", &lemma_path)
+                    .expect("nat_lemmas.bend must pass bend --verdict");
+            }
+        }
+
+        let _ = fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn tile_split_laws_verified_with_bundled_nat_lemmas() {
+        let root = temp_workspace("issue11_tile_split");
+        let _ = write_nat_lemmas(root.join("verified"))
+            .expect("write_nat_lemmas should populate verified/");
+        let tiles = root.join("verified/tiles.bend");
+        fs::write(
+            &tiles,
+            r#"import Base
+import nat_lemmas.bend as L
+
+def tile_chunk(t: Nat, tpc: Nat) -> Nat:
+  Nat.div(t, 1n+tpc)
+
+def tile_place(t: Nat, tpc: Nat) -> Nat:
+  Nat.mod(t, 1n+tpc)
+
+def tile_offset(chunk: Nat, place: Nat, tpc: Nat) -> Nat:
+  Nat.add(place, Nat.mul(chunk, 1n+tpc))
+
+# promise: every tile index maps to a place strictly below tiles_per_chunk
+law tile_place_lt:
+  for t: Nat
+  for tpc: Nat
+  {Nat.is_lt(tile_place(t, tpc), 1n+tpc) == True{} : Bool}
+
+def tile_place_lt(t, tpc):
+  L.nat_mod_lt(t, tpc)
+
+# promise: splitting a tile into chunk and place reconstructs the original tile index
+law tile_split_reconstructs:
+  for t: Nat
+  for tpc: Nat
+  {tile_offset(tile_chunk(t, tpc), tile_place(t, tpc), tpc) == t : Nat}
+
+def tile_split_reconstructs(t, tpc):
+  L.nat_div_mod(t, tpc)
+
+# promise: every tile index below chunks * tiles_per_chunk maps to a chunk strictly below chunks
+law tile_chunk_in_bounds:
+  for t: Nat
+  for chunks: Nat
+  for tpc: Nat
+  for h: {Nat.is_lt(t, Nat.mul(chunks, 1n+tpc)) == True{} : Bool}
+  {Nat.is_lt(tile_chunk(t, tpc), chunks) == True{} : Bool}
+
+def tile_chunk_in_bounds(t, chunks, tpc, h):
+  L.nat_div_lt_of_lt_mul(t, chunks, tpc, h)
+"#,
+        )
+        .unwrap();
+
+        let mut cfg = make_cfg(&root);
+        cfg.bend_bin = resolve_bend_bin(
+            env::var("BEND_BIN").ok(),
+            env::var_os("PATH"),
+            env::var_os("HOME").map(PathBuf::from),
+        );
+        cfg.verdict_mode = if has_verdict_runtime() {
+            VerdictMode::Require
+        } else {
+            VerdictMode::Off
+        };
+
+        let out_rs = run(&cfg)
+            .expect("tile split laws using nat_lemmas.bend must pass bend, mutation check, lock, and emit")
+            .expect("expected emitted verified.rs");
+        let emitted = fs::read_to_string(&out_rs).unwrap();
+        assert!(emitted.contains("pub fn tile_chunk("), "got:\n{emitted}");
+        assert!(emitted.contains("pub fn tile_place("), "got:\n{emitted}");
+        assert!(emitted.contains("pub fn tile_offset("), "got:\n{emitted}");
+        assert!(
+            !emitted.contains("nat_mod_lt"),
+            "emitted leaked proof helper:\n{emitted}"
+        );
+        assert!(
+            !emitted.contains("nat_div_mod"),
+            "emitted leaked proof helper:\n{emitted}"
+        );
+        assert!(
+            !emitted.contains("bool_pick_type"),
+            "emitted leaked type helper:\n{emitted}"
+        );
+        assert!(
+            !emitted.contains("L::"),
+            "emitted leaked alias L:::\n{emitted}"
+        );
 
         let bin_path = root.join("out/test_bin");
         let rustc = env::var("RUSTC").unwrap_or_else(|_| "rustc".to_string());

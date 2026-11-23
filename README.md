@@ -96,6 +96,20 @@ headers, laws and proofs). [`BEND_GUIDE.md`](BEND_GUIDE.md) is the guide to the 
 syntax and emitter conventions that RustyBends supports; read it before writing `.bend`
 code, and hand it to a coding agent working on a RustyBends project.
 
+## Bundled `Nat` arithmetic lemma library (`nat_lemmas.bend`)
+
+`rusty-bends-build` bundles [`rusty-bends-build/lemmas/nat_lemmas.bend`](rusty-bends-build/lemmas/nat_lemmas.bend)
+(also exposed as `rusty_bends_build::NAT_LEMMAS_BEND` and materialized idempotently into `verified/` by
+`rusty_bends_build::write_nat_lemmas("verified")` before `verify_and_emit("verified")`).
+Import it in any file under `verified/` with `import nat_lemmas.bend as L`. Every definition is
+`q=0` and completely erased before Rust emission, and provides:
+
+- **Ex falso / Bool refutation:** `bool_pick_type`, `bool_false_ne_true`, `bool_true_ne_false`, `bool_absurd`, `bool_absurd_tf`.
+- **Order & `min`/`max`:** `nat_le_refl`, `nat_le_zero`, `nat_le_succ_r`, `nat_lt_succ_self`, `nat_lt_succ_eq_le`, `nat_lt_imp_le`, `nat_not_lt_imp_le`, `nat_le_subst_r`, `nat_lt_subst_r`, `nat_le_trans`, `nat_lt_trans`, `nat_lt_le_trans`, `nat_le_lt_trans`, `nat_lt_not_le`, `nat_lt_le_false`, `nat_le_lt_false`, `nat_le_antisym`, `nat_min_le_l`, `nat_min_le_r`, `nat_max_ge_l`, `nat_max_ge_r`, `nat_min_comm`, `nat_max_comm`.
+- **Addition & subtraction:** `nat_add_zero_r`, `nat_add_succ_r`, `nat_add_comm`, `nat_add_assoc`, `nat_add_le_l`, `nat_add_le_r`, `nat_add_le_mono`, `nat_add_lt_le_mono`, `nat_sub_zero_r`, `nat_sub_self`, `nat_add_sub_cancel_l`, `nat_add_sub_cancel_r`, `nat_sub_add_cancel`.
+- **Multiplication:** `nat_mul_zero_r`, `nat_mul_one_r`, `nat_mul_succ_r`, `nat_mul_comm`, `nat_mul_add_dist_r`, `nat_mul_add_dist_l`, `nat_mul_assoc`, `nat_mul_le_mono_r`, `nat_mul_le_mono_l`, `nat_mul_le_mono`.
+- **Division & modulo (`1n+bp > 0`):** `nat_mod_lt`, `nat_div_mod`, `nat_div_mod_r`, `nat_div_lt_of_lt_mul`, and `nat_div_lt_of_lt_mul_l`.
+
 ## Requirements
 
 - Rust (stable).
@@ -119,7 +133,7 @@ code, and hand it to a coding agent working on a RustyBends project.
 
 | Path | What |
 |---|---|
-| `rusty-bends-build/` | The build crate: proof gate (`lib.rs`), law lock & `# promise:` parser (`lock.rs`), Rust emitter (`emit.rs`), per-law test & counterexample evaluator (`law_test.rs`), mutation checker (`mutate.rs`), and CLI lister (`src/bin/rusty-bends-laws.rs`). |
+| `rusty-bends-build/` | The build crate: proof gate (`lib.rs`), law lock & `# promise:` parser (`lock.rs`), Rust emitter (`emit.rs`), per-law test & counterexample evaluator (`law_test.rs`), mutation checker (`mutate.rs`), bundled `Nat` lemma library (`lemmas/nat_lemmas.bend`), and CLI lister (`src/bin/rusty-bends-laws.rs`). |
 | `example-app/` | A minimal crate using it. |
 | `BEND_GUIDE.md` | Bend 2 + RustyBends coding guide. |
 | `src/`, `index.html`, `package.json` | **BendTT Kernel Workbench**, a browser tool (React + Vite) to parse Bend, inspect the AST and quantity erasure, trace proofs, suggest laws and preview the emitted Rust. Run it with `npm install && npm run dev`. It is an exploration aid; the build crate is the authority. |

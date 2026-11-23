@@ -194,6 +194,12 @@ def cancel_idempotent(s):
 - **Control flow & patterns:** nested \`match\`, multi-scrutinee \`match a b:\`, \`case 1n+p:\` and nested \`case 1n+1n+q:\` successor patterns, and multi-line \`let\` bindings are all supported.
 - **Recursive ADTs & built-in \`List\`:** direct or mutually recursive \`type\` definitions automatically box cycle-forming fields (\`Box<T>\`), omit \`Copy\` (\`#[derive(Debug, Clone, PartialEq, Eq)]\`) across recursive types and any wrappers containing them, unbox patterns (\`*__rb_box\` + nested guards), and insert \`.clone()\` on multi-use non-\`Copy\` values. Built-in \`Base\` \`List<T>\` / \`List<&2, T>\`, \`Nil{}\` / \`Con{head, tail}\`, and list literals \`[]\` / \`[a, b]\` emit \`pub enum List<T> { Nil, Con(T, Box<List<T>>) }\`.
 - **Cross-file sibling imports (\`import sibling.bend as X\`):** files under \`verified/\` can import sibling \`.bend\` files (\`import base_rules.bend as B\`) to share functions, types, laws, and helper lemmas (\`B.fn_name(...)\`, \`B.TypeName\`, \`B.Ctor{}\`). Keep top-level names unique across \`verified/*.bend\`; the emitter resolves each file's import aliases into the single emitted \`verified.rs\` module, and \`rusty-bends.lock\` normalizes aliases so renaming \`as B\` does not trip \`E_LAW_LOCK_TAMPERED\`.
+- **Bundled \`Nat\` arithmetic lemma library (\`nat_lemmas.bend\`):** \`rusty-bends-build\` ships \`rusty_bends_build::lemmas/nat_lemmas.bend\` via \`rusty_bends_build::NAT_LEMMAS_BEND\` and \`rusty_bends_build::write_nat_lemmas("verified")\` (called in \`build.rs\` before \`verify_and_emit("verified")\`, or copied into \`verified/\`). Import it with \`import nat_lemmas.bend as L\`. All definitions in \`nat_lemmas.bend\` are \`q=0\` proof/type helpers and are erased completely before Rust codegen, covering:
+  - **Ex falso / Bool refutation:** \`bool_pick_type\`, \`bool_false_ne_true\`, \`bool_true_ne_false\`, \`bool_absurd\`, \`bool_absurd_tf\`.
+  - **Order & min/max:** \`nat_le_refl\`, \`nat_le_zero\`, \`nat_le_succ_r\`, \`nat_lt_succ_self\`, \`nat_lt_succ_eq_le\`, \`nat_lt_imp_le\`, \`nat_not_lt_imp_le\`, \`nat_le_subst_r\`, \`nat_lt_subst_r\`, \`nat_le_trans\`, \`nat_lt_trans\`, \`nat_lt_le_trans\`, \`nat_le_lt_trans\`, \`nat_lt_not_le\`, \`nat_lt_le_false\`, \`nat_le_lt_false\`, \`nat_le_antisym\`, \`nat_min_le_l\`, \`nat_min_le_r\`, \`nat_max_ge_l\`, \`nat_max_ge_r\`, \`nat_min_comm\`, \`nat_max_comm\`.
+  - **Addition & subtraction:** \`nat_add_zero_r\`, \`nat_add_succ_r\`, \`nat_add_comm\`, \`nat_add_assoc\`, \`nat_add_le_l\`, \`nat_add_le_r\`, \`nat_add_le_mono\`, \`nat_add_lt_le_mono\`, \`nat_sub_zero_r\`, \`nat_sub_self\`, \`nat_add_sub_cancel_l\`, \`nat_add_sub_cancel_r\`, \`nat_sub_add_cancel\`.
+  - **Multiplication:** \`nat_mul_zero_r\`, \`nat_mul_one_r\`, \`nat_mul_succ_r\`, \`nat_mul_comm\`, \`nat_mul_add_dist_r\`, \`nat_mul_add_dist_l\`, \`nat_mul_assoc\`, \`nat_mul_le_mono_r\`, \`nat_mul_le_mono_l\`, \`nat_mul_le_mono\`.
+  - **Division & modulo (\`b = 1n+bp > 0\`):** \`nat_mod_lt(a, bp)\` (\`a % (1n+bp) < 1n+bp\`), \`nat_div_mod(a, bp)\` (\`a % (1n+bp) + (a / (1n+bp)) * (1n+bp) == a\`), \`nat_div_mod_r(a, bp)\` (\`(a / (1n+bp)) * (1n+bp) + a % (1n+bp) == a\`), \`nat_div_lt_of_lt_mul(a, n, bp, h)\` (\`a < n * (1n+bp) -> a / (1n+bp) < n\`), and \`nat_div_lt_of_lt_mul_l(a, n, bp, h)\` (\`a < (1n+bp) * n -> a / (1n+bp) < n\`).
 - **Generated per-law Rust tests:** every \`law\` also emits a \`#[cfg(test)]\` Rust test into \`OUT_DIR/verified.rs\` (run automatically by \`cargo test\`) that checks the emitted functions across small values, \`u64::MAX - 1\`, \`u64::MAX\`, ADT constructors, and deterministic PRNG samples (skipping only checked \`Nat\` overflow panics).
 - **Counterexample vs proof-failure diagnosis:** when \`bend --check-only\` fails on a law, \`rusty-bends-build\` evaluates the emitted Rust on concrete inputs first and reports \`[E_LAW_FALSE]\` with aligned \`lhs\`/\`rhs\` values if the law is false, or notes \`"no counterexample up to ...: the law may be true; the proof is what failed"\` if no counterexample exists.
 - **Mutation checking before sealing (\`E_LAW_VACUOUS\`):** every unlocked/new law is checked against small mutants of the live functions in its dependency cone (\`True{}\`/\`False{}\` swap, \`Nat.is_le\`/\`Nat.is_lt\` swap, \`Nat.add\`/\`Nat.sub\` swap, \`Bool.and\`/\`Bool.or\` operand drop, returning a constructor argument unchanged, swapping match arms) and fails with \`[E_LAW_VACUOUS]\` if it catches none. Run \`RUSTY_BENDS_MUTATE=all cargo check\` to report caught/survived status for already-locked laws without failing.
@@ -1761,18 +1767,11 @@ pub fn parse_book_items(source: &str) -> Result<(Vec<TypeDef>, Vec<Def>), String
             }
 
             let body = body_lines.join("\\n");
-            let def_name = header_part.split('(').next().unwrap_or("").trim();
-            let is_eq_proof_ret = header_part
-                .split_once("->")
-                .map(|(_, ret)| ret.trim().starts_with('{'))
-                .unwrap_or(false);
 
-            // Real Bend 2 proof definitions share their law's name, return an equality type '{...}',
-            // or omit '->' and return '{==}'. Erase all proof definitions before Rust codegen.
-            if law_names.contains(def_name)
-                || is_eq_proof_ret
-                || (!header_part.contains("->") && body.contains("{==}"))
-            {
+            // Real Bend 2 proof and type-level definitions (matching law names, equality
+            // return types '{...}', Type/Data/Empty/Kind return types, equality/Empty proof
+            // arguments, or body '{==}' without '->') are q=0 and erased before codegen.
+            if is_erased_proof_or_type_def(header_part, &body, &law_names) {
                 continue;
             }
 
@@ -1789,6 +1788,67 @@ pub fn parse_book_items(source: &str) -> Result<(Vec<TypeDef>, Vec<Def>), String
     }
 
     Ok((types, defs))
+}
+
+fn is_erased_proof_or_type_def(header_part: &str, body: &str, law_names: &HashSet<String>) -> bool {
+    let def_name = header_part.split('(').next().unwrap_or("").trim();
+    if law_names.contains(def_name) {
+        return true;
+    }
+
+    let mut params_raw = "";
+    let mut tail = header_part;
+    if let Some(open) = header_part.find('(') {
+        let mut depth = 0i32;
+        let mut close = None;
+        for (idx, ch) in header_part[open..].char_indices() {
+            match ch {
+                '(' => depth += 1,
+                ')' => {
+                    depth -= 1;
+                    if depth == 0 {
+                        close = Some(open + idx);
+                        break;
+                    }
+                }
+                _ => {}
+            }
+        }
+        if let Some(c) = close {
+            params_raw = header_part[open + 1..c].trim();
+            tail = header_part[c + 1..].trim();
+        }
+    }
+
+    if let Some(ret) = tail.strip_prefix("->").map(str::trim) {
+        if ret.starts_with('{')
+            || matches!(ret, "Type" | "Data" | "Empty" | "*0" | "*1" | "*2")
+            || ret.starts_with("Kind(")
+            || (ret.contains('{') && ret.contains("=="))
+        {
+            return true;
+        }
+    } else if body.contains("{==}") {
+        return true;
+    }
+
+    if !params_raw.is_empty() {
+        for chunk in split_type_args(params_raw, ',') {
+            let item = chunk.trim();
+            if item.is_empty() {
+                continue;
+            }
+            if let Some((lhs, ty)) = split_type_args_once(item, ':') {
+                let lhs = lhs.trim();
+                let ty = ty.trim();
+                if !lhs.starts_with('-') && (ty.starts_with('{') || ty == "Empty") {
+                    return true;
+                }
+            }
+        }
+    }
+
+    false
 }
 
 fn parse_variant(raw: &str) -> Result<Variant, String> {
@@ -4318,6 +4378,42 @@ def use_b(x: B) -> Nat:
         assert!(summary.rust_source.contains("pub enum Status"));
         assert!(summary.rust_source.contains("pub enum B"));
     }
+
+    #[test]
+    fn erases_type_level_and_proof_only_helper_defs() {
+        let bundled = emit_verified_rust(include_str!("../lemmas/nat_lemmas.bend"), 0)
+            .expect("bundled nat_lemmas.bend should parse and erase cleanly");
+        assert_eq!(bundled.types_emitted, 0);
+        assert_eq!(bundled.defs_emitted, 0);
+
+        let mixed = r#"import Base
+
+def bool_pick_type(b: Bool, t: Type, f: Type) -> Type:
+  match b:
+    case True{}:
+      t
+    case False{}:
+      f
+
+def bool_false_ne_true(h: {False{} == True{} : Bool}) -> Empty:
+  %h : bool_pick_type(_, Empty, Unit)
+  Unit{}
+
+def bool_absurd(-A: Type, h: {False{} == True{} : Bool}) -> A:
+  Empty.absurd(A, bool_false_ne_true(h))
+
+def checked_id(x: Nat, -proof: {x == x : Nat}) -> Nat:
+  x
+"#;
+        let summary = emit_verified_rust(mixed, 0).expect("mixed source should emit");
+        assert_eq!(summary.defs_emitted, 1);
+        assert!(!summary.rust_source.contains("bool_pick_type"));
+        assert!(!summary.rust_source.contains("bool_false_ne_true"));
+        assert!(!summary.rust_source.contains("bool_absurd"));
+        assert!(summary
+            .rust_source
+            .contains("pub fn checked_id(x: u64) -> u64"));
+    }
 }
 `;
 
@@ -4418,6 +4514,36 @@ impl Default for Config {
             list_laws,
         }
     }
+}
+
+/// Shared Bend 2 Nat arithmetic, order, and division lemma library (\`nat_lemmas.bend\`).
+/// Every definition is a \`q=0\` proof/type helper and is completely erased before Rust codegen.
+pub const NAT_LEMMAS_BEND: &str = include_str!("../lemmas/nat_lemmas.bend");
+
+/// Writes the bundled \`nat_lemmas.bend\` into \`dir\` (typically \`"verified"\`), creating
+/// the directory if needed. Only writes when the file is missing or differs, keeping
+/// mtime stable for Cargo incremental rebuilds.
+pub fn write_nat_lemmas(dir: impl AsRef<Path>) -> Result<PathBuf, String> {
+    let dir = dir.as_ref();
+    fs::create_dir_all(dir).map_err(|e| {
+        format!(
+            "[E_NAT_LEMMAS_WRITE] Failed to create '{}': {e}",
+            dir.display()
+        )
+    })?;
+    let dest = dir.join("nat_lemmas.bend");
+    let unchanged = fs::read_to_string(&dest)
+        .map(|existing| existing == NAT_LEMMAS_BEND)
+        .unwrap_or(false);
+    if !unchanged {
+        fs::write(&dest, NAT_LEMMAS_BEND).map_err(|e| {
+            format!(
+                "[E_NAT_LEMMAS_WRITE] Failed to write '{}': {e}",
+                dest.display()
+            )
+        })?;
+    }
+    Ok(dest)
 }
 
 /// Primary build.rs entry point: checks bend.pin, enforces token-canonical law lock,
@@ -5407,6 +5533,155 @@ def us_open_or_open(flag):
         assert!(!emitted.contains("B::"), "emitted leaked B::\\n{emitted}");
         assert!(emitted.contains("br_within(pos, a)"), "got:\\n{emitted}");
         assert!(emitted.contains("pub enum Status"), "got:\\n{emitted}");
+
+        let bin_path = root.join("out/test_bin");
+        let rustc = env::var("RUSTC").unwrap_or_else(|_| "rustc".to_string());
+        let compile = Command::new(&rustc)
+            .args(["--edition", "2021", "--test", "-D", "warnings", "-o"])
+            .arg(&bin_path)
+            .arg(&out_rs)
+            .output()
+            .expect("rustc --test must execute");
+        assert!(
+            compile.status.success(),
+            "rustc --test failed:\\n{}",
+            String::from_utf8_lossy(&compile.stderr)
+        );
+        let run_tests = Command::new(&bin_path)
+            .output()
+            .expect("generated law test binary must run");
+        assert!(
+            run_tests.status.success(),
+            "generated law tests failed:\\n{}{}",
+            String::from_utf8_lossy(&run_tests.stdout),
+            String::from_utf8_lossy(&run_tests.stderr)
+        );
+
+        let _ = fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn nat_lemmas_bend_checks_with_bend_verdict_and_erases_completely() {
+        let root = temp_workspace("issue11_lemmas_only");
+        let lemma_path = write_nat_lemmas(root.join("verified"))
+            .expect("write_nat_lemmas should create nat_lemmas.bend");
+        assert!(lemma_path.ends_with("verified/nat_lemmas.bend"));
+        assert_eq!(fs::read_to_string(&lemma_path).unwrap(), NAT_LEMMAS_BEND);
+
+        // Idempotent second write preserves content.
+        let lemma_path_2 =
+            write_nat_lemmas(root.join("verified")).expect("idempotent write_nat_lemmas");
+        assert_eq!(lemma_path_2, lemma_path);
+
+        let erased =
+            emit::emit_verified_rust(NAT_LEMMAS_BEND, 0).expect("nat_lemmas.bend must emit");
+        assert_eq!(erased.types_emitted, 0);
+        assert_eq!(erased.defs_emitted, 0);
+
+        let bend_bin = resolve_bend_bin(
+            env::var("BEND_BIN").ok(),
+            env::var_os("PATH"),
+            env::var_os("HOME").map(PathBuf::from),
+        );
+        if Path::new(&bend_bin).is_file() || env::var("BEND_BIN").is_ok() {
+            run_bend_step(&bend_bin, "--check-only", &lemma_path)
+                .expect("nat_lemmas.bend must pass bend --check-only");
+            if has_verdict_runtime() {
+                run_bend_step(&bend_bin, "--verdict", &lemma_path)
+                    .expect("nat_lemmas.bend must pass bend --verdict");
+            }
+        }
+
+        let _ = fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn tile_split_laws_verified_with_bundled_nat_lemmas() {
+        let root = temp_workspace("issue11_tile_split");
+        let _ = write_nat_lemmas(root.join("verified"))
+            .expect("write_nat_lemmas should populate verified/");
+        let tiles = root.join("verified/tiles.bend");
+        fs::write(
+            &tiles,
+            r#"import Base
+import nat_lemmas.bend as L
+
+def tile_chunk(t: Nat, tpc: Nat) -> Nat:
+  Nat.div(t, 1n+tpc)
+
+def tile_place(t: Nat, tpc: Nat) -> Nat:
+  Nat.mod(t, 1n+tpc)
+
+def tile_offset(chunk: Nat, place: Nat, tpc: Nat) -> Nat:
+  Nat.add(place, Nat.mul(chunk, 1n+tpc))
+
+# promise: every tile index maps to a place strictly below tiles_per_chunk
+law tile_place_lt:
+  for t: Nat
+  for tpc: Nat
+  {Nat.is_lt(tile_place(t, tpc), 1n+tpc) == True{} : Bool}
+
+def tile_place_lt(t, tpc):
+  L.nat_mod_lt(t, tpc)
+
+# promise: splitting a tile into chunk and place reconstructs the original tile index
+law tile_split_reconstructs:
+  for t: Nat
+  for tpc: Nat
+  {tile_offset(tile_chunk(t, tpc), tile_place(t, tpc), tpc) == t : Nat}
+
+def tile_split_reconstructs(t, tpc):
+  L.nat_div_mod(t, tpc)
+
+# promise: every tile index below chunks * tiles_per_chunk maps to a chunk strictly below chunks
+law tile_chunk_in_bounds:
+  for t: Nat
+  for chunks: Nat
+  for tpc: Nat
+  for h: {Nat.is_lt(t, Nat.mul(chunks, 1n+tpc)) == True{} : Bool}
+  {Nat.is_lt(tile_chunk(t, tpc), chunks) == True{} : Bool}
+
+def tile_chunk_in_bounds(t, chunks, tpc, h):
+  L.nat_div_lt_of_lt_mul(t, chunks, tpc, h)
+"#,
+        )
+        .unwrap();
+
+        let mut cfg = make_cfg(&root);
+        cfg.bend_bin = resolve_bend_bin(
+            env::var("BEND_BIN").ok(),
+            env::var_os("PATH"),
+            env::var_os("HOME").map(PathBuf::from),
+        );
+        cfg.verdict_mode = if has_verdict_runtime() {
+            VerdictMode::Require
+        } else {
+            VerdictMode::Off
+        };
+
+        let out_rs = run(&cfg)
+            .expect("tile split laws using nat_lemmas.bend must pass bend, mutation check, lock, and emit")
+            .expect("expected emitted verified.rs");
+        let emitted = fs::read_to_string(&out_rs).unwrap();
+        assert!(emitted.contains("pub fn tile_chunk("), "got:\\n{emitted}");
+        assert!(emitted.contains("pub fn tile_place("), "got:\\n{emitted}");
+        assert!(emitted.contains("pub fn tile_offset("), "got:\\n{emitted}");
+        assert!(
+            !emitted.contains("nat_mod_lt"),
+            "emitted leaked proof helper:\\n{emitted}"
+        );
+        assert!(
+            !emitted.contains("nat_div_mod"),
+            "emitted leaked proof helper:\\n{emitted}"
+        );
+        assert!(
+            !emitted.contains("bool_pick_type"),
+            "emitted leaked type helper:\\n{emitted}"
+        );
+        assert!(
+            !emitted.contains("L::"),
+            "emitted leaked alias L:::\\n{emitted}"
+        );
 
         let bin_path = root.join("out/test_bin");
         let rustc = env::var("RUSTC").unwrap_or_else(|_| "rustc".to_string());
@@ -9264,6 +9539,841 @@ mod tests {
 }
 `;
 
+  const buildCrateNatLemmas = `# Shared Nat arithmetic & order lemmas for RustyBends verified cores.
+# Import into any file under verified/ via:
+#   import nat_lemmas.bend as L
+# Every definition here is a q=0 proof/type helper and is completely erased before Rust codegen.
+
+import Base
+
+# ==============================================================================
+# Ex falso / Bool refutation
+# ==============================================================================
+
+def bool_pick_type(b: Bool, t: Type, f: Type) -> Type:
+  match b:
+    case True{}:
+      t
+    case False{}:
+      f
+
+def bool_false_ne_true(h: {False{} == True{} : Bool}) -> Empty:
+  %h : bool_pick_type(_, Empty, Unit)
+  Unit{}
+
+def bool_true_ne_false(h: {True{} == False{} : Bool}) -> Empty:
+  %h : bool_pick_type(_, Unit, Empty)
+  Unit{}
+
+def bool_absurd(-A: Type, h: {False{} == True{} : Bool}) -> A:
+  Empty.absurd(A, bool_false_ne_true(h))
+
+def bool_absurd_tf(-A: Type, h: {True{} == False{} : Bool}) -> A:
+  Empty.absurd(A, bool_true_ne_false(h))
+
+# ==============================================================================
+# Order (Nat.is_le, Nat.is_lt, Nat.min, Nat.max)
+# ==============================================================================
+
+def nat_le_refl(a: Nat) -> {Nat.is_le(a, a) == True{} : Bool}:
+  match a:
+    case 0n:
+      {==}
+    case 1n+ap:
+      nat_le_refl(ap)
+
+def nat_le_zero(b: Nat) -> {Nat.is_le(0n, b) == True{} : Bool}:
+  match b:
+    case 0n:
+      {==}
+    case 1n+bp:
+      {==}
+
+def nat_le_succ_r(a: Nat, b: Nat, h: {Nat.is_le(a, b) == True{} : Bool}) -> {Nat.is_le(a, 1n+b) == True{} : Bool}:
+  match a:
+    case 0n:
+      {==}
+    case 1n+ap:
+      match b:
+        case 0n:
+          bool_absurd({Nat.is_le(1n+ap, 1n) == True{} : Bool}, h)
+        case 1n+bp:
+          nat_le_succ_r(ap, bp, h)
+
+def nat_lt_succ_self(a: Nat) -> {Nat.is_lt(a, 1n+a) == True{} : Bool}:
+  match a:
+    case 0n:
+      {==}
+    case 1n+ap:
+      nat_lt_succ_self(ap)
+
+def nat_lt_succ_eq_le(a: Nat, b: Nat) -> {Nat.is_lt(a, 1n+b) == Nat.is_le(a, b) : Bool}:
+  match a b:
+    case 0n 0n:
+      {==}
+    case 0n 1n+bp:
+      {==}
+    case 1n 0n:
+      {==}
+    case 1n+1n+app 0n:
+      {==}
+    case 1n+ap 1n+bp:
+      nat_lt_succ_eq_le(ap, bp)
+
+def nat_lt_imp_le(a: Nat, b: Nat, h: {Nat.is_lt(a, b) == True{} : Bool}) -> {Nat.is_le(a, b) == True{} : Bool}:
+  match a b:
+    case 0n 0n:
+      bool_absurd({Nat.is_le(0n, 0n) == True{} : Bool}, h)
+    case 0n 1n+bp:
+      {==}
+    case 1n+ap 0n:
+      bool_absurd({Nat.is_le(1n+ap, 0n) == True{} : Bool}, h)
+    case 1n+ap 1n+bp:
+      nat_lt_imp_le(ap, bp, h)
+
+def nat_not_lt_imp_le(a: Nat, b: Nat, h: {Nat.is_lt(a, b) == False{} : Bool}) -> {Nat.is_le(b, a) == True{} : Bool}:
+  match a b:
+    case 0n 0n:
+      {==}
+    case 0n 1n+bp:
+      bool_absurd_tf({Nat.is_le(1n+bp, 0n) == True{} : Bool}, h)
+    case 1n+ap 0n:
+      {==}
+    case 1n+ap 1n+bp:
+      nat_not_lt_imp_le(ap, bp, h)
+
+def nat_le_subst_r(-x: Nat, -y: Nat, -z: Nat, eq_yz: {y == z : Nat}, h: {Nat.is_le(x, y) == True{} : Bool}) -> {Nat.is_le(x, z) == True{} : Bool}:
+  %eq_yz : {Nat.is_le(x, _) == True{} : Bool}
+  h
+
+def nat_lt_subst_r(-x: Nat, -y: Nat, -z: Nat, eq_yz: {y == z : Nat}, h: {Nat.is_lt(x, y) == True{} : Bool}) -> {Nat.is_lt(x, z) == True{} : Bool}:
+  %eq_yz : {Nat.is_lt(x, _) == True{} : Bool}
+  h
+
+def nat_le_trans(
+  a: Nat,
+  b: Nat,
+  c: Nat,
+  ab: {Nat.is_le(a, b) == True{} : Bool},
+  bc: {Nat.is_le(b, c) == True{} : Bool}
+) -> {Nat.is_le(a, c) == True{} : Bool}:
+  match a:
+    case 0n:
+      nat_le_zero(c)
+    case 1n+ap:
+      match b:
+        case 0n:
+          bool_absurd({Nat.is_le(1n+ap, c) == True{} : Bool}, ab)
+        case 1n+bp:
+          match c:
+            case 0n:
+              bool_absurd({Nat.is_le(1n+ap, 0n) == True{} : Bool}, bc)
+            case 1n+cp:
+              nat_le_trans(ap, bp, cp, ab, bc)
+
+def nat_lt_trans(
+  a: Nat,
+  b: Nat,
+  c: Nat,
+  ab: {Nat.is_lt(a, b) == True{} : Bool},
+  bc: {Nat.is_lt(b, c) == True{} : Bool}
+) -> {Nat.is_lt(a, c) == True{} : Bool}:
+  match a:
+    case 0n:
+      match b:
+        case 0n:
+          bool_absurd({Nat.is_lt(0n, c) == True{} : Bool}, ab)
+        case 1n+bp:
+          match c:
+            case 0n:
+              bool_absurd({Nat.is_lt(0n, 0n) == True{} : Bool}, bc)
+            case 1n+cp:
+              {==}
+    case 1n+ap:
+      match b:
+        case 0n:
+          bool_absurd({Nat.is_lt(1n+ap, c) == True{} : Bool}, ab)
+        case 1n+bp:
+          match c:
+            case 0n:
+              bool_absurd({Nat.is_lt(1n+ap, 0n) == True{} : Bool}, bc)
+            case 1n+cp:
+              nat_lt_trans(ap, bp, cp, ab, bc)
+
+def nat_lt_le_trans(
+  a: Nat,
+  b: Nat,
+  c: Nat,
+  ab: {Nat.is_lt(a, b) == True{} : Bool},
+  bc: {Nat.is_le(b, c) == True{} : Bool}
+) -> {Nat.is_lt(a, c) == True{} : Bool}:
+  match a:
+    case 0n:
+      match b:
+        case 0n:
+          bool_absurd({Nat.is_lt(0n, c) == True{} : Bool}, ab)
+        case 1n+bp:
+          match c:
+            case 0n:
+              bool_absurd({Nat.is_lt(0n, 0n) == True{} : Bool}, bc)
+            case 1n+cp:
+              {==}
+    case 1n+ap:
+      match b:
+        case 0n:
+          bool_absurd({Nat.is_lt(1n+ap, c) == True{} : Bool}, ab)
+        case 1n+bp:
+          match c:
+            case 0n:
+              bool_absurd({Nat.is_lt(1n+ap, 0n) == True{} : Bool}, bc)
+            case 1n+cp:
+              nat_lt_le_trans(ap, bp, cp, ab, bc)
+
+def nat_le_lt_trans(
+  a: Nat,
+  b: Nat,
+  c: Nat,
+  ab: {Nat.is_le(a, b) == True{} : Bool},
+  bc: {Nat.is_lt(b, c) == True{} : Bool}
+) -> {Nat.is_lt(a, c) == True{} : Bool}:
+  match a:
+    case 0n:
+      match b:
+        case 0n:
+          bc
+        case 1n+bp:
+          match c:
+            case 0n:
+              bool_absurd({Nat.is_lt(0n, 0n) == True{} : Bool}, bc)
+            case 1n+cp:
+              {==}
+    case 1n+ap:
+      match b:
+        case 0n:
+          bool_absurd({Nat.is_lt(1n+ap, c) == True{} : Bool}, ab)
+        case 1n+bp:
+          match c:
+            case 0n:
+              bool_absurd({Nat.is_lt(1n+ap, 0n) == True{} : Bool}, bc)
+            case 1n+cp:
+              nat_le_lt_trans(ap, bp, cp, ab, bc)
+
+def nat_lt_not_le(
+  a: Nat,
+  b: Nat,
+  lt: {Nat.is_lt(a, b) == True{} : Bool},
+  le: {Nat.is_le(b, a) == True{} : Bool}
+) -> Empty:
+  match a b:
+    case 0n 0n:
+      bool_false_ne_true(lt)
+    case 0n 1n+bp:
+      bool_false_ne_true(le)
+    case 1n+ap 0n:
+      bool_false_ne_true(lt)
+    case 1n+ap 1n+bp:
+      nat_lt_not_le(ap, bp, lt, le)
+
+def nat_lt_le_false(
+  a: Nat,
+  b: Nat,
+  lt: {Nat.is_lt(a, b) == True{} : Bool}
+) -> {Nat.is_le(b, a) == False{} : Bool}:
+  match a b:
+    case 0n 0n:
+      bool_absurd({Nat.is_le(0n, 0n) == False{} : Bool}, lt)
+    case 0n 1n+bp:
+      {==}
+    case 1n+ap 0n:
+      bool_absurd({Nat.is_le(0n, 1n+ap) == False{} : Bool}, lt)
+    case 1n+ap 1n+bp:
+      nat_lt_le_false(ap, bp, lt)
+
+def nat_le_lt_false(
+  a: Nat,
+  b: Nat,
+  le: {Nat.is_le(b, a) == True{} : Bool}
+) -> {Nat.is_lt(a, b) == False{} : Bool}:
+  match a b:
+    case 0n 0n:
+      {==}
+    case 0n 1n+bp:
+      bool_absurd({Nat.is_lt(0n, 1n+bp) == False{} : Bool}, le)
+    case 1n+ap 0n:
+      {==}
+    case 1n+ap 1n+bp:
+      nat_le_lt_false(ap, bp, le)
+
+def nat_le_antisym(
+  a: Nat,
+  b: Nat,
+  ab: {Nat.is_le(a, b) == True{} : Bool},
+  ba: {Nat.is_le(b, a) == True{} : Bool}
+) -> {a == b : Nat}:
+  match a b:
+    case 0n 0n:
+      {==}
+    case 0n 1n+bp:
+      bool_absurd({0n == 1n+bp : Nat}, ba)
+    case 1n+ap 0n:
+      bool_absurd({1n+ap == 0n : Nat}, ab)
+    case 1n+ap 1n+bp:
+      %nat_le_antisym(ap, bp, ab, ba) : {1n+ap == 1n+_ : Nat}
+      {==}
+
+def nat_min_le_l.go(+a: Nat, +b: Nat) -> {Nat.is_le(Nat.min(a, b), a) == True{} : Bool}:
+  match a b:
+    case 0n _:
+      {==}
+    case 1n+ap 0n:
+      {==}
+    case 1n+ap 1n+bp:
+      nat_min_le_l.go(ap, bp)
+
+def nat_min_le_l(a: Nat, b: Nat) -> {Nat.is_le(Nat.min(a, b), a) == True{} : Bool}:
+  +a2 = {a : Nat}
+  +b2 = {b : Nat}
+  nat_min_le_l.go(a2, b2)
+
+def nat_min_le_r.go(+a: Nat, +b: Nat) -> {Nat.is_le(Nat.min(a, b), b) == True{} : Bool}:
+  match a b:
+    case 0n _:
+      nat_le_zero(b)
+    case 1n+ap 0n:
+      {==}
+    case 1n+ap 1n+bp:
+      nat_min_le_r.go(ap, bp)
+
+def nat_min_le_r(a: Nat, b: Nat) -> {Nat.is_le(Nat.min(a, b), b) == True{} : Bool}:
+  +a2 = {a : Nat}
+  +b2 = {b : Nat}
+  nat_min_le_r.go(a2, b2)
+
+def nat_max_ge_l.go(+a: Nat, +b: Nat) -> {Nat.is_le(a, Nat.max(a, b)) == True{} : Bool}:
+  match a b:
+    case 0n _:
+      nat_le_zero(Nat.max(0n, b))
+    case 1n+ap 0n:
+      nat_le_refl(1n+ap)
+    case 1n+ap 1n+bp:
+      nat_max_ge_l.go(ap, bp)
+
+def nat_max_ge_l(a: Nat, b: Nat) -> {Nat.is_le(a, Nat.max(a, b)) == True{} : Bool}:
+  +a2 = {a : Nat}
+  +b2 = {b : Nat}
+  nat_max_ge_l.go(a2, b2)
+
+def nat_max_ge_r.go(+a: Nat, +b: Nat) -> {Nat.is_le(b, Nat.max(a, b)) == True{} : Bool}:
+  match a b:
+    case 0n _:
+      nat_le_refl(b)
+    case 1n+ap 0n:
+      {==}
+    case 1n+ap 1n+bp:
+      nat_max_ge_r.go(ap, bp)
+
+def nat_max_ge_r(a: Nat, b: Nat) -> {Nat.is_le(b, Nat.max(a, b)) == True{} : Bool}:
+  +a2 = {a : Nat}
+  +b2 = {b : Nat}
+  nat_max_ge_r.go(a2, b2)
+
+def nat_min_comm.go(+a: Nat, +b: Nat) -> {Nat.min(a, b) == Nat.min(b, a) : Nat}:
+  match a b:
+    case 0n 0n:
+      {==}
+    case 0n 1n+bp:
+      {==}
+    case 1n+ap 0n:
+      {==}
+    case 1n+ap 1n+bp:
+      %nat_min_comm.go(ap, bp) : {1n+Nat.min(ap, bp) == 1n+_ : Nat}
+      {==}
+
+def nat_min_comm(a: Nat, b: Nat) -> {Nat.min(a, b) == Nat.min(b, a) : Nat}:
+  +a2 = {a : Nat}
+  +b2 = {b : Nat}
+  nat_min_comm.go(a2, b2)
+
+def nat_max_comm.go(+a: Nat, +b: Nat) -> {Nat.max(a, b) == Nat.max(b, a) : Nat}:
+  match a b:
+    case 0n 0n:
+      {==}
+    case 0n 1n+bp:
+      {==}
+    case 1n+ap 0n:
+      {==}
+    case 1n+ap 1n+bp:
+      %nat_max_comm.go(ap, bp) : {1n+Nat.max(ap, bp) == 1n+_ : Nat}
+      {==}
+
+def nat_max_comm(a: Nat, b: Nat) -> {Nat.max(a, b) == Nat.max(b, a) : Nat}:
+  +a2 = {a : Nat}
+  +b2 = {b : Nat}
+  nat_max_comm.go(a2, b2)
+
+# ==============================================================================
+# Addition & subtraction
+# ==============================================================================
+
+def nat_add_zero_r(a: Nat) -> {Nat.add(a, 0n) == a : Nat}:
+  match a:
+    case 0n:
+      {==}
+    case 1n+ap:
+      %nat_add_zero_r(ap) : {1n+Nat.add(ap, 0n) == 1n+_ : Nat}
+      {==}
+
+def nat_add_succ_r(a: Nat, -b: Nat) -> {Nat.add(a, 1n+b) == 1n+Nat.add(a, b) : Nat}:
+  match a:
+    case 0n:
+      {==}
+    case 1n+ap:
+      %nat_add_succ_r(ap, b) : {1n+Nat.add(ap, 1n+b) == 1n+_ : Nat}
+      {==}
+
+def nat_add_comm.go(a: Nat, +b: Nat) -> {Nat.add(a, b) == Nat.add(b, a) : Nat}:
+  match a:
+    case 0n:
+      Equal.sym(Nat, Nat.add(b, 0n), b, nat_add_zero_r(b))
+    case 1n+ap:
+      %Equal.sym(Nat, Nat.add(b, 1n+ap), 1n+Nat.add(b, ap), nat_add_succ_r(b, ap)) : {1n+Nat.add(ap, b) == _ : Nat}
+      %nat_add_comm.go(ap, b) : {1n+Nat.add(ap, b) == 1n+_ : Nat}
+      {==}
+
+def nat_add_comm(a: Nat, b: Nat) -> {Nat.add(a, b) == Nat.add(b, a) : Nat}:
+  +b2 = {b : Nat}
+  nat_add_comm.go(a, b2)
+
+def nat_add_assoc(a: Nat, -b: Nat, -c: Nat) -> {Nat.add(Nat.add(a, b), c) == Nat.add(a, Nat.add(b, c)) : Nat}:
+  match a:
+    case 0n:
+      {==}
+    case 1n+ap:
+      %nat_add_assoc(ap, b, c) : {1n+Nat.add(Nat.add(ap, b), c) == 1n+_ : Nat}
+      {==}
+
+def nat_add_le_l.go(+bp: Nat, +d: Nat) -> {Nat.is_le(d, Nat.add(bp, d)) == True{} : Bool}:
+  match bp:
+    case 0n:
+      nat_le_refl(d)
+    case 1n+bpp:
+      nat_le_succ_r(d, Nat.add(bpp, d), nat_add_le_l.go(bpp, d))
+
+def nat_add_le_l(a: Nat, b: Nat) -> {Nat.is_le(b, Nat.add(a, b)) == True{} : Bool}:
+  +a2 = {a : Nat}
+  +b2 = {b : Nat}
+  nat_add_le_l.go(a2, b2)
+
+def nat_add_le_r(a: Nat, b: Nat) -> {Nat.is_le(a, Nat.add(a, b)) == True{} : Bool}:
+  match a:
+    case 0n:
+      nat_le_zero(b)
+    case 1n+ap:
+      nat_add_le_r(ap, b)
+
+def nat_add_le_mono.go(
+  a: Nat,
+  +b: Nat,
+  +c: Nat,
+  +d: Nat,
+  ab: {Nat.is_le(a, b) == True{} : Bool},
+  cd: {Nat.is_le(c, d) == True{} : Bool}
+) -> {Nat.is_le(Nat.add(a, c), Nat.add(b, d)) == True{} : Bool}:
+  match a b:
+    case 0n 0n:
+      cd
+    case 0n 1n+bp:
+      nat_le_succ_r(c, Nat.add(bp, d), nat_add_le_mono.go(0n, bp, c, d, nat_le_zero(bp), cd))
+    case 1n+ap 0n:
+      bool_absurd({Nat.is_le(1n+Nat.add(ap, c), d) == True{} : Bool}, ab)
+    case 1n+ap 1n+bp:
+      nat_add_le_mono.go(ap, bp, c, d, ab, cd)
+
+def nat_add_le_mono(
+  a: Nat,
+  b: Nat,
+  c: Nat,
+  d: Nat,
+  ab: {Nat.is_le(a, b) == True{} : Bool},
+  cd: {Nat.is_le(c, d) == True{} : Bool}
+) -> {Nat.is_le(Nat.add(a, c), Nat.add(b, d)) == True{} : Bool}:
+  +b2 = {b : Nat}
+  +c2 = {c : Nat}
+  +d2 = {d : Nat}
+  nat_add_le_mono.go(a, b2, c2, d2, ab, cd)
+
+def nat_add_lt_le_mono.go(
+  a: Nat,
+  +b: Nat,
+  +c: Nat,
+  +d: Nat,
+  ab: {Nat.is_lt(a, b) == True{} : Bool},
+  cd: {Nat.is_le(c, d) == True{} : Bool}
+) -> {Nat.is_lt(Nat.add(a, c), Nat.add(b, d)) == True{} : Bool}:
+  match a b:
+    case 0n 0n:
+      bool_absurd({Nat.is_lt(c, d) == True{} : Bool}, ab)
+    case 0n 1n+bp:
+      %Equal.sym(Bool, Nat.is_lt(c, 1n+Nat.add(bp, d)), Nat.is_le(c, Nat.add(bp, d)), nat_lt_succ_eq_le(c, Nat.add(bp, d))) : {_ == True{} : Bool}
+      nat_le_trans(c, d, Nat.add(bp, d), cd, nat_add_le_l(bp, d))
+    case 1n+ap 0n:
+      bool_absurd({Nat.is_lt(1n+Nat.add(ap, c), d) == True{} : Bool}, ab)
+    case 1n+ap 1n+bp:
+      nat_add_lt_le_mono.go(ap, bp, c, d, ab, cd)
+
+def nat_add_lt_le_mono(
+  a: Nat,
+  b: Nat,
+  c: Nat,
+  d: Nat,
+  ab: {Nat.is_lt(a, b) == True{} : Bool},
+  cd: {Nat.is_le(c, d) == True{} : Bool}
+) -> {Nat.is_lt(Nat.add(a, c), Nat.add(b, d)) == True{} : Bool}:
+  +b2 = {b : Nat}
+  +c2 = {c : Nat}
+  +d2 = {d : Nat}
+  nat_add_lt_le_mono.go(a, b2, c2, d2, ab, cd)
+
+def nat_sub_zero_r(a: Nat) -> {Nat.sub(a, 0n) == a : Nat}:
+  match a:
+    case 0n:
+      {==}
+    case 1n+ap:
+      {==}
+
+def nat_sub_self(a: Nat) -> {Nat.sub(a, a) == 0n : Nat}:
+  match a:
+    case 0n:
+      {==}
+    case 1n+ap:
+      nat_sub_self(ap)
+
+def nat_add_sub_cancel_l(a: Nat, b: Nat) -> {Nat.sub(Nat.add(a, b), a) == b : Nat}:
+  match a:
+    case 0n:
+      nat_sub_zero_r(b)
+    case 1n+ap:
+      nat_add_sub_cancel_l(ap, b)
+
+def nat_add_sub_cancel_r(a: Nat, b: Nat) -> {Nat.sub(Nat.add(a, b), b) == a : Nat}:
+  +a2 = {a : Nat}
+  +b2 = {b : Nat}
+  %nat_add_comm(b2, a2) : {Nat.sub(_, b2) == a2 : Nat}
+  nat_add_sub_cancel_l(b2, a2)
+
+def nat_sub_add_cancel.go(
+  +a: Nat,
+  +b: Nat,
+  h: {Nat.is_le(b, a) == True{} : Bool}
+) -> {Nat.add(Nat.sub(a, b), b) == a : Nat}:
+  match a b:
+    case 0n 0n:
+      {==}
+    case 0n 1n+bp:
+      bool_absurd({1n+bp == 0n : Nat}, h)
+    case 1n+ap 0n:
+      nat_add_zero_r(1n+ap)
+    case 1n+ap 1n+bp:
+      %Equal.sym(Nat, Nat.add(Nat.sub(ap, bp), 1n+bp), 1n+Nat.add(Nat.sub(ap, bp), bp), nat_add_succ_r(Nat.sub(ap, bp), bp)) : {_ == 1n+ap : Nat}
+      %nat_sub_add_cancel.go(ap, bp, h) : {1n+Nat.add(Nat.sub(ap, bp), bp) == 1n+_ : Nat}
+      {==}
+
+def nat_sub_add_cancel(
+  a: Nat,
+  b: Nat,
+  h: {Nat.is_le(b, a) == True{} : Bool}
+) -> {Nat.add(Nat.sub(a, b), b) == a : Nat}:
+  +a2 = {a : Nat}
+  +b2 = {b : Nat}
+  nat_sub_add_cancel.go(a2, b2, h)
+
+# ==============================================================================
+# Multiplication
+# ==============================================================================
+
+def nat_mul_zero_r(a: Nat) -> {Nat.mul(a, 0n) == 0n : Nat}:
+  match a:
+    case 0n:
+      {==}
+    case 1n+ap:
+      nat_mul_zero_r(ap)
+
+def nat_mul_one_r(a: Nat) -> {Nat.mul(a, 1n) == a : Nat}:
+  match a:
+    case 0n:
+      {==}
+    case 1n+ap:
+      %nat_mul_one_r(ap) : {1n+Nat.mul(ap, 1n) == 1n+_ : Nat}
+      {==}
+
+def nat_mul_succ_r.go(+a: Nat, +b: Nat) -> {Nat.mul(a, 1n+b) == Nat.add(a, Nat.mul(a, b)) : Nat}:
+  match a:
+    case 0n:
+      {==}
+    case 1n+ap:
+      %Equal.sym(Nat, Nat.mul(ap, 1n+b), Nat.add(ap, Nat.mul(ap, b)), nat_mul_succ_r.go(ap, b)) : {1n+Nat.add(b, _) == 1n+Nat.add(ap, Nat.add(b, Nat.mul(ap, b))) : Nat}
+      %nat_add_assoc(b, ap, Nat.mul(ap, b)) : {1n+_ == 1n+Nat.add(ap, Nat.add(b, Nat.mul(ap, b))) : Nat}
+      %nat_add_comm(ap, b) : {1n+Nat.add(_, Nat.mul(ap, b)) == 1n+Nat.add(ap, Nat.add(b, Nat.mul(ap, b))) : Nat}
+      %nat_add_assoc(ap, b, Nat.mul(ap, b)) : {1n+Nat.add(Nat.add(ap, b), Nat.mul(ap, b)) == 1n+_ : Nat}
+      {==}
+
+def nat_mul_succ_r(a: Nat, b: Nat) -> {Nat.mul(a, 1n+b) == Nat.add(a, Nat.mul(a, b)) : Nat}:
+  +a2 = {a : Nat}
+  +b2 = {b : Nat}
+  nat_mul_succ_r.go(a2, b2)
+
+def nat_mul_comm.go(+a: Nat, +b: Nat) -> {Nat.mul(a, b) == Nat.mul(b, a) : Nat}:
+  match a:
+    case 0n:
+      Equal.sym(Nat, Nat.mul(b, 0n), 0n, nat_mul_zero_r(b))
+    case 1n+ap:
+      %Equal.sym(Nat, Nat.mul(b, 1n+ap), Nat.add(b, Nat.mul(b, ap)), nat_mul_succ_r(b, ap)) : {Nat.add(b, Nat.mul(ap, b)) == _ : Nat}
+      %nat_mul_comm.go(ap, b) : {Nat.add(b, Nat.mul(ap, b)) == Nat.add(b, _) : Nat}
+      {==}
+
+def nat_mul_comm(a: Nat, b: Nat) -> {Nat.mul(a, b) == Nat.mul(b, a) : Nat}:
+  +a2 = {a : Nat}
+  +b2 = {b : Nat}
+  nat_mul_comm.go(a2, b2)
+
+def nat_mul_add_dist_r.go(a: Nat, +b: Nat, +c: Nat) -> {Nat.mul(Nat.add(a, b), c) == Nat.add(Nat.mul(a, c), Nat.mul(b, c)) : Nat}:
+  match a:
+    case 0n:
+      {==}
+    case 1n+ap:
+      %Equal.sym(Nat, Nat.mul(Nat.add(ap, b), c), Nat.add(Nat.mul(ap, c), Nat.mul(b, c)), nat_mul_add_dist_r.go(ap, b, c)) : {Nat.add(c, _) == Nat.add(Nat.add(c, Nat.mul(ap, c)), Nat.mul(b, c)) : Nat}
+      Equal.sym(Nat, Nat.add(Nat.add(c, Nat.mul(ap, c)), Nat.mul(b, c)), Nat.add(c, Nat.add(Nat.mul(ap, c), Nat.mul(b, c))), nat_add_assoc(c, Nat.mul(ap, c), Nat.mul(b, c)))
+
+def nat_mul_add_dist_r(a: Nat, b: Nat, c: Nat) -> {Nat.mul(Nat.add(a, b), c) == Nat.add(Nat.mul(a, c), Nat.mul(b, c)) : Nat}:
+  +b2 = {b : Nat}
+  +c2 = {c : Nat}
+  nat_mul_add_dist_r.go(a, b2, c2)
+
+def nat_mul_add_dist_l(a: Nat, b: Nat, c: Nat) -> {Nat.mul(a, Nat.add(b, c)) == Nat.add(Nat.mul(a, b), Nat.mul(a, c)) : Nat}:
+  +a2 = {a : Nat}
+  +b2 = {b : Nat}
+  +c2 = {c : Nat}
+  %nat_mul_comm(Nat.add(b2, c2), a2) : {_ == Nat.add(Nat.mul(a2, b2), Nat.mul(a2, c2)) : Nat}
+  %nat_mul_comm(b2, a2) : {Nat.mul(Nat.add(b2, c2), a2) == Nat.add(_, Nat.mul(a2, c2)) : Nat}
+  %nat_mul_comm(c2, a2) : {Nat.mul(Nat.add(b2, c2), a2) == Nat.add(Nat.mul(b2, a2), _) : Nat}
+  nat_mul_add_dist_r(b2, c2, a2)
+
+def nat_mul_assoc.go(+a: Nat, +b: Nat, +c: Nat) -> {Nat.mul(Nat.mul(a, b), c) == Nat.mul(a, Nat.mul(b, c)) : Nat}:
+  match a:
+    case 0n:
+      {==}
+    case 1n+ap:
+      %Equal.sym(Nat, Nat.mul(Nat.add(b, Nat.mul(ap, b)), c), Nat.add(Nat.mul(b, c), Nat.mul(Nat.mul(ap, b), c)), nat_mul_add_dist_r(b, Nat.mul(ap, b), c)) : {_ == Nat.add(Nat.mul(b, c), Nat.mul(ap, Nat.mul(b, c))) : Nat}
+      %nat_mul_assoc.go(ap, b, c) : {Nat.add(Nat.mul(b, c), Nat.mul(Nat.mul(ap, b), c)) == Nat.add(Nat.mul(b, c), _) : Nat}
+      {==}
+
+def nat_mul_assoc(a: Nat, b: Nat, c: Nat) -> {Nat.mul(Nat.mul(a, b), c) == Nat.mul(a, Nat.mul(b, c)) : Nat}:
+  +a2 = {a : Nat}
+  +b2 = {b : Nat}
+  +c2 = {c : Nat}
+  nat_mul_assoc.go(a2, b2, c2)
+
+def nat_mul_le_mono_r.go(
+  +a: Nat,
+  +b: Nat,
+  +c: Nat,
+  ab: {Nat.is_le(a, b) == True{} : Bool}
+) -> {Nat.is_le(Nat.mul(a, c), Nat.mul(b, c)) == True{} : Bool}:
+  match a b:
+    case 0n 0n:
+      {==}
+    case 0n 1n+bp:
+      nat_le_zero(Nat.add(c, Nat.mul(bp, c)))
+    case 1n+ap 0n:
+      bool_absurd({Nat.is_le(Nat.add(c, Nat.mul(ap, c)), 0n) == True{} : Bool}, ab)
+    case 1n+ap 1n+bp:
+      nat_add_le_mono(c, c, Nat.mul(ap, c), Nat.mul(bp, c), nat_le_refl(c), nat_mul_le_mono_r.go(ap, bp, c, ab))
+
+def nat_mul_le_mono_r(
+  a: Nat,
+  b: Nat,
+  c: Nat,
+  ab: {Nat.is_le(a, b) == True{} : Bool}
+) -> {Nat.is_le(Nat.mul(a, c), Nat.mul(b, c)) == True{} : Bool}:
+  +a2 = {a : Nat}
+  +b2 = {b : Nat}
+  +c2 = {c : Nat}
+  nat_mul_le_mono_r.go(a2, b2, c2, ab)
+
+def nat_mul_le_mono_l(
+  a: Nat,
+  b: Nat,
+  c: Nat,
+  bc: {Nat.is_le(b, c) == True{} : Bool}
+) -> {Nat.is_le(Nat.mul(a, b), Nat.mul(a, c)) == True{} : Bool}:
+  +a2 = {a : Nat}
+  +b2 = {b : Nat}
+  +c2 = {c : Nat}
+  %nat_mul_comm(b2, a2) : {Nat.is_le(_, Nat.mul(a2, c2)) == True{} : Bool}
+  %nat_mul_comm(c2, a2) : {Nat.is_le(Nat.mul(b2, a2), _) == True{} : Bool}
+  nat_mul_le_mono_r(b2, c2, a2, bc)
+
+def nat_mul_le_mono(
+  a: Nat,
+  b: Nat,
+  c: Nat,
+  d: Nat,
+  ab: {Nat.is_le(a, b) == True{} : Bool},
+  cd: {Nat.is_le(c, d) == True{} : Bool}
+) -> {Nat.is_le(Nat.mul(a, c), Nat.mul(b, d)) == True{} : Bool}:
+  +a2 = {a : Nat}
+  +b2 = {b : Nat}
+  +c2 = {c : Nat}
+  +d2 = {d : Nat}
+  nat_le_trans(
+    Nat.mul(a2, c2),
+    Nat.mul(b2, c2),
+    Nat.mul(b2, d2),
+    nat_mul_le_mono_r(a2, b2, c2, ab),
+    nat_mul_le_mono_l(b2, c2, d2, cd)
+  )
+
+# ==============================================================================
+# Division & modulo (Nat.div, Nat.mod, Nat.divmod)
+# ==============================================================================
+
+def nat_divmod_go_mod_lt(
+  n: Nat,
+  +m: Nat,
+  d: Nat,
+  +r: Nat,
+  +bp: Nat,
+  eq_mr: {Nat.add(m, r) == bp : Nat}
+) -> {Nat.is_lt(Pair.snd(Nat, Nat, Nat.divmod.go(n, m, d, r)), 1n+bp) == True{} : Bool}:
+  match n:
+    case 0n:
+      %Equal.sym(Bool, Nat.is_lt(r, 1n+bp), Nat.is_le(r, bp), nat_lt_succ_eq_le(r, bp)) : {_ == True{} : Bool}
+      %eq_mr : {Nat.is_le(r, _) == True{} : Bool}
+      nat_add_le_l(m, r)
+    case 1n+np:
+      match m:
+        case 0n:
+          nat_divmod_go_mod_lt(np, r, 1n+d, 0n, bp, Equal.trans(Nat, Nat.add(r, 0n), r, bp, nat_add_zero_r(r), eq_mr))
+        case 1n+mp:
+          nat_divmod_go_mod_lt(
+            np,
+            mp,
+            d,
+            1n+r,
+            bp,
+            Equal.trans(Nat, Nat.add(mp, 1n+r), 1n+Nat.add(mp, r), bp, nat_add_succ_r(mp, r), eq_mr)
+          )
+
+# For b > 0, written as 1n+bp: a % (1n+bp) < 1n+bp
+def nat_mod_lt(a: Nat, bp: Nat) -> {Nat.is_lt(Nat.mod(a, 1n+bp), 1n+bp) == True{} : Bool}:
+  +bp2 = {bp : Nat}
+  nat_divmod_go_mod_lt(a, bp2, 0n, 0n, bp2, nat_add_zero_r(bp2))
+
+def nat_divmod_go_eq(
+  +n: Nat,
+  +m: Nat,
+  +d: Nat,
+  +r: Nat,
+  +bp: Nat,
+  +eq_mr: {Nat.add(m, r) == bp : Nat}
+) -> {Nat.add(Pair.snd(Nat, Nat, Nat.divmod.go(n, m, d, r)), Nat.mul(Pair.fst(Nat, Nat, Nat.divmod.go(n, m, d, r)), 1n+bp)) == Nat.add(n, Nat.add(r, Nat.mul(d, 1n+bp))) : Nat}:
+  match n:
+    case 0n:
+      {==}
+    case 1n+np:
+      match m:
+        case 0n:
+          ih = nat_divmod_go_eq(np, r, 1n+d, 0n, bp, Equal.trans(Nat, Nat.add(r, 0n), r, bp, nat_add_zero_r(r), eq_mr))
+          %Equal.sym(Nat, r, bp, eq_mr) : {Nat.add(Pair.snd(Nat, Nat, Nat.divmod.go(np, r, 1n+d, 0n)), Nat.mul(Pair.fst(Nat, Nat, Nat.divmod.go(np, r, 1n+d, 0n)), 1n+bp)) == 1n+Nat.add(np, Nat.add(_, Nat.mul(d, 1n+bp))) : Nat}
+          %nat_add_succ_r(np, Nat.add(bp, Nat.mul(d, 1n+bp))) : {Nat.add(Pair.snd(Nat, Nat, Nat.divmod.go(np, r, 1n+d, 0n)), Nat.mul(Pair.fst(Nat, Nat, Nat.divmod.go(np, r, 1n+d, 0n)), 1n+bp)) == _ : Nat}
+          ih
+        case 1n+mp:
+          ih = nat_divmod_go_eq(
+            np,
+            mp,
+            d,
+            1n+r,
+            bp,
+            Equal.trans(Nat, Nat.add(mp, 1n+r), 1n+Nat.add(mp, r), bp, nat_add_succ_r(mp, r), eq_mr)
+          )
+          %nat_add_succ_r(np, Nat.add(r, Nat.mul(d, 1n+bp))) : {Nat.add(Pair.snd(Nat, Nat, Nat.divmod.go(np, mp, d, 1n+r)), Nat.mul(Pair.fst(Nat, Nat, Nat.divmod.go(np, mp, d, 1n+r)), 1n+bp)) == _ : Nat}
+          ih
+
+# For b > 0, written as 1n+bp: (a % (1n+bp)) + (a / (1n+bp)) * (1n+bp) == a
+def nat_div_mod(a: Nat, bp: Nat) -> {Nat.add(Nat.mod(a, 1n+bp), Nat.mul(Nat.div(a, 1n+bp), 1n+bp)) == a : Nat}:
+  +a2 = {a : Nat}
+  +bp2 = {bp : Nat}
+  %nat_add_zero_r(a2) : {Nat.add(Nat.mod(a2, 1n+bp2), Nat.mul(Nat.div(a2, 1n+bp2), 1n+bp2)) == _ : Nat}
+  nat_divmod_go_eq(a2, bp2, 0n, 0n, bp2, nat_add_zero_r(bp2))
+
+# Commuted orientation: (a / (1n+bp)) * (1n+bp) + (a % (1n+bp)) == a
+def nat_div_mod_r(a: Nat, bp: Nat) -> {Nat.add(Nat.mul(Nat.div(a, 1n+bp), 1n+bp), Nat.mod(a, 1n+bp)) == a : Nat}:
+  +a2 = {a : Nat}
+  +bp2 = {bp : Nat}
+  %nat_add_comm(Nat.mod(a2, 1n+bp2), Nat.mul(Nat.div(a2, 1n+bp2), 1n+bp2)) : {_ == a2 : Nat}
+  nat_div_mod(a2, bp2)
+
+def nat_div_lt_of_lt_mul_dec(
+  +a: Nat,
+  +n: Nat,
+  +bp: Nat,
+  h: {Nat.is_lt(a, Nat.mul(n, 1n+bp)) == True{} : Bool},
+  b: Bool,
+  eb: {b == Nat.is_lt(Nat.div(a, 1n+bp), n) : Bool}
+) -> {Nat.is_lt(Nat.div(a, 1n+bp), n) == True{} : Bool}:
+  match b:
+    case True{}:
+      Equal.sym(Bool, True{}, Nat.is_lt(Nat.div(a, 1n+bp), n), eb)
+    case False{}:
+      nq = nat_not_lt_imp_le(Nat.div(a, 1n+bp), n, Equal.sym(Bool, False{}, Nat.is_lt(Nat.div(a, 1n+bp), n), eb))
+      nb_le_qb = nat_mul_le_mono_r(n, Nat.div(a, 1n+bp), 1n+bp, nq)
+      qb_le_rqb = nat_add_le_l(Nat.mod(a, 1n+bp), Nat.mul(Nat.div(a, 1n+bp), 1n+bp))
+      nb_le_rqb = nat_le_trans(
+        Nat.mul(n, 1n+bp),
+        Nat.mul(Nat.div(a, 1n+bp), 1n+bp),
+        Nat.add(Nat.mod(a, 1n+bp), Nat.mul(Nat.div(a, 1n+bp), 1n+bp)),
+        nb_le_qb,
+        qb_le_rqb
+      )
+      nb_le_a = nat_le_subst_r(
+        Nat.mul(n, 1n+bp),
+        Nat.add(Nat.mod(a, 1n+bp), Nat.mul(Nat.div(a, 1n+bp), 1n+bp)),
+        a,
+        nat_div_mod(a, bp),
+        nb_le_rqb
+      )
+      Empty.absurd({Nat.is_lt(Nat.div(a, 1n+bp), n) == True{} : Bool}, nat_lt_not_le(a, Nat.mul(n, 1n+bp), h, nb_le_a))
+
+# For b > 0, written as 1n+bp: a < n * (1n+bp) -> a / (1n+bp) < n
+def nat_div_lt_of_lt_mul(
+  a: Nat,
+  n: Nat,
+  bp: Nat,
+  h: {Nat.is_lt(a, Nat.mul(n, 1n+bp)) == True{} : Bool}
+) -> {Nat.is_lt(Nat.div(a, 1n+bp), n) == True{} : Bool}:
+  +a2 = {a : Nat}
+  +n2 = {n : Nat}
+  +bp2 = {bp : Nat}
+  nat_div_lt_of_lt_mul_dec(a2, n2, bp2, h, Nat.is_lt(Nat.div(a2, 1n+bp2), n2), {==})
+
+# For b > 0, written as 1n+bp: a < (1n+bp) * n -> a / (1n+bp) < n
+def nat_div_lt_of_lt_mul_l(
+  a: Nat,
+  n: Nat,
+  bp: Nat,
+  h: {Nat.is_lt(a, Nat.mul(1n+bp, n)) == True{} : Bool}
+) -> {Nat.is_lt(Nat.div(a, 1n+bp), n) == True{} : Bool}:
+  +a2 = {a : Nat}
+  +n2 = {n : Nat}
+  +bp2 = {bp : Nat}
+  nat_div_lt_of_lt_mul(
+    a2,
+    n2,
+    bp2,
+    nat_lt_subst_r(a2, Nat.mul(1n+bp2, n2), Nat.mul(n2, 1n+bp2), nat_mul_comm(1n+bp2, n2), h)
+  )
+`;
+
   return [
     {
       path: 'rusty-bends-build/Cargo.toml',
@@ -9306,6 +10416,12 @@ mod tests {
       language: 'rust',
       summary: 'CLI binary that prints every law as name: promise for PR descriptions.',
       content: buildCrateLawsBin,
+    },
+    {
+      path: 'rusty-bends-build/lemmas/nat_lemmas.bend',
+      language: 'bend',
+      summary: 'Bundled Bend 2 Nat arithmetic, order, and division lemma library (erased before Rust codegen).',
+      content: buildCrateNatLemmas,
     },
     {
       path: 'example-app/Cargo.toml',
