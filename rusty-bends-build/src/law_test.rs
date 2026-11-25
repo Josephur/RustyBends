@@ -212,8 +212,10 @@ fn split_law_clause(after_for: &str) -> (&str, &str) {
     let mut depth = 0i32;
     let mut saw_colon = false;
     for (idx, ch) in after_for.char_indices() {
+        let is_arrow = ch == '>' && idx > 0 && bytes[idx - 1] == b'-';
         match ch {
             '(' | '[' | '<' => depth += 1,
+            '>' if is_arrow => {}
             ')' | ']' | '>' => depth -= 1,
             '{' => {
                 if depth == 0 && saw_colon {
@@ -412,6 +414,7 @@ pub(crate) fn emit_law_tests_module(
     types: &[TypeDef],
     defs: &[Def],
     type_env: &TypeEnv,
+    unchecked_laws: &HashSet<String>,
 ) -> String {
     if laws.is_empty() {
         return String::new();
@@ -437,7 +440,13 @@ pub(crate) fn emit_law_tests_module(
             used_fn_names.insert(fn_name.clone());
         }
         out.push_str(&emit_single_law_test(
-            &fn_name, law, types, defs, &def_map, &type_map, type_env,
+            &fn_name,
+            law,
+            defs,
+            &def_map,
+            &type_map,
+            type_env,
+            unchecked_laws.contains(&law.name),
         ));
         out.push('\n');
     }
@@ -479,15 +488,26 @@ pub(crate) fn emit_pool_runtime_helpers(
         z ^ (z >> 31)
     }
 
-    fn __rb_is_nat_overflow(payload: &(dyn std::any::Any + Send)) -> bool {
-        let msg = if let Some(m) = payload.downcast_ref::<&str>() {
-            *m
+    fn __rb_panic_msg(payload: &(dyn std::any::Any + Send)) -> &str {
+        if let Some(m) = payload.downcast_ref::<&str>() {
+            m
         } else if let Some(m) = payload.downcast_ref::<String>() {
             m.as_str()
         } else {
-            return false;
-        };
-        msg.contains("rusty-bends: Nat overflow") || msg.contains("rusty-bends: step limit")
+            "(non-string panic)"
+        }
+    }
+
+    /// Checked `Nat` growth past `u64`: the input is outside what the Rust code can
+    /// represent, so the case is skipped.
+    fn __rb_is_nat_overflow(payload: &(dyn std::any::Any + Send)) -> bool {
+        __rb_panic_msg(payload).contains("rusty-bends: Nat overflow")
+    }
+
+    /// The evaluation step limit (mutation harnesses only): the code did not terminate
+    /// in time, which kills a mutant instead of skipping the case.
+    fn __rb_is_step_limit(payload: &(dyn std::any::Any + Send)) -> bool {
+        __rb_panic_msg(payload).contains("rusty-bends: step limit")
     }
 "#,
     );
@@ -499,7 +519,10 @@ pub(crate) fn emit_pool_runtime_helpers(
         if recursive {
             (0_u64..=12).collect()
         } else {
-            vec![0_u64, 1, 2, 3, 4, 5, 6, 7, 8, 16, 1000, u64::MAX - 1, u64::MAX]
+            vec![
+                0_u64, 1, 2, 3, 4, 5, 6, 7, 8, 10, 16, 32, 64, 100, 128, 255, 256, 512, 999, 1000,
+                u64::MAX - 1, u64::MAX,
+            ]
         }
     }
 
@@ -535,7 +558,10 @@ pub(crate) fn emit_pool_runtime_helpers(
             }
             v
         } else {
-            let mut v = vec![0_u64, 1, 2, 3, 5, 7, 16, 1000, u64::MAX - 1, u64::MAX];
+            let mut v = vec![
+                0_u64, 1, 2, 3, 5, 7, 10, 16, 32, 64, 100, 128, 255, 256, 512, 999, 1000,
+                u64::MAX - 1, u64::MAX,
+            ];
             for _ in 0..2 {
                 v.push(__rb_next_u64(rng) % 10_000);
             }
@@ -691,10 +717,16 @@ fn emit_adt_pool_fn(
     s.push_str("        let mut out = Vec::new();\n");
     for v in &td.variants {
         let ctor_rs = format!("{}::{}", rust_ident(&td.name), rust_ident(&v.name));
-        let has_adt_field = v
-            .field_types
-            .iter()
-            .any(|ft| type_references_adt(ft, type_map));
+        // Only a field that leads back to this type (a recursive cycle, boxed in Rust)
+        // spends depth; nested non-recursive ADTs always get their full pools.
+        let recursive_variant = type_env
+            .ctor_map
+            .get(&format!("{}.{}", td.name, v.name))
+            .is_some_and(|c| c.boxed_fields.iter().any(|b| *b));
+        let has_adt_field = recursive_variant
+            && v.field_types
+                .iter()
+                .any(|ft| type_references_adt(ft, type_map));
         let indent = if has_adt_field {
             s.push_str("        if depth > 0 {\n");
             "            "
@@ -956,11 +988,11 @@ fn emit_tuple_pool_expr(
 fn emit_single_law_test(
     fn_name: &str,
     law: &ParsedLaw,
-    _types: &[TypeDef],
     defs: &[Def],
     def_map: &HashMap<String, &Def>,
     type_map: &HashMap<String, &TypeDef>,
     type_env: &TypeEnv,
+    marked_unchecked: bool,
 ) -> String {
     if let Some(reason) = &law.unsupported_reason {
         return format!("    // Skipped law {}: {reason}\n", law.name);
@@ -1158,9 +1190,16 @@ fn emit_single_law_test(
     s.push_str("            }\n");
     s.push_str("        }\n");
 
-    if law.hypotheses.is_empty() {
+    // A law whose hypotheses no sampled input satisfies proves nothing here; only a
+    // reviewed '# unchecked:' marker lets it pass with zero checked cases.
+    if !marked_unchecked {
+        let why = if law.hypotheses.is_empty() {
+            "non-overflowing test cases"
+        } else {
+            "test cases satisfying its hypotheses"
+        };
         s.push_str(&format!(
-            "        assert!(__checked > 0, \"law {} had 0 non-overflowing test cases\");\n",
+            "        assert!(__checked > 0, \"law {} had 0 {why}\");\n",
             escape_rust_str(&law.name)
         ));
     }
@@ -1442,7 +1481,7 @@ pub(crate) fn emit_eval_law_checker(
     } else if recursive {
         "Nat in 0..=12, Bool in {false, true}, ADT depth <= 2".to_string()
     } else {
-        "Nat in [0..=8, 16, 1000, u64::MAX-1, u64::MAX], Bool in {false, true}, ADT depth <= 2"
+        "Nat in [0..=8, 10, 16, 32, 64, 100, 128, 255, 256, 512, 999, 1000, u64::MAX-1, u64::MAX], Bool in {false, true}, recursive ADT depth <= 2"
             .to_string()
     };
 
@@ -1461,10 +1500,23 @@ pub(crate) fn emit_eval_law_checker(
     } else {
         ""
     };
+    if compact_mutant_mode {
+        // How many sampled cases satisfied every hypothesis and reached the goal on the
+        // last call: the mutation gate requires this to be non-zero on unmutated code.
+        s.push_str("pub static CHECKED: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);\n");
+    }
     s.push_str(&format!("{vis}fn {fn_name}(){ret_sig} {{\n"));
 
     if runtime_vars.is_empty() {
         s.push_str(&format!("    match {eval_expr} {{\n"));
+        if compact_mutant_mode {
+            s.push_str(
+                "        Ok(Some(_)) => CHECKED.store(1, std::sync::atomic::Ordering::Relaxed),\n",
+            );
+            s.push_str("        _ => CHECKED.store(0, std::sync::atomic::Ordering::Relaxed),\n");
+            s.push_str("    }\n");
+            s.push_str(&format!("    match {eval_expr} {{\n"));
+        }
         s.push_str("        Ok(Some((__lhs, __rhs))) if __lhs != __rhs => {\n");
         if compact_mutant_mode {
             s.push_str("            return Some(format!(\"lhs={:?}, rhs={:?}\", __lhs, __rhs));\n");
@@ -1490,6 +1542,12 @@ pub(crate) fn emit_eval_law_checker(
             ));
         }
         s.push_str("        }\n");
+        if compact_mutant_mode {
+            s.push_str("        Err(__p) if __rb_is_step_limit(&*__p) => return Some(\"did not terminate within the evaluation step limit\".to_string()),\n");
+            s.push_str("        Err(__p) if !__rb_is_nat_overflow(&*__p) => return Some(format!(\"panicked: {}\", __rb_panic_msg(&*__p))),\n");
+        } else {
+            s.push_str("        Err(__p) if !__rb_is_nat_overflow(&*__p) && !__rb_is_step_limit(&*__p) => std::panic::resume_unwind(__p),\n");
+        }
         s.push_str("        _ => {\n");
         if compact_mutant_mode {
             s.push_str("            return None;\n");
@@ -1537,7 +1595,14 @@ pub(crate) fn emit_eval_law_checker(
     }
     s.push_str(&format!("        match {eval_expr} {{\n"));
     s.push_str("            Err(__p) if __rb_is_nat_overflow(&*__p) => false,\n");
-    s.push_str("            Err(__p) => std::panic::resume_unwind(__p),\n");
+    if compact_mutant_mode {
+        // A mutant that loops forever or panics differently is caught, not skipped.
+        s.push_str("            Err(__p) if __rb_is_step_limit(&*__p) => { *__ce_out = Some(\"did not terminate within the evaluation step limit\".to_string()); true }\n");
+        s.push_str("            Err(__p) => { *__ce_out = Some(format!(\"panicked: {}\", __rb_panic_msg(&*__p))); true }\n");
+    } else {
+        s.push_str("            Err(__p) if __rb_is_step_limit(&*__p) => false,\n");
+        s.push_str("            Err(__p) => std::panic::resume_unwind(__p),\n");
+    }
     s.push_str("            Ok(None) => false,\n");
     s.push_str("            Ok(Some((__lhs, __rhs))) => {\n");
     s.push_str("                *__checked += 1;\n");
@@ -1692,6 +1757,7 @@ pub(crate) fn emit_eval_law_checker(
     s.push_str("    }\n");
 
     if compact_mutant_mode {
+        s.push_str("    CHECKED.store(__checked, std::sync::atomic::Ordering::Relaxed);\n");
         s.push_str("    __ce_summary\n");
     } else {
         s.push_str("    if !__found_ce {\n");
@@ -2287,5 +2353,25 @@ law keep_same:
             other => panic!("expected a counterexample, got {other:?}"),
         }
         let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn function_typed_binders_do_not_break_the_next_clause() {
+        let src = "law apply_twice:
+  for f: (Nat -> Nat)
+  for n: Nat
+  {f(f(n)) == f(f(n)) : Nat}
+";
+        let laws = parse_laws(src);
+        assert_eq!(laws.len(), 1);
+        let law = &laws[0];
+        let vars: Vec<(&str, &str)> = law
+            .vars
+            .iter()
+            .map(|v| (v.name.as_str(), v.ty.as_str()))
+            .collect();
+        assert_eq!(vars, vec![("f", "(Nat -> Nat)"), ("n", "Nat")]);
+        assert_eq!(law.lhs, "f(f(n))");
+        assert_eq!(law.eq_ty, "Nat");
     }
 }

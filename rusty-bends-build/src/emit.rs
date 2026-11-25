@@ -339,7 +339,13 @@ pub fn emit_verified_rust(source: &str, laws_verified: usize) -> Result<EmitSumm
     let mut summary = emit_items_to_rust(&types, &defs, &type_env, laws_verified, None, true)?;
 
     if !laws.is_empty() {
-        let test_mod = crate::law_test::emit_law_tests_module(&laws, &types, &defs, &type_env);
+        let unchecked: HashSet<String> = crate::lock::extract_law_doc_comments(source)
+            .into_iter()
+            .filter(|(_, docs)| docs.unchecked.is_some())
+            .map(|(name, _)| name)
+            .collect();
+        let test_mod =
+            crate::law_test::emit_law_tests_module(&laws, &types, &defs, &type_env, &unchecked);
         if !test_mod.is_empty() {
             summary.rust_source.push('\n');
             summary.rust_source.push_str(&test_mod);

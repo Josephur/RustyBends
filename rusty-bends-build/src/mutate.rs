@@ -44,7 +44,7 @@ const MAX_ADD_MAX_MIN_MUTANTS_PER_LAW: usize = 32;
 /// At most this many `Nat` literal sites per function are mutated by `NatLit`.
 const MAX_NAT_LIT_SITES_PER_DEF: usize = 8;
 /// Version tag baked into mutation cone hashes so cache keys invalidate when mutators change.
-const MUTATE_CACHE_VERSION: &str = "v5";
+const MUTATE_CACHE_VERSION: &str = "v6";
 /// Maximum mutants packed into one compiled multi-law harness binary.
 const BATCH_MAX_MUTANTS: usize = 160;
 /// Maximum distinct laws packed into one compiled multi-law harness binary.
@@ -142,7 +142,14 @@ enum EvaluatedLawResult {
         error_message: String,
         outcomes: Vec<MutantOutcome>,
     },
+    /// The unmutated code gives no usable baseline: no sampled case reached the goal
+    /// (hypotheses never hold), or the law already fails or panics on it. Kills would
+    /// say nothing about the law, so it is reported as skipped with this reason.
+    BaselineUnusable { reason: String },
 }
+
+/// Prefix of the skip reason for a law whose hypotheses no sampled input satisfies.
+const VACUOUS_BASELINE_REASON: &str = "no sampled input satisfies its hypotheses";
 
 fn sanitize_cache_field(s: &str) -> String {
     s.replace(['\t', '\n', '\r'], " ")
@@ -414,6 +421,27 @@ pub fn run_mutation_checks_with_cache(
                     cache_dirty = true;
                     report_slots[work.prepared_idx] = Some(report);
                 }
+                EvaluatedLawResult::BaselineUnusable { reason } => {
+                    let report = LawMutationReport {
+                        law_name: item.law.name.clone(),
+                        cone: item.cone.clone(),
+                        total_mutants: item.generated.mutants.len(),
+                        generated_mutants: item.generated.generated_total,
+                        dropped_by_budget: item.generated.dropped_by_budget,
+                        dropped_by_site_cap: item.generated.dropped_by_site_cap,
+                        caught_by: None,
+                        survived_operators: Vec::new(),
+                        mutant_outcomes: Vec::new(),
+                        skipped_reason: Some(reason),
+                        from_cache: false,
+                    };
+                    cache.insert(
+                        item.cone_key.clone(),
+                        cache_entry_from_report(&report, full_report),
+                    );
+                    cache_dirty = true;
+                    report_slots[work.prepared_idx] = Some(report);
+                }
                 EvaluatedLawResult::BuildFailed {
                     error_message,
                     outcomes,
@@ -502,6 +530,12 @@ pub fn run_mutation_checks_with_cache(
 
         if !is_locked {
             if let Some(ref reason) = report.skipped_reason {
+                if reason.starts_with(VACUOUS_BASELINE_REASON) && unchecked_marker.is_none() {
+                    return Err(format!(
+                        "[E_LAW_VACUOUS] Law '{}' is vacuous on the sampled inputs: {reason}, so it never reaches its conclusion and no mutant result means anything.\nHint: check that the hypotheses of '{}' can hold together (a law that assumes something impossible proves nothing). If they only hold for inputs outside the sampled pool, add '# unchecked: <why>' directly above 'law {}:'.",
+                        report.law_name, report.law_name, report.law_name
+                    ));
+                }
                 match unchecked_marker {
                     Some(marker) => warnings.push(format!(
                         "RustyBends mutate [{}]: UNCHECKED ({reason}); accepted by '# unchecked: {marker}'",
@@ -776,6 +810,7 @@ fn run_single_law_per_mutant_fallback(
             return res;
         }
     }
+    // Per-mutant runs below each re-check the baseline; it does not depend on the mutant.
 
     let mut outcomes = Vec::with_capacity(item.mutants.len());
     let mut build_failures: Vec<(String, String)> = Vec::new();
@@ -796,10 +831,14 @@ fn run_single_law_per_mutant_fallback(
             out_dir,
         ) {
             Ok(mut res) => {
+                let popped = res.pop();
+                if let Some(EvaluatedLawResult::BaselineUnusable { reason }) = popped {
+                    return EvaluatedLawResult::BaselineUnusable { reason };
+                }
                 if let Some(EvaluatedLawResult::Complete {
                     caught_by,
                     outcomes: mut sub_outcomes,
-                }) = res.pop()
+                }) = popped
                 {
                     if !full_report {
                         if let Some(hit) = caught_by {
@@ -890,6 +929,7 @@ fn evaluate_mutants_batch(
     match run_single_law_per_mutant_fallback(&item, types, type_map, type_env, false, out_dir) {
         EvaluatedLawResult::Complete { caught_by, .. } => Ok(caught_by),
         EvaluatedLawResult::BuildFailed { error_message, .. } => Err(error_message),
+        EvaluatedLawResult::BaselineUnusable { reason } => Err(reason),
     }
 }
 
@@ -955,6 +995,29 @@ fn run_batch_harness(
         .map(|item| vec![None; item.mutants.len()])
         .collect();
     let mut any_active = false;
+
+    let mut has_baseline = vec![false; batch.len()];
+    for (bi, item) in batch.iter().enumerate() {
+        // Unmutated baseline: the same checker over the original cone.
+        let base_defs = item.cone_defs.to_vec();
+        let base_map: HashMap<String, &Def> =
+            base_defs.iter().map(|d| (d.name.clone(), d)).collect();
+        if let (Ok(defs_rs), Ok(check_fn)) = (
+            emit_items_to_rust(&[], &base_defs, type_env, 0, Some(10_000), false),
+            emit_eval_law_checker(
+                "check", item.law, &base_defs, &base_map, type_map, type_env, true,
+            ),
+        ) {
+            program.push_str(&format!("mod l_{bi}_base {{\n    use super::*;\n"));
+            for line in defs_rs.rust_source.lines().chain(check_fn.lines()) {
+                program.push_str("    ");
+                program.push_str(line);
+                program.push('\n');
+            }
+            program.push_str("}\n\n");
+            has_baseline[bi] = true;
+        }
+    }
 
     for (bi, item) in batch.iter().enumerate() {
         let mut active_indices = Vec::new();
@@ -1032,6 +1095,11 @@ fn run_batch_harness(
 
     for (bi, active_indices) in per_law_active.iter().enumerate() {
         program.push_str(&format!("fn __rb_run_batch_law_{bi}() {{\n"));
+        if has_baseline[bi] {
+            program.push_str(&format!(
+                "    let __base = l_{bi}_base::check();\n    println!(\"BASELINE\\t{bi}\\t{{}}\\t{{}}\", l_{bi}_base::CHECKED.load(std::sync::atomic::Ordering::Relaxed), __base.unwrap_or_default().replace(['\\n', '\\r', '\\t'], \" \"));\n"
+            ));
+        }
         for &mi in active_indices {
             if full_report {
                 program.push_str(&format!(
@@ -1084,7 +1152,20 @@ fn run_batch_harness(
         .collect();
 
     let stdout = String::from_utf8_lossy(&run.stdout);
+    let mut per_law_baseline: Vec<Option<(usize, String)>> = vec![None; batch.len()];
     for line in stdout.lines() {
+        if let Some(rest) = line.strip_prefix("BASELINE\t") {
+            let mut parts = rest.splitn(3, '\t');
+            if let (Some(bi), Some(checked), Some(ce)) = (parts.next(), parts.next(), parts.next())
+            {
+                if let (Ok(bi), Ok(checked)) = (bi.parse::<usize>(), checked.parse::<usize>()) {
+                    if bi < per_law_baseline.len() {
+                        per_law_baseline[bi] = Some((checked, ce.trim().to_string()));
+                    }
+                }
+            }
+            continue;
+        }
         if let Some(rest) = line.strip_prefix("CAUGHT\t") {
             let mut parts = rest.splitn(3, '\t');
             if let (Some(bi_str), Some(mi_str), Some(ce)) =
@@ -1122,6 +1203,25 @@ fn run_batch_harness(
 
     let mut results = Vec::with_capacity(batch.len());
     for (bi, item) in batch.iter().enumerate() {
+        match per_law_baseline[bi].take() {
+            Some((_, ce)) if !ce.is_empty() => {
+                results.push(EvaluatedLawResult::BaselineUnusable {
+                    reason: format!(
+                        "the unmutated emitted code already fails it on a sampled input ({ce})"
+                    ),
+                });
+                continue;
+            }
+            Some((0, _)) => {
+                results.push(EvaluatedLawResult::BaselineUnusable {
+                    reason: format!(
+                        "{VACUOUS_BASELINE_REASON} (0 sampled cases reached the conclusion on the unmutated code)"
+                    ),
+                });
+                continue;
+            }
+            _ => {}
+        }
         let outcomes = if full_report {
             item.mutants
                 .iter()
@@ -4213,6 +4313,261 @@ def keep_same(as):
             .expect("a keyword-named law must not be reported vacuous");
         let (desc, _) = summary.reports[0].caught_by.clone().expect("caught");
         assert!(desc.ends_with("[NatBound]"), "caught by: {desc}");
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    const IMPOSSIBLE_HYPOTHESIS_SRC: &str = r#"import Base
+
+def bool_pick_type(b: Bool, t: Type, f: Type) -> Type:
+  match b:
+    case True{}:
+      t
+    case False{}:
+      f
+
+def bool_false_ne_true(h: {False{} == True{} : Bool}) -> Empty:
+  %h : bool_pick_type(_, Empty, Unit)
+  Unit{}
+
+def bool_absurd(-A: Type, h: {False{} == True{} : Bool}) -> A:
+  Empty.absurd(A, bool_false_ne_true(h))
+
+def accepts(x: Nat) -> Bool:
+  False{}
+
+# promise: whenever accepts holds, x equals x + 1
+law impossible_step:
+  for x: Nat
+  for h: {accepts(x) == True{} : Bool}
+  {x == Nat.add(x, 1n) : Nat}
+
+def impossible_step(x, h):
+  bool_absurd({x == Nat.add(x, 1n) : Nat}, h)
+"#;
+
+    #[test]
+    fn law_whose_hypotheses_never_hold_is_vacuous_not_caught() {
+        let dir = tmp_dir("unsat_hyp");
+        let core = dir.join("core.bend");
+        fs::write(&core, IMPOSSIBLE_HYPOTHESIS_SRC).unwrap();
+        // Differential: the reference checker proves it (ex falso).
+        let bend = crate::resolve_bend_bin(
+            env::var("BEND_BIN").ok(),
+            env::var_os("PATH"),
+            env::var_os("HOME").map(std::path::PathBuf::from),
+        );
+        if let Ok(out) = Command::new(&bend).arg(&core).arg("--check-only").output() {
+            assert!(out.status.success(), "reference accepts the ex-falso proof");
+        }
+        let report = lock::check_law_lock(
+            &dir.join("rusty-bends.lock"),
+            std::slice::from_ref(&core),
+            false,
+        )
+        .unwrap();
+        let err = run_mutation_checks(
+            IMPOSSIBLE_HYPOTHESIS_SRC,
+            &report,
+            MutateMode::NewOnly,
+            &dir.join("o"),
+        )
+        .expect_err("flipping 'accepts' must not count as a catch");
+        assert!(err.contains("[E_LAW_VACUOUS]"), "{err}");
+        assert!(
+            err.contains("no sampled input satisfies its hypotheses"),
+            "{err}"
+        );
+
+        // The generated cargo test refuses zero checked cases too.
+        let summary = crate::emit::emit_verified_rust(IMPOSSIBLE_HYPOTHESIS_SRC, 1).unwrap();
+        assert!(
+            summary
+                .rust_source
+                .contains("law impossible_step had 0 test cases satisfying its hypotheses"),
+            "{}",
+            summary.rust_source
+        );
+
+        // A reviewed '# unchecked:' marker accepts it explicitly, in both places.
+        let marked = IMPOSSIBLE_HYPOTHESIS_SRC.replace(
+            "# promise: whenever accepts holds, x equals x + 1
+",
+            "# promise: whenever accepts holds, x equals x + 1
+# unchecked: accepts is a placeholder that holds for no input yet
+",
+        );
+        fs::write(&core, &marked).unwrap();
+        let report = lock::check_law_lock(
+            &dir.join("rusty-bends.lock"),
+            std::slice::from_ref(&core),
+            false,
+        )
+        .unwrap();
+        let summary = run_mutation_checks(&marked, &report, MutateMode::NewOnly, &dir.join("o2"))
+            .expect("marked law is accepted");
+        assert!(
+            summary.warnings.iter().any(|w| w.contains("UNCHECKED")),
+            "{:?}",
+            summary.warnings
+        );
+        let emitted = crate::emit::emit_verified_rust(&marked, 1).unwrap();
+        assert!(!emitted.rust_source.contains("had 0 test cases"));
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    const NESTED_AND_BANDED_SRC: &str = r#"import Base
+
+type Inner is Data:
+  Leaf{n: Nat}
+
+type Mid is Data:
+  Wrap{i: Inner}
+
+type Outer is Data:
+  Hold{m: Mid}
+
+type Top is Data:
+  Root{o: Outer}
+
+def depth_value(t: Top) -> Nat:
+  match t:
+    case Root{Hold{Wrap{Leaf{n}}}}: n
+
+def bump(t: Top) -> Nat:
+  Nat.add(depth_value(t), 1n)
+
+# promise: bump is one more than the stored value
+law bump_adds_one:
+  for t: Top
+  {bump(t) == Nat.add(depth_value(t), 1n) : Nat}
+
+def bump_adds_one(t):
+  {==}
+
+def in_band(+x: Nat) -> Bool:
+  Bool.and(Nat.is_gt(x, 20n), Nat.is_lt(x, 900n))
+
+def halve(+x: Nat) -> Nat:
+  Nat.div(x, 2n)
+
+# promise: halving a value in the band divides it by two
+law halve_in_band:
+  for +x: Nat
+  for h: {in_band(x) == True{} : Bool}
+  {halve(x) == Nat.div(x, 2n) : Nat}
+
+def halve_in_band(x, h):
+  {==}
+"#;
+
+    #[test]
+    fn deep_non_recursive_adts_and_mid_range_hypotheses_get_samples() {
+        let dir = tmp_dir("deep_pools");
+        let core = dir.join("core.bend");
+        fs::write(&core, NESTED_AND_BANDED_SRC).unwrap();
+        let bend = crate::resolve_bend_bin(
+            env::var("BEND_BIN").ok(),
+            env::var_os("PATH"),
+            env::var_os("HOME").map(std::path::PathBuf::from),
+        );
+        if let Ok(out) = Command::new(&bend).arg(&core).arg("--check-only").output() {
+            assert!(out.status.success(), "reference must prove the fixture");
+        }
+        let report = lock::check_law_lock(
+            &dir.join("rusty-bends.lock"),
+            std::slice::from_ref(&core),
+            false,
+        )
+        .unwrap();
+        // Four nested ADT levels and a 20 < x < 900 band both reach their goals, so both
+        // laws are mutation-checked instead of vacuous.
+        let summary = run_mutation_checks(
+            NESTED_AND_BANDED_SRC,
+            &report,
+            MutateMode::NewOnly,
+            &dir.join("o"),
+        )
+        .expect("both laws are checkable");
+        for r in &summary.reports {
+            assert!(
+                r.caught_by.is_some(),
+                "{} caught nothing: {r:?}",
+                r.law_name
+            );
+        }
+
+        // The generated cargo tests run with non-empty pools.
+        let emitted = crate::emit::emit_verified_rust(NESTED_AND_BANDED_SRC, 2).unwrap();
+        let rs = dir.join("nested.rs");
+        let bin = dir.join("nested_bin");
+        fs::write(&rs, &emitted.rust_source).unwrap();
+        let rustc = env::var("RUSTC").unwrap_or_else(|_| "rustc".to_string());
+        let compile = Command::new(&rustc)
+            .args(["--edition", "2021", "--test", "-A", "warnings", "-o"])
+            .arg(&bin)
+            .arg(&rs)
+            .output()
+            .unwrap();
+        assert!(
+            compile.status.success(),
+            "{}",
+            String::from_utf8_lossy(&compile.stderr)
+        );
+        let run = Command::new(&bin).output().unwrap();
+        let out = String::from_utf8_lossy(&run.stdout);
+        assert!(run.status.success(), "{out}");
+        assert!(out.contains("law_bump_adds_one ... ok"), "{out}");
+        assert!(out.contains("law_halve_in_band ... ok"), "{out}");
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn mutant_that_never_terminates_is_caught_not_skipped() {
+        let dir = tmp_dir("step_limit");
+        let src = r#"import Base
+
+def drain(n: Nat) -> Nat:
+  match n:
+    case 0n: 0n
+    case 1n+p: drain(p)
+
+law drain_reaches_zero:
+  for n: Nat
+  {drain(n) == 0n : Nat}
+
+law drain_three:
+  {drain(3n) == 0n : Nat}
+"#;
+        let laws = parse_laws(src);
+        let (types, defs) = parse_book_items(src).unwrap();
+        let type_env = TypeEnv::build(&types, &defs, &collect_law_source_slices(&laws));
+        let type_map: HashMap<String, &TypeDef> =
+            types.iter().map(|t| (t.name.clone(), t)).collect();
+        let spin = Mutant {
+            operator: "Test".to_string(),
+            description: "drain: recurse on n [Test]".to_string(),
+            def_name: "drain".to_string(),
+            mutated_body: "match n:
+  case 0n: drain(n)
+  case 1n+p: drain(n)"
+                .to_string(),
+        };
+        for law in &laws {
+            let caught = evaluate_mutants_batch(
+                law,
+                std::slice::from_ref(&spin),
+                &types,
+                &defs,
+                &type_map,
+                &type_env,
+                &dir,
+            )
+            .expect("harness runs");
+            let (desc, ce) =
+                caught.unwrap_or_else(|| panic!("{}: non-termination must be caught", law.name));
+            assert_eq!(desc, "drain: recurse on n [Test]");
+            assert!(ce.contains("step limit"), "{}: {ce}", law.name);
+        }
         let _ = fs::remove_dir_all(&dir);
     }
 
