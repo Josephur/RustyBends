@@ -295,15 +295,42 @@ pub fn resolve_bend_bin(
 }
 
 /// Checks whether the installed 'bend version' string satisfies the pinned prefix.
+///
+/// The pin must appear on version boundaries: `2.0.4` matches `bend 2.0.4` and
+/// `2.0.4-rc1`, but not `2.0.40` or `12.0.4`. A pin ending in `.` (such as `2.0.`)
+/// or naming fewer components (such as `2.0`) matches every release under it.
 pub fn verify_bend_version_str(expected_pin: &str, actual_output: &str) -> Result<(), String> {
     let trimmed_pin = expected_pin.trim();
-    if trimmed_pin.is_empty() || actual_output.contains(trimmed_pin) {
+    if trimmed_pin.is_empty() || version_pin_matches(trimmed_pin, actual_output) {
         return Ok(());
     }
     Err(format!(
         "[E_BEND_VERSION_MISMATCH] Pinned Bend version '{trimmed_pin}' does not match installed '{}'.\nHint: Install the pinned Bend 2 release or update bend.pin / BEND_PIN_VERSION.",
         actual_output.trim()
     ))
+}
+
+fn version_pin_matches(pin: &str, actual_output: &str) -> bool {
+    let is_word = |c: char| c.is_ascii_alphanumeric() || c == '.';
+    let mut from = 0;
+    while let Some(off) = actual_output[from..].find(pin) {
+        let start = from + off;
+        let end = start + pin.len();
+        let before_ok = actual_output[..start]
+            .chars()
+            .next_back()
+            .is_none_or(|c| !is_word(c));
+        let after_ok = pin.ends_with('.')
+            || actual_output[end..]
+                .chars()
+                .next()
+                .is_none_or(|c| !c.is_ascii_alphanumeric());
+        if before_ok && after_ok {
+            return true;
+        }
+        from = start + pin.chars().next().map_or(1, char::len_utf8);
+    }
+    false
 }
 
 /// Asks the Bend CLI for its version. Bend 2 (2.0.40+) only accepts the 'version'
@@ -511,6 +538,16 @@ where
     let mut combined_source = String::new();
     for file in &bend_files {
         let text = fs::read_to_string(file).map_err(|e| e.to_string())?;
+        if let Some(bad) = find_unchecked_defs(&text).first() {
+            return Err(format!(
+                "[E_UNCHECKED_DEF] {}:{}: def '{}' is {} — Bend trusts its type without checking its code, so it cannot be part of a verified build.\nHint: move it out of '{}' or give it a checked body.",
+                file.display(),
+                bad.line,
+                bad.name,
+                bad.kind,
+                cfg.verified_dir.display()
+            ));
+        }
         combined_source.push_str(&emit::resolve_import_aliases(&text));
         combined_source.push('\n');
         file_sources.push((file, text));
@@ -523,7 +560,9 @@ where
             .and_then(|n| n.to_str())
             .map(|n| n.eq_ignore_ascii_case("LAWS.bend"))
             .unwrap_or(false);
-        let has_laws = is_laws_file || !lock::extract_laws_from_source(text).is_empty();
+        let has_laws = is_laws_file
+            || !lock::extract_laws_from_source(text).is_empty()
+            || has_equality_lemma(text);
 
         match checker(file, has_laws) {
             Ok(VerdictApplied::Skipped) => {
@@ -633,7 +672,7 @@ fn verify_with_bend_cli(
     if cfg.verdict_mode == VerdictMode::Off || cfg.verdict_flag.trim().is_empty() {
         return Ok(VerdictApplied::Off);
     }
-    if !has_laws {
+    if !has_laws && cfg.verdict_mode != VerdictMode::Require {
         return Ok(expected_verdict_applied(cfg, has_verdict_runtime()));
     }
 
@@ -720,15 +759,184 @@ fn run_bend_step(bend_bin: &str, flag: &str, file: &Path) -> Result<(), String> 
         )
     })?;
 
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    let stderr = String::from_utf8_lossy(&output.stderr);
     if !output.status.success() {
-        let stdout = String::from_utf8_lossy(&output.stdout);
-        let stderr = String::from_utf8_lossy(&output.stderr);
         return Err(format!(
             "[E_BEND_CHECK_FAILED] '{bend_bin} {} {flag}' failed:\n{stdout}{stderr}",
             file.display()
         ));
     }
+    check_bend_verdict_text(bend_bin, flag, file, &stdout, &stderr)
+}
+
+/// Bend's verdict line, printed on stdout when every def outside Base checks.
+const BEND_PASS: &str = "ALL PROOFS CHECK";
+/// Bend's verdict line on failure (printed on stderr).
+const BEND_FAIL: &str = "SOME PROOFS FAIL";
+
+/// Accepts a successful `bend --check-only` / `--verdict` run only when its output
+/// carries the passing verdict line and no failing one, so a zero exit status alone
+/// (a wrapper script, a changed CLI) never counts as a proof.
+fn check_bend_verdict_text(
+    bend_bin: &str,
+    flag: &str,
+    file: &Path,
+    stdout: &str,
+    stderr: &str,
+) -> Result<(), String> {
+    let has_line = |text: &str, line: &str| text.lines().any(|l| l.trim() == line);
+    if has_line(stdout, BEND_FAIL) || has_line(stderr, BEND_FAIL) {
+        return Err(format!(
+            "[E_BEND_CHECK_FAILED] '{bend_bin} {} {flag}' reported '{BEND_FAIL}' despite exiting 0:\n{stdout}{stderr}",
+            file.display()
+        ));
+    }
+    if !has_line(stdout, BEND_PASS) {
+        return Err(format!(
+            "[E_BEND_NO_VERDICT] '{bend_bin} {} {flag}' exited 0 but did not print '{BEND_PASS}':\n{stdout}{stderr}\nHint: point BEND_BIN at a real Bend 2 binary and keep BEND_CHECK_FLAG / BEND_VERDICT_FLAG at --check-only / --verdict.",
+            file.display()
+        ));
+    }
     Ok(())
+}
+
+/// One definition in `verified/` that Bend takes on trust instead of checking.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct UncheckedDef {
+    pub name: String,
+    pub line: usize,
+    pub kind: &'static str,
+}
+
+/// Finds `@unsafe` defs, `def f?(..)` (Bend's shorthand for `@unsafe`), and foreign
+/// defs whose body is `import "file.c"` / `import "file.js"`. Bend reads only the
+/// type of these, never their code, so they cannot back a verified build.
+pub fn find_unchecked_defs(source: &str) -> Vec<UncheckedDef> {
+    let lines: Vec<&str> = source.lines().collect();
+    let mut found = Vec::new();
+    let def_name = |rest: &str| -> String {
+        rest.trim_start()
+            .split(|c: char| c == '(' || c == ':' || c == '?' || c.is_whitespace())
+            .next()
+            .unwrap_or("")
+            .to_string()
+    };
+    let mut pending_unsafe: Option<usize> = None;
+    for (idx, raw) in lines.iter().enumerate() {
+        let code = emit::strip_comment(raw);
+        let trimmed = code.trim();
+        if trimmed.is_empty() {
+            continue;
+        }
+        let at_top = !raw.starts_with([' ', '\t']);
+        if !at_top {
+            continue;
+        }
+        let mut rest = trimmed;
+        let mut unsafe_line = pending_unsafe.take();
+        if let Some(after) = rest.strip_prefix('@') {
+            let after = after.trim_start();
+            if let Some(tail) = after.strip_prefix("unsafe") {
+                if tail.is_empty() || tail.starts_with(char::is_whitespace) {
+                    unsafe_line = Some(idx + 1);
+                    rest = tail.trim_start();
+                    if rest.is_empty() {
+                        pending_unsafe = unsafe_line;
+                        continue;
+                    }
+                }
+            }
+        }
+        let Some(after_def) = rest.strip_prefix("def") else {
+            continue;
+        };
+        if !after_def.starts_with(char::is_whitespace) {
+            continue;
+        }
+        let name = def_name(after_def);
+        if let Some(line) = unsafe_line {
+            found.push(UncheckedDef {
+                name: name.clone(),
+                line,
+                kind: "@unsafe",
+            });
+            continue;
+        }
+        let head = after_def.trim_start();
+        if head[name.len()..].trim_start().starts_with('?') {
+            found.push(UncheckedDef {
+                name,
+                line: idx + 1,
+                kind: "unsafe '?' def",
+            });
+            continue;
+        }
+        // Foreign body: the first code after the header's ':' is `import "..."`.
+        let mut depth = 0i32;
+        let mut header_end: Option<(usize, usize)> = None;
+        'scan: for (li, l) in lines.iter().enumerate().skip(idx) {
+            for (bi, ch) in emit::strip_comment(l).char_indices() {
+                match ch {
+                    '(' | '[' | '{' => depth += 1,
+                    ')' | ']' | '}' => depth -= 1,
+                    ':' if depth == 0 => {
+                        header_end = Some((li, bi + 1));
+                        break 'scan;
+                    }
+                    _ => {}
+                }
+            }
+        }
+        let Some((hl, hc)) = header_end else {
+            continue;
+        };
+        let after_header = emit::strip_comment(lines[hl])[hc..].trim();
+        let body_start = if after_header.is_empty() {
+            lines
+                .iter()
+                .skip(hl + 1)
+                .map(|l| emit::strip_comment(l).trim())
+                .find(|l| !l.is_empty())
+                .unwrap_or("")
+        } else {
+            after_header
+        };
+        if body_start.starts_with("import \"") || body_start.starts_with("import\"") {
+            found.push(UncheckedDef {
+                name,
+                line: idx + 1,
+                kind: "foreign",
+            });
+        }
+    }
+    found
+}
+
+/// True when `source` holds a def that proves an equality (`-> {lhs == rhs : T}`):
+/// a lemma that `--verdict` must cross-check even if the file declares no `law`.
+pub fn has_equality_lemma(source: &str) -> bool {
+    let lines: Vec<&str> = source.lines().collect();
+    for (idx, raw) in lines.iter().enumerate() {
+        if !raw.starts_with("def ") {
+            continue;
+        }
+        let mut header = String::new();
+        for l in lines.iter().skip(idx).take(8) {
+            header.push_str(emit::strip_comment(l));
+            header.push(' ');
+            if l.trim_end().ends_with(':') && header.contains("->") {
+                break;
+            }
+        }
+        if let Some((_, ret)) = header.split_once("->") {
+            let ret = ret.trim_start();
+            if ret.starts_with('{') && ret.contains("==") {
+                return true;
+            }
+        }
+    }
+    false
 }
 
 /// Locates `def <name>` in `files`: returns `(file index, header line, end line exclusive)`.
@@ -1005,6 +1213,168 @@ mod tests {
         assert!(verify_bend_version_str("0.2.38", "bend 0.2.38 (commit abc123)").is_ok());
         let err = verify_bend_version_str("0.2.38", "bend 0.3.0").unwrap_err();
         assert!(err.contains("E_BEND_VERSION_MISMATCH"));
+    }
+
+    #[test]
+    fn bend_version_pin_matches_on_version_boundaries() {
+        // Exact and prefix pins.
+        assert!(verify_bend_version_str("2.0.4", "bend 2.0.4\n").is_ok());
+        assert!(verify_bend_version_str("2.0.4", "bend 2.0.4-rc1").is_ok());
+        assert!(verify_bend_version_str("2.0.", "bend 2.0.40").is_ok());
+        assert!(verify_bend_version_str("2.0", "bend 2.0.40").is_ok());
+        assert!(verify_bend_version_str("bend 2.0.40", "bend 2.0.40").is_ok());
+        // Substrings that cross a version boundary do not match.
+        assert!(verify_bend_version_str("2.0.4", "bend 2.0.40").is_err());
+        assert!(verify_bend_version_str("2.0.4", "bend 12.0.4").is_err());
+        assert!(verify_bend_version_str("2.0", "bend 2.01.1").is_err());
+        assert!(verify_bend_version_str("0.4", "bend 2.0.4").is_err());
+        // A later boundary-respecting occurrence still matches.
+        assert!(verify_bend_version_str("2.0.4", "bend 2.0.40 (compat 2.0.4)").is_ok());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn bend_step_requires_passing_verdict_text_not_only_exit_status() {
+        use std::os::unix::fs::PermissionsExt;
+        let root = temp_workspace("verdict_text");
+        let file = root.join("verified/core.bend");
+        fs::write(&file, "import Base\n").unwrap();
+        let script = |name: &str, body: &str| {
+            let p = root.join(name);
+            fs::write(&p, format!("#!/bin/sh\n{body}\n")).unwrap();
+            fs::set_permissions(&p, fs::Permissions::from_mode(0o755)).unwrap();
+            p.to_string_lossy().into_owned()
+        };
+        let silent = script("bend_silent", "exit 0");
+        let err = run_bend_step(&silent, "--check-only", &file).unwrap_err();
+        assert!(err.contains("E_BEND_NO_VERDICT"), "{err}");
+
+        let lying = script(
+            "bend_lying",
+            "echo 'ALL PROOFS CHECK'; echo 'SOME PROOFS FAIL' >&2; exit 0",
+        );
+        let err = run_bend_step(&lying, "--check-only", &file).unwrap_err();
+        assert!(err.contains("E_BEND_CHECK_FAILED"), "{err}");
+
+        let passing = script("bend_pass", "echo 'ALL PROOFS CHECK'; exit 0");
+        run_bend_step(&passing, "--check-only", &file).unwrap();
+
+        let failing = script("bend_fail", "echo 'SOME PROOFS FAIL' >&2; exit 1");
+        let err = run_bend_step(&failing, "--check-only", &file).unwrap_err();
+        assert!(err.contains("E_BEND_CHECK_FAILED"), "{err}");
+        let _ = fs::remove_dir_all(&root);
+    }
+
+    const UNCHECKED_DEFS_SRC: &str = r#"import Base
+
+@unsafe
+def spin(n: Nat) -> Nat:
+  spin(n)
+
+@unsafe def spin_inline(n: Nat) -> Nat:
+  spin_inline(n)
+
+def loose?(n: Nat) -> Nat:
+  loose(n)
+
+def show_line(s: String) -> IO(Unit):
+  import "./effs/show.js"
+
+def show_inline(s: String) -> IO(Unit): import "./effs/show.c"
+
+def plain(n: Nat) -> Nat:
+  # import "not a body"
+  Nat.add(n, 1n)
+"#;
+
+    #[test]
+    fn finds_unsafe_and_foreign_defs_but_not_checked_ones() {
+        let found: Vec<(String, &str)> = find_unchecked_defs(UNCHECKED_DEFS_SRC)
+            .into_iter()
+            .map(|d| (d.name, d.kind))
+            .collect();
+        assert_eq!(
+            found,
+            vec![
+                ("spin".to_string(), "@unsafe"),
+                ("spin_inline".to_string(), "@unsafe"),
+                ("loose".to_string(), "unsafe '?' def"),
+                ("show_line".to_string(), "foreign"),
+                ("show_inline".to_string(), "foreign"),
+            ]
+        );
+        assert!(find_unchecked_defs(NAT_LEMMAS_BEND).is_empty());
+
+        // Differential: the reference checker refuses an @unsafe def too.
+        let root = temp_workspace("unchecked_ref");
+        let file = root.join("verified/core.bend");
+        let src = "import Base\n\n@unsafe\ndef spin(n: Nat) -> Nat:\n  spin(n)\n";
+        fs::write(&file, src).unwrap();
+        let bend_bin = resolve_bend_bin(
+            env::var("BEND_BIN").ok(),
+            env::var_os("PATH"),
+            env::var_os("HOME").map(PathBuf::from),
+        );
+        if let Ok(out) = Command::new(&bend_bin)
+            .arg(&file)
+            .arg("--check-only")
+            .output()
+        {
+            assert!(!out.status.success(), "reference must reject @unsafe");
+        }
+        assert_eq!(find_unchecked_defs(src).len(), 1);
+
+        // The gate rejects it before trusting any checker result.
+        let cfg = make_cfg(&root);
+        let err = run_with_checker(&cfg, |_, _| Ok(())).unwrap_err();
+        assert!(err.contains("E_UNCHECKED_DEF"), "{err}");
+        assert!(err.contains("'spin'"), "{err}");
+        let _ = fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn lemma_only_files_request_the_verdict_cross_check() {
+        assert!(has_equality_lemma(NAT_LEMMAS_BEND));
+        assert!(has_equality_lemma(
+            "import Base\n\ndef zero_add(n: Nat) -> {Nat.add(0n, n) == n : Nat}:\n  {==}\n"
+        ));
+        assert!(has_equality_lemma(
+            "import Base\n\ndef zero_add(\n  n: Nat\n) -> {Nat.add(0n, n) == n : Nat}:\n  {==}\n"
+        ));
+        assert!(!has_equality_lemma(
+            "import Base\n\ndef inc(n: Nat) -> Nat:\n  Nat.add(n, 1n)\n"
+        ));
+
+        let root = temp_workspace("lemma_verdict");
+        fs::write(
+            root.join("verified/lemmas.bend"),
+            "import Base\n\ndef zero_add(n: Nat) -> {Nat.add(0n, n) == n : Nat}:\n  {==}\n",
+        )
+        .unwrap();
+        fs::write(
+            root.join("verified/plain.bend"),
+            "import Base\n\ndef inc(n: Nat) -> Nat:\n  Nat.add(n, 1n)\n",
+        )
+        .unwrap();
+        let cfg = make_cfg(&root);
+        let mut seen = Vec::new();
+        run_with_checker(&cfg, |file, needs_verdict| {
+            seen.push((
+                file.file_name().unwrap().to_string_lossy().into_owned(),
+                needs_verdict,
+            ));
+            Ok(())
+        })
+        .unwrap();
+        seen.sort();
+        assert_eq!(
+            seen,
+            vec![
+                ("lemmas.bend".to_string(), true),
+                ("plain.bend".to_string(), false)
+            ]
+        );
+        let _ = fs::remove_dir_all(&root);
     }
 
     #[test]
