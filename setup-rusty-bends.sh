@@ -9355,15 +9355,16 @@ use crate::emit::{
     TypeEnv,
 };
 use crate::law_test::{
-    create_temp_eval_dir, emit_eval_law_checker, emit_pool_runtime_helpers, law_dependency_cone,
-    parse_laws, ParsedLaw,
+    create_temp_eval_dir, emit_eval_law_checker, emit_pool_runtime_helpers, parse_laws, ParsedLaw,
 };
 use crate::lock::{self, LockCheckReport};
-use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
+use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet, VecDeque};
 use std::env;
 use std::fs;
-use std::path::Path;
+use std::path::{Path, PathBuf};
 use std::process::Command;
+use std::sync::atomic::{AtomicUsize, Ordering};
+use std::sync::Mutex;
 
 /// Budget for the original operator families (selection order unchanged since Issue #6).
 const MAX_MUTANTS_PER_LAW: usize = 48;
@@ -9375,6 +9376,12 @@ const MAX_BOUND_MUTANTS_PER_LAW: usize = 48;
 const MAX_RETURN_LIT_MUTANTS_PER_LAW: usize = 32;
 /// At most this many `Nat` literal sites per function are mutated by `NatLit`.
 const MAX_NAT_LIT_SITES_PER_DEF: usize = 8;
+/// Version tag baked into mutation cone hashes so cache keys invalidate when mutators change.
+const MUTATE_CACHE_VERSION: &str = "v2";
+/// Maximum mutants packed into one compiled multi-law harness binary.
+const BATCH_MAX_MUTANTS: usize = 160;
+/// Maximum distinct laws packed into one compiled multi-law harness binary.
+const BATCH_MAX_LAWS: usize = 16;
 
 /// Law shapes the mutation checker (and the generated per-law tests) can evaluate.
 const SUPPORTED_LAW_FORMS: &str = "Supported forms: zero or more 'for x: T' binders (T = Nat, Bool, U32/U64/I32/I64, a user ADT, List<T>, or a tuple of these), optional '{a == b : T} ->' hypotheses, and an equality goal '{lhs == rhs : T}'. Not supported: 'exs' (existential), 'where' refinements, goals without '=='.";
@@ -9383,12 +9390,14 @@ const SUPPORTED_LAW_FORMS: &str = "Supported forms: zero or more 'for x: T' bind
 pub enum MutateMode {
     NewOnly,
     All,
+    Report,
 }
 
 impl MutateMode {
     pub fn parse(raw: &str) -> Self {
         match raw.trim().to_ascii_lowercase().as_str() {
             "all" => Self::All,
+            "report" => Self::Report,
             _ => Self::NewOnly,
         }
     }
@@ -9403,12 +9412,31 @@ pub struct Mutant {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
+pub enum MutantStatus {
+    Caught(String),
+    Survived,
+    BuildError(String),
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct MutantOutcome {
+    pub def_name: String,
+    pub operator: String,
+    pub description: String,
+    pub status: MutantStatus,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub struct LawMutationReport {
     pub law_name: String,
     pub cone: Vec<String>,
     pub total_mutants: usize,
+    pub generated_mutants: usize,
+    pub dropped_by_budget: usize,
+    pub dropped_by_site_cap: usize,
     pub caught_by: Option<(String, String)>,
     pub survived_operators: Vec<String>,
+    pub mutant_outcomes: Vec<MutantOutcome>,
     pub skipped_reason: Option<String>,
     pub from_cache: bool,
 }
@@ -9417,22 +9445,67 @@ pub struct LawMutationReport {
 pub struct MutationRunSummary {
     pub reports: Vec<LawMutationReport>,
     pub warnings: Vec<String>,
+    pub report_path: Option<PathBuf>,
 }
 
-struct MutateCtx<'a> {
-    types: &'a [TypeDef],
-    defs: &'a [Def],
-    def_map: &'a HashMap<String, &'a Def>,
-    type_map: &'a HashMap<String, &'a TypeDef>,
-    type_env: &'a TypeEnv,
-    out_dir: &'a Path,
+struct PreparedLaw<'a> {
+    law: &'a ParsedLaw,
+    is_locked: bool,
+    cone: Vec<String>,
+    cone_key: String,
+    cone_defs: Vec<Def>,
+    generated: GeneratedMutants,
+}
+
+struct LawWorkItem<'a> {
+    prepared_idx: usize,
+    law: &'a ParsedLaw,
+    is_locked: bool,
+    cone_defs: &'a [Def],
+    mutants: &'a [Mutant],
+}
+
+#[derive(Debug, Clone)]
+enum EvaluatedLawResult {
+    Complete {
+        caught_by: Option<(String, String)>,
+        outcomes: Vec<MutantOutcome>,
+    },
+    BuildFailed {
+        error_message: String,
+        outcomes: Vec<MutantOutcome>,
+    },
+}
+
+fn sanitize_cache_field(s: &str) -> String {
+    s.replace(['\t', '\n', '\r'], " ")
+}
+
+fn format_dropped_suffix(
+    evaluated: usize,
+    generated: usize,
+    dropped_by_budget: usize,
+    dropped_by_site_cap: usize,
+) -> String {
+    if dropped_by_budget + dropped_by_site_cap == 0 {
+        return String::new();
+    }
+    let mut parts = Vec::new();
+    if dropped_by_budget > 0 {
+        parts.push(format!("{dropped_by_budget} dropped by budget"));
+    }
+    if dropped_by_site_cap > 0 {
+        parts.push(format!("{dropped_by_site_cap} dropped by site cap"));
+    }
+    format!(" [evaluated {evaluated}/{generated}: {}]", parts.join(", "))
 }
 
 /// Runs mutation checks according to `mode`:
-/// - Always checks every unlocked/new law in `lock_report.new_names` and fails with
-///   `[E_LAW_VACUOUS]` if any testable new law fails to catch at least one mutant.
-/// - Under `MutateMode::All`, also evaluates every locked law and emits one warning line
-///   per locked law (`CAUGHT` or `SURVIVED`) without failing on locked laws.
+/// - `NewOnly`: checks unlocked/new laws and fails with `[E_LAW_VACUOUS]` or `[E_LAW_UNCHECKED]`
+///   when an unmarked new law fails to catch at least one mutant or cannot be evaluated.
+/// - `All`: evaluates both new and locked laws and emits one diagnostic line per law.
+/// - `Report`: evaluates every generated mutant of every checked law (new and locked), writes
+///   the full report to `OUT_DIR/rusty-bends-mutants.txt`, and emits per-mutant lines.
 pub fn run_mutation_checks(
     combined_source: &str,
     lock_report: &LockCheckReport,
@@ -9444,6 +9517,7 @@ pub fn run_mutation_checks(
         return Ok(MutationRunSummary {
             reports: Vec::new(),
             warnings: Vec::new(),
+            report_path: None,
         });
     }
 
@@ -9451,7 +9525,8 @@ pub fn run_mutation_checks(
         .iter()
         .filter(|l| {
             lock_report.new_names.contains(&l.name)
-                || (mode == MutateMode::All && lock_report.locked_names.contains(&l.name))
+                || (matches!(mode, MutateMode::All | MutateMode::Report)
+                    && lock_report.locked_names.contains(&l.name))
         })
         .collect();
 
@@ -9459,6 +9534,7 @@ pub fn run_mutation_checks(
         return Ok(MutationRunSummary {
             reports: Vec::new(),
             warnings: Vec::new(),
+            report_path: None,
         });
     }
 
@@ -9468,63 +9544,276 @@ pub fn run_mutation_checks(
     let def_map: HashMap<String, &Def> = defs.iter().map(|d| (d.name.clone(), d)).collect();
     let type_map: HashMap<String, &TypeDef> = types.iter().map(|t| (t.name.clone(), t)).collect();
 
+    // Precompute call graph adjacency and structural fingerprints once across all laws.
+    let def_callees = precompute_def_callees(&defs, &def_map);
+    let types_hash = compute_types_hash(&types);
+    let def_hashes = precompute_def_hashes(&defs);
+
     fs::create_dir_all(out_dir).map_err(|e| e.to_string())?;
     let cache_path = out_dir.join("rusty-bends-mutate.cache");
     let mut cache = load_mutate_cache(&cache_path);
     let mut cache_dirty = false;
+    let full_report = mode == MutateMode::Report;
 
-    let mut reports = Vec::new();
-    let mut warnings = Vec::new();
+    let mut prepared: Vec<PreparedLaw<'_>> = Vec::with_capacity(check_targets.len());
+    let mut report_slots: Vec<Option<LawMutationReport>> = vec![None; check_targets.len()];
+    let mut build_errors: Vec<Option<String>> = vec![None; check_targets.len()];
 
-    let ctx = MutateCtx {
-        types: &types,
-        defs: &defs,
-        def_map: &def_map,
-        type_map: &type_map,
-        type_env: &type_env,
-        out_dir,
-    };
-
-    for law in check_targets {
+    for law in &check_targets {
         let is_locked = lock_report.locked_names.contains(&law.name);
-        let cone = law_dependency_cone(law, &defs);
-        let cone_key = compute_cone_hash(law, &cone, &types, &def_map);
+        let cone = law_dependency_cone_fast(law, &def_map, &def_callees);
+        let cone_key = compute_cone_hash_fast(law, &cone, &types_hash, &def_hashes);
+        let cone_defs: Vec<Def> = cone
+            .iter()
+            .filter_map(|name| def_map.get(name).map(|d| (*d).clone()))
+            .collect();
+        prepared.push(PreparedLaw {
+            law,
+            is_locked,
+            cone,
+            cone_key,
+            cone_defs,
+            generated: GeneratedMutants::default(),
+        });
+    }
 
-        let report = if let Some((desc, ce)) = cache.get(&cone_key).cloned() {
-            LawMutationReport {
-                law_name: law.name.clone(),
-                cone: cone.clone(),
-                total_mutants: 1,
-                caught_by: Some((desc, ce)),
+    let mut pending_indices = Vec::new();
+    for (idx, item) in prepared.iter_mut().enumerate() {
+        if let Some(entry) = cache.get(&item.cone_key) {
+            if let Some(cached_report) =
+                report_from_cache(item, entry, full_report, &def_map, &type_env.ctor_map)
+            {
+                report_slots[idx] = Some(cached_report);
+                continue;
+            }
+        }
+
+        if let Some(ref reason) = item.law.unsupported_reason {
+            let report = LawMutationReport {
+                law_name: item.law.name.clone(),
+                cone: item.cone.clone(),
+                total_mutants: 0,
+                generated_mutants: 0,
+                dropped_by_budget: 0,
+                dropped_by_site_cap: 0,
+                caught_by: None,
                 survived_operators: Vec::new(),
-                skipped_reason: None,
-                from_cache: true,
-            }
-        } else {
-            let r = match check_single_law(law, &cone, &ctx) {
-                Ok(r) => r,
-                // Locked laws are only reported under MutateMode::All, never failed.
-                Err(e) if is_locked && e.starts_with("[E_MUTANT_BUILD]") => {
-                    warnings.push(format!("RustyBends mutate [{}]: {e}", law.name));
-                    continue;
-                }
-                Err(e) => return Err(e),
+                mutant_outcomes: Vec::new(),
+                skipped_reason: Some(reason.clone()),
+                from_cache: false,
             };
-            if let Some((ref desc, ref ce)) = r.caught_by {
-                cache.insert(cone_key, (desc.clone(), ce.clone()));
-                cache_dirty = true;
+            cache.insert(
+                item.cone_key.clone(),
+                cache_entry_from_report(&report, full_report),
+            );
+            cache_dirty = true;
+            report_slots[idx] = Some(report);
+            continue;
+        }
+
+        item.generated =
+            generate_mutants_for_cone_with_stats(&item.cone_defs, &def_map, &type_env.ctor_map);
+        if item.generated.mutants.is_empty() {
+            let report = LawMutationReport {
+                law_name: item.law.name.clone(),
+                cone: item.cone.clone(),
+                total_mutants: 0,
+                generated_mutants: item.generated.generated_total,
+                dropped_by_budget: item.generated.dropped_by_budget,
+                dropped_by_site_cap: item.generated.dropped_by_site_cap,
+                caught_by: None,
+                survived_operators: Vec::new(),
+                mutant_outcomes: Vec::new(),
+                skipped_reason: None,
+                from_cache: false,
+            };
+            cache.insert(
+                item.cone_key.clone(),
+                cache_entry_from_report(&report, full_report),
+            );
+            cache_dirty = true;
+            report_slots[idx] = Some(report);
+            continue;
+        }
+
+        if let Err(reason) = emit_eval_law_checker(
+            "check", item.law, &defs, &def_map, &type_map, &type_env, true,
+        ) {
+            let report = LawMutationReport {
+                law_name: item.law.name.clone(),
+                cone: item.cone.clone(),
+                total_mutants: item.generated.mutants.len(),
+                generated_mutants: item.generated.generated_total,
+                dropped_by_budget: item.generated.dropped_by_budget,
+                dropped_by_site_cap: item.generated.dropped_by_site_cap,
+                caught_by: None,
+                survived_operators: Vec::new(),
+                mutant_outcomes: Vec::new(),
+                skipped_reason: Some(reason),
+                from_cache: false,
+            };
+            cache.insert(
+                item.cone_key.clone(),
+                cache_entry_from_report(&report, full_report),
+            );
+            cache_dirty = true;
+            report_slots[idx] = Some(report);
+            continue;
+        }
+
+        pending_indices.push(idx);
+    }
+
+    if !pending_indices.is_empty() {
+        let work_items: Vec<LawWorkItem<'_>> = pending_indices
+            .iter()
+            .map(|&idx| {
+                let item = &prepared[idx];
+                LawWorkItem {
+                    prepared_idx: idx,
+                    law: item.law,
+                    is_locked: item.is_locked,
+                    cone_defs: &item.cone_defs,
+                    mutants: &item.generated.mutants,
+                }
+            })
+            .collect();
+
+        let eval_results = evaluate_work_items_batched(
+            &work_items,
+            &types,
+            &type_map,
+            &type_env,
+            full_report,
+            out_dir,
+        )?;
+
+        for (work, eval_res) in work_items.into_iter().zip(eval_results) {
+            let item = &prepared[work.prepared_idx];
+            let ops: Vec<String> = item
+                .generated
+                .mutants
+                .iter()
+                .map(|m| m.operator.clone())
+                .collect::<BTreeSet<_>>()
+                .into_iter()
+                .collect();
+
+            match eval_res {
+                EvaluatedLawResult::Complete {
+                    caught_by,
+                    outcomes,
+                } => {
+                    let report = LawMutationReport {
+                        law_name: item.law.name.clone(),
+                        cone: item.cone.clone(),
+                        total_mutants: item.generated.mutants.len(),
+                        generated_mutants: item.generated.generated_total,
+                        dropped_by_budget: item.generated.dropped_by_budget,
+                        dropped_by_site_cap: item.generated.dropped_by_site_cap,
+                        caught_by,
+                        survived_operators: ops,
+                        mutant_outcomes: outcomes,
+                        skipped_reason: None,
+                        from_cache: false,
+                    };
+                    cache.insert(
+                        item.cone_key.clone(),
+                        cache_entry_from_report(&report, full_report),
+                    );
+                    cache_dirty = true;
+                    report_slots[work.prepared_idx] = Some(report);
+                }
+                EvaluatedLawResult::BuildFailed {
+                    error_message,
+                    outcomes,
+                } => {
+                    let caught_by = outcomes.iter().find_map(|o| match &o.status {
+                        MutantStatus::Caught(ce) => Some((o.description.clone(), ce.clone())),
+                        _ => None,
+                    });
+                    let report = LawMutationReport {
+                        law_name: item.law.name.clone(),
+                        cone: item.cone.clone(),
+                        total_mutants: item.generated.mutants.len(),
+                        generated_mutants: item.generated.generated_total,
+                        dropped_by_budget: item.generated.dropped_by_budget,
+                        dropped_by_site_cap: item.generated.dropped_by_site_cap,
+                        caught_by,
+                        survived_operators: ops,
+                        mutant_outcomes: outcomes,
+                        skipped_reason: None,
+                        from_cache: false,
+                    };
+                    build_errors[work.prepared_idx] = Some(error_message);
+                    report_slots[work.prepared_idx] = Some(report);
+                }
             }
-            r
-        };
+        }
+    }
+
+    if cache_dirty {
+        save_mutate_cache(&cache_path, &cache)?;
+    }
+
+    let reports: Vec<LawMutationReport> = report_slots
+        .into_iter()
+        .map(|slot| slot.expect("every target law has a mutation report"))
+        .collect();
+    let mut warnings = Vec::new();
+    let mut report_path = None;
+
+    if full_report {
+        let report_file = out_dir.join("rusty-bends-mutants.txt");
+        let mut all_lines = Vec::new();
+        for report in &reports {
+            all_lines.extend(format_full_law_report(report));
+        }
+        let caught_laws = reports
+            .iter()
+            .filter(|r| r.skipped_reason.is_none() && r.caught_by.is_some())
+            .count();
+        let survived_laws = reports
+            .iter()
+            .filter(|r| r.skipped_reason.is_none() && r.caught_by.is_none())
+            .count();
+        let skipped_laws = reports
+            .iter()
+            .filter(|r| r.skipped_reason.is_some())
+            .count();
+        all_lines.push(format!(
+            "Summary: {} law(s), {caught_laws} caught, {survived_laws} survived, {skipped_laws} skipped",
+            reports.len()
+        ));
+        fs::write(&report_file, format!("{}\n", all_lines.join("\n")))
+            .map_err(|e| e.to_string())?;
+        warnings.push(format!(
+            "RustyBends mutate report written to {}",
+            report_file.display()
+        ));
+        warnings.extend(all_lines);
+        report_path = Some(report_file);
+    }
+
+    for (idx, report) in reports.iter().enumerate() {
+        let is_locked = prepared[idx].is_locked;
+        if let Some(ref build_err) = build_errors[idx] {
+            if is_locked {
+                warnings.push(format!(
+                    "RustyBends mutate [{}]: {build_err}",
+                    report.law_name
+                ));
+                continue;
+            }
+            return Err(build_err.clone());
+        }
 
         let unchecked_marker = lock_report
             .current
-            .get(&law.name)
+            .get(&report.law_name)
             .and_then(|l| l.unchecked.as_deref());
 
-        if is_locked && mode == MutateMode::All {
-            warnings.push(format_locked_law_line(&report));
-        } else if !is_locked {
+        if !is_locked {
             if let Some(ref reason) = report.skipped_reason {
                 match unchecked_marker {
                     Some(marker) => warnings.push(format!(
@@ -9549,41 +9838,54 @@ pub fn run_mutation_checks(
                 } else {
                     report.survived_operators.join(", ")
                 };
+                let dropped = format_dropped_suffix(
+                    report.total_mutants,
+                    report.generated_mutants,
+                    report.dropped_by_budget,
+                    report.dropped_by_site_cap,
+                );
                 return Err(format!(
-                    "[E_LAW_VACUOUS] Law '{}' is vacuous: it caught 0 mutants across [{cone_str}] (survived {} mutants: {ops_str}).\nHint: Strengthen '{}' so it fails when its target function is broken.",
+                    "[E_LAW_VACUOUS] Law '{}' is vacuous: it caught 0 mutants across [{cone_str}] (survived {} mutants: {ops_str}){dropped}.\nHint: Strengthen '{}' so it fails when its target function is broken.",
                     report.law_name, report.total_mutants, report.law_name
                 ));
-            }
-            if report.skipped_reason.is_none() {
-                if let Some(marker) = unchecked_marker {
-                    warnings.push(format!(
-                        "RustyBends mutate [{}]: '# unchecked: {marker}' is unnecessary; the law is mutation-checkable, so remove the marker.",
-                        report.law_name
-                    ));
-                }
+            } else if let Some(marker) = unchecked_marker {
+                warnings.push(format!(
+                    "RustyBends mutate [{}]: '# unchecked: {marker}' is unnecessary; the law is mutation-checkable, so remove the marker.",
+                    report.law_name
+                ));
             }
         }
 
-        reports.push(report);
+        if mode == MutateMode::All
+            && (is_locked || (report.skipped_reason.is_none() && report.caught_by.is_some()))
+        {
+            warnings.push(format_locked_law_line(report));
+        }
     }
 
-    if cache_dirty {
-        save_mutate_cache(&cache_path, &cache)?;
-    }
-
-    Ok(MutationRunSummary { reports, warnings })
+    Ok(MutationRunSummary {
+        reports,
+        warnings,
+        report_path,
+    })
 }
 
 pub fn format_locked_law_line(report: &LawMutationReport) -> String {
+    let cached_tag = if report.from_cache { " [cached]" } else { "" };
+    let dropped_tag = format_dropped_suffix(
+        report.total_mutants,
+        report.generated_mutants,
+        report.dropped_by_budget,
+        report.dropped_by_site_cap,
+    );
     if let Some((ref desc, ref ce)) = report.caught_by {
-        let cached_tag = if report.from_cache { " [cached]" } else { "" };
         format!(
-            "RustyBends mutate [{}]: caught by {desc} ({ce}){cached_tag}",
+            "RustyBends mutate [{}]: caught by {desc} ({ce}){dropped_tag}{cached_tag}",
             report.law_name
         )
     } else if let Some(ref reason) = report.skipped_reason {
         format!(
-            "RustyBends mutate [{}]: skipped ({reason})",
+            "RustyBends mutate [{}]: skipped ({reason}){cached_tag}",
             report.law_name
         )
     } else {
@@ -9593,97 +9895,295 @@ pub fn format_locked_law_line(report: &LawMutationReport) -> String {
             report.survived_operators.join(", ")
         };
         format!(
-            "RustyBends mutate [{}]: SURVIVED ({} mutants: {ops})",
+            "RustyBends mutate [{}]: SURVIVED ({} mutants: {ops}){dropped_tag}{cached_tag}",
             report.law_name, report.total_mutants
         )
     }
 }
 
-fn check_single_law(
-    law: &ParsedLaw,
-    cone: &[String],
-    ctx: &MutateCtx<'_>,
-) -> Result<LawMutationReport, String> {
-    if let Some(ref reason) = law.unsupported_reason {
-        return Ok(LawMutationReport {
-            law_name: law.name.clone(),
-            cone: cone.to_vec(),
-            total_mutants: 0,
-            caught_by: None,
-            survived_operators: Vec::new(),
-            skipped_reason: Some(reason.clone()),
-            from_cache: false,
-        });
+pub fn format_full_law_report(report: &LawMutationReport) -> Vec<String> {
+    let cached_tag = if report.from_cache { " [cached]" } else { "" };
+    let dropped_tag = format_dropped_suffix(
+        report.total_mutants,
+        report.generated_mutants,
+        report.dropped_by_budget,
+        report.dropped_by_site_cap,
+    );
+    if let Some(ref reason) = report.skipped_reason {
+        return vec![format!(
+            "RustyBends mutate [{}]: skipped ({reason}){cached_tag}",
+            report.law_name
+        )];
+    }
+    let caught_count = report
+        .mutant_outcomes
+        .iter()
+        .filter(|o| matches!(o.status, MutantStatus::Caught(_)))
+        .count();
+    let survived_count = report
+        .mutant_outcomes
+        .iter()
+        .filter(|o| matches!(o.status, MutantStatus::Survived))
+        .count();
+    let err_count = report
+        .mutant_outcomes
+        .iter()
+        .filter(|o| matches!(o.status, MutantStatus::BuildError(_)))
+        .count();
+    let err_part = if err_count > 0 {
+        format!(", {err_count} build-error")
+    } else {
+        String::new()
+    };
+    let mut lines = vec![format!(
+        "RustyBends mutate [{}]: {caught_count}/{} caught, {survived_count} survived{err_part}{dropped_tag}{cached_tag}",
+        report.law_name, report.total_mutants
+    )];
+    for o in &report.mutant_outcomes {
+        match &o.status {
+            MutantStatus::Caught(ce) => {
+                lines.push(format!("  caught   {} ({ce})", o.description));
+            }
+            MutantStatus::Survived => {
+                lines.push(format!("  survived {}", o.description));
+            }
+            MutantStatus::BuildError(err) => {
+                lines.push(format!("  build-error {} ({err})", o.description));
+            }
+        }
+    }
+    lines
+}
+
+fn evaluate_work_items_batched(
+    work_items: &[LawWorkItem<'_>],
+    types: &[TypeDef],
+    type_map: &HashMap<String, &TypeDef>,
+    type_env: &TypeEnv,
+    full_report: bool,
+    out_dir: &Path,
+) -> Result<Vec<EvaluatedLawResult>, String> {
+    let mut batches: Vec<&[LawWorkItem<'_>]> = Vec::new();
+    let mut start = 0usize;
+    while start < work_items.len() {
+        let mut end = start;
+        let mut mut_count = 0usize;
+        while end < work_items.len() && (end - start) < BATCH_MAX_LAWS {
+            let next_m = work_items[end].mutants.len();
+            if end > start && mut_count + next_m > BATCH_MAX_MUTANTS {
+                break;
+            }
+            mut_count += next_m;
+            end += 1;
+        }
+        batches.push(&work_items[start..end]);
+        start = end;
     }
 
-    let mut cone_defs: Vec<Def> = Vec::new();
-    for name in cone {
-        if let Some(def) = ctx.def_map.get(name) {
-            cone_defs.push((*def).clone());
+    if batches.len() <= 1 {
+        let mut out = Vec::with_capacity(work_items.len());
+        for batch in batches {
+            out.extend(run_batch_with_fallback(
+                batch,
+                types,
+                type_map,
+                type_env,
+                full_report,
+                out_dir,
+            )?);
+        }
+        return Ok(out);
+    }
+
+    let workers = std::thread::available_parallelism()
+        .map(|n| n.get())
+        .unwrap_or(2)
+        .clamp(1, 8)
+        .min(batches.len());
+    let next_batch = AtomicUsize::new(0);
+    type BatchSlot = Option<Result<Vec<EvaluatedLawResult>, String>>;
+    let results: Mutex<Vec<BatchSlot>> = Mutex::new(vec![None; batches.len()]);
+
+    std::thread::scope(|scope| {
+        for _ in 0..workers {
+            scope.spawn(|| loop {
+                let bi = next_batch.fetch_add(1, Ordering::Relaxed);
+                if bi >= batches.len() {
+                    break;
+                }
+                let res = run_batch_with_fallback(
+                    batches[bi],
+                    types,
+                    type_map,
+                    type_env,
+                    full_report,
+                    out_dir,
+                );
+                let mut guard = results.lock().expect("batch results mutex");
+                guard[bi] = Some(res);
+            });
+        }
+    });
+
+    let mut out = Vec::with_capacity(work_items.len());
+    let slots = results.into_inner().expect("batch results mutex");
+    for slot in slots {
+        out.extend(slot.expect("every batch completed")?);
+    }
+    Ok(out)
+}
+
+fn run_batch_with_fallback(
+    batch: &[LawWorkItem<'_>],
+    types: &[TypeDef],
+    type_map: &HashMap<String, &TypeDef>,
+    type_env: &TypeEnv,
+    full_report: bool,
+    out_dir: &Path,
+) -> Result<Vec<EvaluatedLawResult>, String> {
+    match run_batch_harness(batch, types, type_map, type_env, full_report, out_dir) {
+        Ok(res) => Ok(res),
+        Err(_) if batch.len() > 1 => {
+            let mut out = Vec::with_capacity(batch.len());
+            for item in batch {
+                out.push(run_single_law_per_mutant_fallback(
+                    item,
+                    types,
+                    type_map,
+                    type_env,
+                    full_report,
+                    out_dir,
+                ));
+            }
+            Ok(out)
+        }
+        Err(_) => Ok(vec![run_single_law_per_mutant_fallback(
+            &batch[0],
+            types,
+            type_map,
+            type_env,
+            full_report,
+            out_dir,
+        )]),
+    }
+}
+
+fn run_single_law_per_mutant_fallback(
+    item: &LawWorkItem<'_>,
+    types: &[TypeDef],
+    type_map: &HashMap<String, &TypeDef>,
+    type_env: &TypeEnv,
+    full_report: bool,
+    out_dir: &Path,
+) -> EvaluatedLawResult {
+    // First try the single law as a batch (when coming from a failed multi-law batch).
+    if let Ok(mut single) = run_batch_harness(
+        std::slice::from_ref(item),
+        types,
+        type_map,
+        type_env,
+        full_report,
+        out_dir,
+    ) {
+        if let Some(res) = single.pop() {
+            return res;
         }
     }
 
-    let mutants = generate_mutants_for_cone(&cone_defs, ctx.def_map, &ctx.type_env.ctor_map);
-    if mutants.is_empty() {
-        return Ok(LawMutationReport {
-            law_name: law.name.clone(),
-            cone: cone.to_vec(),
-            total_mutants: 0,
-            caught_by: None,
-            survived_operators: Vec::new(),
-            skipped_reason: None,
-            from_cache: false,
-        });
+    let mut outcomes = Vec::with_capacity(item.mutants.len());
+    let mut build_failures: Vec<(String, String)> = Vec::new();
+    for m in item.mutants {
+        let single_item = LawWorkItem {
+            prepared_idx: item.prepared_idx,
+            law: item.law,
+            is_locked: item.is_locked,
+            cone_defs: item.cone_defs,
+            mutants: std::slice::from_ref(m),
+        };
+        match run_batch_harness(
+            &[single_item],
+            types,
+            type_map,
+            type_env,
+            full_report,
+            out_dir,
+        ) {
+            Ok(mut res) => {
+                if let Some(EvaluatedLawResult::Complete {
+                    caught_by,
+                    outcomes: mut sub_outcomes,
+                }) = res.pop()
+                {
+                    if !full_report {
+                        if let Some(hit) = caught_by {
+                            return EvaluatedLawResult::Complete {
+                                caught_by: Some(hit),
+                                outcomes: Vec::new(),
+                            };
+                        }
+                    } else if let Some(first) = sub_outcomes.pop() {
+                        outcomes.push(first);
+                    }
+                }
+            }
+            Err(HarnessError::Run) => {
+                if full_report {
+                    outcomes.push(MutantOutcome {
+                        def_name: m.def_name.clone(),
+                        operator: m.operator.clone(),
+                        description: m.description.clone(),
+                        status: MutantStatus::Survived,
+                    });
+                }
+            }
+            Err(HarnessError::Compile(stderr)) => {
+                let first_error = first_rustc_error(&stderr);
+                build_failures.push((m.description.clone(), first_error.clone()));
+                if full_report {
+                    outcomes.push(MutantOutcome {
+                        def_name: m.def_name.clone(),
+                        operator: m.operator.clone(),
+                        description: m.description.clone(),
+                        status: MutantStatus::BuildError(first_error),
+                    });
+                }
+            }
+        }
     }
 
-    // Verify the law expression itself can be lowered into an eval checker before mutating.
-    if let Err(reason) = emit_eval_law_checker(
-        "check",
-        law,
-        ctx.defs,
-        ctx.def_map,
-        ctx.type_map,
-        ctx.type_env,
-        true,
-    ) {
-        return Ok(LawMutationReport {
-            law_name: law.name.clone(),
-            cone: cone.to_vec(),
-            total_mutants: mutants.len(),
-            caught_by: None,
-            survived_operators: Vec::new(),
-            skipped_reason: Some(reason),
-            from_cache: false,
-        });
+    if let Some((desc, first_error)) = build_failures.first() {
+        let msg = format!(
+            "[E_MUTANT_BUILD] Law '{}': {} of {} mutants did not compile, so the law could not be mutation-checked. This is a RustyBends bug, not a problem with the law; please report it.\nFirst failing mutant: {desc}\nrustc: {first_error}",
+            item.law.name,
+            build_failures.len(),
+            item.mutants.len()
+        );
+        return EvaluatedLawResult::BuildFailed {
+            error_message: msg,
+            outcomes,
+        };
     }
 
-    let ops: Vec<String> = mutants
-        .iter()
-        .map(|m| m.operator.clone())
-        .collect::<BTreeSet<_>>()
-        .into_iter()
-        .collect();
-
-    let caught = evaluate_mutants_batch(
-        law,
-        &mutants,
-        ctx.types,
-        &cone_defs,
-        ctx.type_map,
-        ctx.type_env,
-        ctx.out_dir,
-    )?;
-    Ok(LawMutationReport {
-        law_name: law.name.clone(),
-        cone: cone.to_vec(),
-        total_mutants: mutants.len(),
-        caught_by: caught,
-        survived_operators: ops,
-        skipped_reason: None,
-        from_cache: false,
-    })
+    let caught_by = outcomes.iter().find_map(|o| match &o.status {
+        MutantStatus::Caught(ce) => Some((o.description.clone(), ce.clone())),
+        _ => None,
+    });
+    EvaluatedLawResult::Complete {
+        caught_by,
+        outcomes,
+    }
 }
 
+fn first_rustc_error(stderr: &str) -> String {
+    stderr
+        .lines()
+        .find(|l| l.trim_start().starts_with("error"))
+        .unwrap_or("(no rustc error line)")
+        .trim()
+        .to_string()
+}
+
+#[cfg(test)]
 fn evaluate_mutants_batch(
     law: &ParsedLaw,
     mutants: &[Mutant],
@@ -9693,46 +10193,40 @@ fn evaluate_mutants_batch(
     type_env: &TypeEnv,
     out_dir: &Path,
 ) -> Result<Option<(String, String)>, String> {
-    match run_mutant_harness(law, mutants, types, cone_defs, type_map, type_env, out_dir) {
-        Ok(res) => Ok(res),
-        Err(_) => {
-            // The combined module failed; check each mutant on its own so one bad mutant
-            // cannot hide a catch by another.
-            let mut build_failures = Vec::new();
-            for m in mutants {
-                match run_mutant_harness(
-                    law,
-                    std::slice::from_ref(m),
-                    types,
-                    cone_defs,
-                    type_map,
-                    type_env,
-                    out_dir,
-                ) {
-                    Ok(Some(hit)) => return Ok(Some(hit)),
-                    Ok(None) | Err(HarnessError::Run) => {}
-                    Err(HarnessError::Compile(stderr)) => {
-                        build_failures.push((m.description.clone(), stderr))
-                    }
-                }
-            }
-            // A mutant that does not compile was never tested. Counting it as a survivor
-            // would turn a tool bug into a false E_LAW_VACUOUS verdict, so report it.
-            if let Some((desc, stderr)) = build_failures.first() {
-                let first_error = stderr
-                    .lines()
-                    .find(|l| l.trim_start().starts_with("error"))
-                    .unwrap_or("(no rustc error line)")
-                    .trim();
-                return Err(format!(
-                    "[E_MUTANT_BUILD] Law '{}': {} of {} mutants did not compile, so the law could not be mutation-checked. This is a RustyBends bug, not a problem with the law; please report it.\nFirst failing mutant: {desc}\nrustc: {first_error}",
-                    law.name,
-                    build_failures.len(),
-                    mutants.len()
-                ));
-            }
-            Ok(None)
-        }
+    let item = LawWorkItem {
+        prepared_idx: 0,
+        law,
+        is_locked: false,
+        cone_defs,
+        mutants,
+    };
+    match run_single_law_per_mutant_fallback(&item, types, type_map, type_env, false, out_dir) {
+        EvaluatedLawResult::Complete { caught_by, .. } => Ok(caught_by),
+        EvaluatedLawResult::BuildFailed { error_message, .. } => Err(error_message),
+    }
+}
+
+#[cfg(test)]
+fn run_mutant_harness(
+    law: &ParsedLaw,
+    mutants: &[Mutant],
+    types: &[TypeDef],
+    cone_defs: &[Def],
+    type_map: &HashMap<String, &TypeDef>,
+    type_env: &TypeEnv,
+    out_dir: &Path,
+) -> Result<Option<(String, String)>, HarnessError> {
+    let item = LawWorkItem {
+        prepared_idx: 0,
+        law,
+        is_locked: false,
+        cone_defs,
+        mutants,
+    };
+    let res = run_batch_harness(&[item], types, type_map, type_env, false, out_dir)?;
+    match res.into_iter().next() {
+        Some(EvaluatedLawResult::Complete { caught_by, .. }) => Ok(caught_by),
+        _ => Ok(None),
     }
 }
 
@@ -9751,15 +10245,14 @@ impl From<String> for HarnessError {
     }
 }
 
-fn run_mutant_harness(
-    law: &ParsedLaw,
-    mutants: &[Mutant],
+fn run_batch_harness(
+    batch: &[LawWorkItem<'_>],
     types: &[TypeDef],
-    cone_defs: &[Def],
     type_map: &HashMap<String, &TypeDef>,
     type_env: &TypeEnv,
+    full_report: bool,
     out_dir: &Path,
-) -> Result<Option<(String, String)>, HarnessError> {
+) -> Result<Vec<EvaluatedLawResult>, HarnessError> {
     let mut program = String::new();
     program.push_str("#![allow(clippy::all, non_snake_case, unused_variables, unused_parens, dead_code, unused_mut)]\n");
 
@@ -9769,55 +10262,106 @@ fn run_mutant_harness(
     program.push_str(&emit_pool_runtime_helpers(types, type_map, type_env, true));
     program.push('\n');
 
-    let mut active_indices = Vec::new();
-    for (idx, mutant) in mutants.iter().enumerate() {
-        let mut mut_defs = cone_defs.to_vec();
-        for d in &mut mut_defs {
-            if d.name == mutant.def_name {
-                d.body = mutant.mutated_body.clone();
+    let mut per_law_active: Vec<Vec<usize>> = Vec::with_capacity(batch.len());
+    let mut per_law_emit_errors: Vec<Vec<Option<String>>> = batch
+        .iter()
+        .map(|item| vec![None; item.mutants.len()])
+        .collect();
+    let mut any_active = false;
+
+    for (bi, item) in batch.iter().enumerate() {
+        let mut active_indices = Vec::new();
+        for (mi, mutant) in item.mutants.iter().enumerate() {
+            let mut mut_defs = item.cone_defs.to_vec();
+            for d in &mut mut_defs {
+                if d.name == mutant.def_name {
+                    d.body = mutant.mutated_body.clone();
+                }
             }
+            let defs_rs = match emit_items_to_rust(&[], &mut_defs, type_env, 0, Some(10_000), false)
+            {
+                Ok(v) => v,
+                Err(err) => {
+                    per_law_emit_errors[bi][mi] = Some(err);
+                    continue;
+                }
+            };
+            let mut_def_map: HashMap<String, &Def> =
+                mut_defs.iter().map(|d| (d.name.clone(), d)).collect();
+            let check_fn = match emit_eval_law_checker(
+                "check",
+                item.law,
+                &mut_defs,
+                &mut_def_map,
+                type_map,
+                type_env,
+                true,
+            ) {
+                Ok(v) => v,
+                Err(err) => {
+                    per_law_emit_errors[bi][mi] = Some(err);
+                    continue;
+                }
+            };
+            program.push_str(&format!("mod l_{bi}_m_{mi} {{\n    use super::*;\n"));
+            for line in defs_rs.rust_source.lines() {
+                program.push_str("    ");
+                program.push_str(line);
+                program.push('\n');
+            }
+            for line in check_fn.lines() {
+                program.push_str("    ");
+                program.push_str(line);
+                program.push('\n');
+            }
+            program.push_str("}\n\n");
+            active_indices.push(mi);
+            any_active = true;
         }
-        let Ok(defs_rs) = emit_items_to_rust(&[], &mut_defs, type_env, 0, Some(10_000), false)
-        else {
-            continue;
-        };
-        let mut_def_map: HashMap<String, &Def> =
-            mut_defs.iter().map(|d| (d.name.clone(), d)).collect();
-        let Ok(check_fn) = emit_eval_law_checker(
-            "check",
-            law,
-            &mut_defs,
-            &mut_def_map,
-            type_map,
-            type_env,
-            true,
-        ) else {
-            continue;
-        };
-        program.push_str(&format!("mod m_{idx} {{\n    use super::*;\n"));
-        for line in defs_rs.rust_source.lines() {
-            program.push_str("    ");
-            program.push_str(line);
-            program.push('\n');
-        }
-        for line in check_fn.lines() {
-            program.push_str("    ");
-            program.push_str(line);
-            program.push('\n');
-        }
-        program.push_str("}\n\n");
-        active_indices.push(idx);
+        per_law_active.push(active_indices);
     }
 
-    if active_indices.is_empty() {
-        return Ok(None);
+    if !any_active {
+        return Ok(batch
+            .iter()
+            .map(|item| EvaluatedLawResult::Complete {
+                caught_by: None,
+                outcomes: if full_report {
+                    item.mutants
+                        .iter()
+                        .map(|m| MutantOutcome {
+                            def_name: m.def_name.clone(),
+                            operator: m.operator.clone(),
+                            description: m.description.clone(),
+                            status: MutantStatus::Survived,
+                        })
+                        .collect()
+                } else {
+                    Vec::new()
+                },
+            })
+            .collect());
+    }
+
+    for (bi, active_indices) in per_law_active.iter().enumerate() {
+        program.push_str(&format!("fn __rb_run_batch_law_{bi}() {{\n"));
+        for &mi in active_indices {
+            if full_report {
+                program.push_str(&format!(
+                    "    match l_{bi}_m_{mi}::check() {{\n        Some(ce) => println!(\"CAUGHT\\t{bi}\\t{mi}\\t{{}}\", ce.replace(['\\n', '\\r', '\\t'], \" \")),\n        None => println!(\"SURVIVED\\t{bi}\\t{mi}\"),\n    }}\n"
+                ));
+            } else {
+                program.push_str(&format!(
+                    "    if let Some(ce) = l_{bi}_m_{mi}::check() {{ println!(\"CAUGHT\\t{bi}\\t{mi}\\t{{}}\", ce.replace(['\\n', '\\r', '\\t'], \" \")); return; }}\n"
+                ));
+            }
+        }
+        program.push_str("}\n\n");
     }
 
     program.push_str("fn main() {\n");
-    for idx in &active_indices {
-        program.push_str(&format!(
-            "    if let Some(ce) = m_{idx}::check() {{ println!(\"CAUGHT\\t{idx}\\t{{}}\", ce.replace(['\\n', '\\r', '\\t'], \" \")); return; }}\n"
-        ));
+    for bi in 0..batch.len() {
+        program.push_str(&format!("    __rb_run_batch_law_{bi}();\n"));
     }
     program.push_str("}\n");
 
@@ -9846,24 +10390,103 @@ fn run_mutant_harness(
         return Err(HarnessError::Run);
     }
 
+    let mut per_law_caught: Vec<Option<(String, String)>> = vec![None; batch.len()];
+    let mut per_law_statuses: Vec<Vec<Option<MutantStatus>>> = batch
+        .iter()
+        .map(|item| vec![None; item.mutants.len()])
+        .collect();
+
     let stdout = String::from_utf8_lossy(&run.stdout);
     for line in stdout.lines() {
         if let Some(rest) = line.strip_prefix("CAUGHT\t") {
-            if let Some((idx_str, ce)) = rest.split_once('\t') {
-                if let Ok(idx) = idx_str.parse::<usize>() {
-                    if let Some(m) = mutants.get(idx) {
-                        return Ok(Some((m.description.clone(), ce.trim().to_string())));
+            let mut parts = rest.splitn(3, '\t');
+            if let (Some(bi_str), Some(mi_str), Some(ce)) =
+                (parts.next(), parts.next(), parts.next())
+            {
+                if let (Ok(bi), Ok(mi)) = (bi_str.parse::<usize>(), mi_str.parse::<usize>()) {
+                    if let Some(item) = batch.get(bi) {
+                        if let Some(m) = item.mutants.get(mi) {
+                            let ce_clean = ce.trim().to_string();
+                            if per_law_caught[bi].is_none() {
+                                per_law_caught[bi] =
+                                    Some((m.description.clone(), ce_clean.clone()));
+                            }
+                            if full_report {
+                                per_law_statuses[bi][mi] = Some(MutantStatus::Caught(ce_clean));
+                            }
+                        }
+                    }
+                }
+            }
+        } else if full_report {
+            if let Some(rest) = line.strip_prefix("SURVIVED\t") {
+                if let Some((bi_str, mi_str)) = rest.split_once('\t') {
+                    if let (Ok(bi), Ok(mi)) = (bi_str.parse::<usize>(), mi_str.parse::<usize>()) {
+                        if let Some(statuses) = per_law_statuses.get_mut(bi) {
+                            if mi < statuses.len() {
+                                statuses[mi] = Some(MutantStatus::Survived);
+                            }
+                        }
                     }
                 }
             }
         }
     }
 
-    Ok(None)
+    let mut results = Vec::with_capacity(batch.len());
+    for (bi, item) in batch.iter().enumerate() {
+        let outcomes = if full_report {
+            item.mutants
+                .iter()
+                .enumerate()
+                .map(|(mi, m)| MutantOutcome {
+                    def_name: m.def_name.clone(),
+                    operator: m.operator.clone(),
+                    description: m.description.clone(),
+                    status: per_law_statuses[bi][mi].clone().unwrap_or_else(|| {
+                        if let Some(ref err) = per_law_emit_errors[bi][mi] {
+                            MutantStatus::BuildError(err.clone())
+                        } else {
+                            MutantStatus::Survived
+                        }
+                    }),
+                })
+                .collect()
+        } else {
+            Vec::new()
+        };
+        results.push(EvaluatedLawResult::Complete {
+            caught_by: per_law_caught[bi].take(),
+            outcomes,
+        });
+    }
+    Ok(results)
 }
 
 /// A candidate mutant before selection: `(def, mutated body, description)`.
 type Candidate<'a> = (&'a Def, String, String);
+
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub(crate) struct GeneratedMutants {
+    pub mutants: Vec<Mutant>,
+    pub generated_total: usize,
+    pub dropped_by_budget: usize,
+    pub dropped_by_site_cap: usize,
+}
+
+fn record_dropped(
+    def: &Def,
+    body: &str,
+    seen: &HashSet<(String, String)>,
+    dropped_seen: &mut HashSet<(String, String)>,
+    dropped_by_budget: &mut usize,
+) {
+    let trimmed = body.trim().to_string();
+    let key = (def.name.clone(), trimmed);
+    if key.1 != def.body.trim() && !seen.contains(&key) && dropped_seen.insert(key) {
+        *dropped_by_budget += 1;
+    }
+}
 
 /// Generates small syntactic mutants for all live `Def`s in a law's dependency cone.
 ///
@@ -9873,24 +10496,24 @@ type Candidate<'a> = (&'a Def, String, String);
 /// `MAX_BOUND_MUTANTS_PER_LAW` more slots, round-robin across families. Finally ReturnCtor
 /// and NatLit take up to `MAX_RETURN_LIT_MUTANTS_PER_LAW` slots, round-robin. Each mutant's
 /// description ends with `[<Operator>]` so reports name the operator that caught a law.
+#[cfg(test)]
 pub(crate) fn generate_mutants_for_cone(
     cone_defs: &[Def],
     def_map: &HashMap<String, &Def>,
     ctor_map: &HashMap<String, CtorInfo>,
 ) -> Vec<Mutant> {
+    generate_mutants_for_cone_with_stats(cone_defs, def_map, ctor_map).mutants
+}
+
+pub(crate) fn generate_mutants_for_cone_with_stats(
+    cone_defs: &[Def],
+    def_map: &HashMap<String, &Def>,
+    ctor_map: &HashMap<String, CtorInfo>,
+) -> GeneratedMutants {
     let mut seen: HashSet<(String, String)> = HashSet::new();
-    let mut make = |operator: &str, desc: String, def: &Def, body: String| -> Option<Mutant> {
-        let trimmed = body.trim().to_string();
-        if trimmed == def.body.trim() || !seen.insert((def.name.clone(), trimmed)) {
-            return None;
-        }
-        Some(Mutant {
-            operator: operator.to_string(),
-            description: format!("{}: {desc} [{operator}]", def.name),
-            def_name: def.name.clone(),
-            mutated_body: body,
-        })
-    };
+    let mut dropped_seen: HashSet<(String, String)> = HashSet::new();
+    let mut dropped_by_budget = 0usize;
+    let mut dropped_by_site_cap = 0usize;
 
     let mut mutants = Vec::new();
     for def in cone_defs {
@@ -9916,9 +10539,10 @@ pub(crate) fn generate_mutants_for_cone(
         for (op, candidates) in legacy {
             for (body, desc) in candidates {
                 if mutants.len() >= MAX_MUTANTS_PER_LAW {
-                    break;
+                    record_dropped(def, &body, &seen, &mut dropped_seen, &mut dropped_by_budget);
+                    continue;
                 }
-                if let Some(m) = make(op, desc, def, body) {
+                if let Some(m) = make_mutant(op, desc, def, body, &mut seen) {
                     mutants.push(m);
                 }
             }
@@ -9947,10 +10571,12 @@ pub(crate) fn generate_mutants_for_cone(
             families[3].1.push((def, body, desc));
         }
     }
-    pick_round_robin(
+    pick_round_robin_with_stats(
         &families,
         MAX_BOUND_MUTANTS_PER_LAW,
-        &mut make,
+        &mut seen,
+        &mut dropped_seen,
+        &mut dropped_by_budget,
         &mut mutants,
     );
 
@@ -9962,30 +10588,60 @@ pub(crate) fn generate_mutants_for_cone(
         for (body, desc) in mutate_return_ctor(def, def_map, ctor_map) {
             families[0].1.push((def, body, desc));
         }
-        for (body, desc) in mutate_nat_lit(&def.body, &protected) {
+        let (lit_mutants, site_dropped) = mutate_nat_lit_with_stats(&def.body, &protected);
+        dropped_by_site_cap += site_dropped;
+        for (body, desc) in lit_mutants {
             families[1].1.push((def, body, desc));
         }
     }
-    pick_round_robin(
+    pick_round_robin_with_stats(
         &families,
         MAX_RETURN_LIT_MUTANTS_PER_LAW,
-        &mut make,
+        &mut seen,
+        &mut dropped_seen,
+        &mut dropped_by_budget,
         &mut mutants,
     );
 
-    mutants
+    let generated_total = mutants.len() + dropped_by_budget + dropped_by_site_cap;
+    GeneratedMutants {
+        mutants,
+        generated_total,
+        dropped_by_budget,
+        dropped_by_site_cap,
+    }
+}
+
+fn make_mutant(
+    operator: &str,
+    desc: String,
+    def: &Def,
+    body: String,
+    seen: &mut HashSet<(String, String)>,
+) -> Option<Mutant> {
+    let trimmed = body.trim().to_string();
+    if trimmed == def.body.trim() || !seen.insert((def.name.clone(), trimmed)) {
+        return None;
+    }
+    Some(Mutant {
+        operator: operator.to_string(),
+        description: format!("{}: {desc} [{operator}]", def.name),
+        def_name: def.name.clone(),
+        mutated_body: body,
+    })
 }
 
 /// Appends up to `cap` mutants from `families`, taking one per family in turn so every family
-/// is represented. Candidates rejected by `make` (unchanged or duplicate bodies) are skipped.
-fn pick_round_robin<F>(
+/// is represented. Candidates rejected by `make_mutant` (unchanged or duplicate bodies) are
+/// skipped; unique candidates left over after `cap` is reached are counted in `dropped_by_budget`.
+fn pick_round_robin_with_stats(
     families: &[(&str, Vec<Candidate<'_>>)],
     cap: usize,
-    make: &mut F,
+    seen: &mut HashSet<(String, String)>,
+    dropped_seen: &mut HashSet<(String, String)>,
+    dropped_by_budget: &mut usize,
     mutants: &mut Vec<Mutant>,
-) where
-    F: FnMut(&str, String, &Def, String) -> Option<Mutant>,
-{
+) {
     let mut cursors = vec![0usize; families.len()];
     let mut taken = 0usize;
     while taken < cap {
@@ -9997,7 +10653,7 @@ fn pick_round_robin<F>(
             while cursors[fi] < items.len() {
                 let (def, body, desc) = &items[cursors[fi]];
                 cursors[fi] += 1;
-                if let Some(m) = make(op, desc.clone(), def, body.clone()) {
+                if let Some(m) = make_mutant(op, desc.clone(), def, body.clone(), seen) {
                     mutants.push(m);
                     taken += 1;
                     progressed = true;
@@ -10007,6 +10663,11 @@ fn pick_round_robin<F>(
         }
         if !progressed {
             break;
+        }
+    }
+    for (fi, (_, items)) in families.iter().enumerate() {
+        for (def, body, _) in &items[cursors[fi]..] {
+            record_dropped(def, body, seen, dropped_seen, dropped_by_budget);
         }
     }
 }
@@ -10274,12 +10935,21 @@ fn mutate_return_ctor(
 /// NatLit: changes a `Nat` literal `k` to `0n`, `k + 1`, and `k - 1` (at most
 /// `MAX_NAT_LIT_SITES_PER_DEF` sites per function). All `-> 0n` mutants come first, so
 /// "zero is rejected" laws guarded by a constant such as `Nat.is_eq(width, 256n)` are caught.
+#[cfg(test)]
 fn mutate_nat_lit(body: &str, protected: &[(usize, usize)]) -> Vec<(String, String)> {
+    mutate_nat_lit_with_stats(body, protected).0
+}
+
+fn mutate_nat_lit_with_stats(
+    body: &str,
+    protected: &[(usize, usize)],
+) -> (Vec<(String, String)>, usize) {
     let bytes = body.as_bytes();
     let is_ident = |b: u8| b.is_ascii_alphanumeric() || b == b'_';
     let mut sites: Vec<(usize, usize, u64)> = Vec::new();
+    let mut extra_site_mutants = 0usize;
     let mut i = 0usize;
-    while i < bytes.len() && sites.len() < MAX_NAT_LIT_SITES_PER_DEF {
+    while i < bytes.len() {
         let starts = bytes[i].is_ascii_digit()
             && (i == 0 || !(is_ident(bytes[i - 1]) || bytes[i - 1] == b'.'));
         if !starts {
@@ -10295,7 +10965,19 @@ fn mutate_nat_lit(body: &str, protected: &[(usize, usize)]) -> Vec<(String, Stri
             && (end + 1 >= bytes.len() || !is_ident(bytes[end + 1]));
         if is_nat && !in_protected(i, protected) {
             if let Ok(k) = body[i..end].parse::<u64>() {
-                sites.push((i, end + 1, k));
+                if sites.len() < MAX_NAT_LIT_SITES_PER_DEF {
+                    sites.push((i, end + 1, k));
+                } else {
+                    if k != 0 {
+                        extra_site_mutants += 1;
+                    }
+                    if k.checked_add(1).is_some() {
+                        extra_site_mutants += 1;
+                    }
+                    if k > 1 {
+                        extra_site_mutants += 1;
+                    }
+                }
             }
         }
         i = end.max(i + 1);
@@ -10323,7 +11005,7 @@ fn mutate_nat_lit(body: &str, protected: &[(usize, usize)]) -> Vec<(String, Stri
             push(s0, e0, k, k - 1);
         }
     }
-    out
+    (out, extra_site_mutants)
 }
 
 fn is_bare_var_ident(
@@ -11130,14 +11812,113 @@ fn find_matching_paren(s: &str) -> Option<usize> {
     None
 }
 
-fn compute_cone_hash(
+fn precompute_def_callees<'a>(
+    defs: &'a [Def],
+    def_map: &HashMap<String, &'a Def>,
+) -> HashMap<&'a str, Vec<&'a str>> {
+    let mut map = HashMap::with_capacity(defs.len());
+    for def in defs {
+        let mut callees = Vec::new();
+        let mut seen = HashSet::new();
+        for tok in lock::tokenize_bend(&def.body) {
+            if let Some(target) = def_map.get(&tok) {
+                if seen.insert(target.name.as_str()) {
+                    callees.push(target.name.as_str());
+                }
+            }
+        }
+        map.insert(def.name.as_str(), callees);
+    }
+    map
+}
+
+fn law_dependency_cone_fast<'a>(
+    law: &ParsedLaw,
+    def_map: &HashMap<String, &'a Def>,
+    def_callees: &HashMap<&'a str, Vec<&'a str>>,
+) -> Vec<String> {
+    let mut visited = BTreeSet::new();
+    let mut queue = VecDeque::new();
+    for expr in std::iter::once(law.lhs.as_str())
+        .chain(std::iter::once(law.rhs.as_str()))
+        .chain(
+            law.hypotheses
+                .iter()
+                .flat_map(|h| [h.lhs.as_str(), h.rhs.as_str()]),
+        )
+    {
+        for tok in lock::tokenize_bend(expr) {
+            if let Some(def) = def_map.get(&tok) {
+                if visited.insert(def.name.clone()) {
+                    queue.push_back(def.name.as_str());
+                }
+            }
+        }
+    }
+    while let Some(name) = queue.pop_front() {
+        if let Some(callees) = def_callees.get(name) {
+            for &callee in callees {
+                if visited.insert(callee.to_string()) {
+                    queue.push_back(callee);
+                }
+            }
+        }
+    }
+    visited.into_iter().collect()
+}
+
+fn compute_types_hash(types: &[TypeDef]) -> String {
+    let mut sorted_types: Vec<&TypeDef> = types.iter().collect();
+    sorted_types.sort_by(|a, b| a.name.cmp(&b.name));
+    let mut buf = Vec::new();
+    for td in sorted_types {
+        buf.extend_from_slice(td.name.as_bytes());
+        buf.push(0);
+        for v in &td.variants {
+            buf.extend_from_slice(v.name.as_bytes());
+            for ft in &v.field_types {
+                buf.push(b',');
+                buf.extend_from_slice(ft.as_bytes());
+            }
+            buf.push(0);
+        }
+    }
+    lock::fnv1a_hex(&buf)
+}
+
+fn precompute_def_hashes(defs: &[Def]) -> HashMap<&str, String> {
+    let mut out = HashMap::with_capacity(defs.len());
+    for def in defs {
+        let mut buf = Vec::new();
+        buf.extend_from_slice(def.name.as_bytes());
+        buf.push(0);
+        for p in &def.params {
+            buf.extend_from_slice(p.name.as_bytes());
+            buf.push(b':');
+            buf.extend_from_slice(p.ty.as_bytes());
+            buf.push(0);
+        }
+        buf.extend_from_slice(def.ret.as_bytes());
+        buf.push(0);
+        buf.push(u8::from(def.total));
+        buf.push(0);
+        buf.extend_from_slice(def.body.as_bytes());
+        buf.push(0);
+        out.insert(def.name.as_str(), lock::fnv1a_hex(&buf));
+    }
+    out
+}
+
+fn compute_cone_hash_fast(
     law: &ParsedLaw,
     cone: &[String],
-    types: &[TypeDef],
-    def_map: &HashMap<String, &Def>,
+    types_hash: &str,
+    def_hashes: &HashMap<&str, String>,
 ) -> String {
     let mut buf = Vec::new();
-    buf.extend_from_slice(b"rb-mutate-v1\0");
+    buf.extend_from_slice(b"rb-mutate-");
+    buf.extend_from_slice(MUTATE_CACHE_VERSION.as_bytes());
+    buf.push(0);
     buf.extend_from_slice(law.name.as_bytes());
     buf.push(0);
     for v in &law.vars {
@@ -11158,77 +11939,387 @@ fn compute_cone_hash(
     buf.push(b':');
     buf.extend_from_slice(law.eq_ty.as_bytes());
     buf.push(0);
-
-    let mut sorted_types: Vec<&TypeDef> = types.iter().collect();
-    sorted_types.sort_by(|a, b| a.name.cmp(&b.name));
-    for td in sorted_types {
-        buf.extend_from_slice(td.name.as_bytes());
-        buf.push(0);
-        for v in &td.variants {
-            buf.extend_from_slice(v.name.as_bytes());
-            for ft in &v.field_types {
-                buf.push(b',');
-                buf.extend_from_slice(ft.as_bytes());
-            }
+    buf.extend_from_slice(types_hash.as_bytes());
+    buf.push(0);
+    for name in cone {
+        if let Some(h) = def_hashes.get(name.as_str()) {
+            buf.extend_from_slice(name.as_bytes());
+            buf.push(b'=');
+            buf.extend_from_slice(h.as_bytes());
             buf.push(0);
         }
     }
-
-    let mut sorted_cone = cone.to_vec();
-    sorted_cone.sort();
-    for name in sorted_cone {
-        if let Some(def) = def_map.get(&name) {
-            buf.extend_from_slice(def.name.as_bytes());
-            buf.push(0);
-            for p in &def.params {
-                buf.extend_from_slice(p.name.as_bytes());
-                buf.push(b':');
-                buf.extend_from_slice(p.ty.as_bytes());
-                buf.push(0);
-            }
-            buf.extend_from_slice(def.ret.as_bytes());
-            buf.push(0);
-            buf.extend_from_slice(def.body.as_bytes());
-            buf.push(0);
-        }
-    }
-
     lock::fnv1a_hex(&buf)
 }
 
-fn load_mutate_cache(path: &Path) -> BTreeMap<String, (String, String)> {
+#[derive(Debug, Clone)]
+enum MutateCacheEntry {
+    First {
+        total_mutants: usize,
+        generated_mutants: usize,
+        dropped_by_budget: usize,
+        dropped_by_site_cap: usize,
+        caught_by: Option<(String, String)>,
+        survived_operators: Vec<String>,
+        skipped_reason: Option<String>,
+    },
+    Full {
+        total_mutants: usize,
+        generated_mutants: usize,
+        dropped_by_budget: usize,
+        dropped_by_site_cap: usize,
+        outcomes: Vec<MutantOutcome>,
+        skipped_reason: Option<String>,
+    },
+}
+
+fn cache_entry_from_report(report: &LawMutationReport, full_report: bool) -> MutateCacheEntry {
+    if full_report {
+        MutateCacheEntry::Full {
+            total_mutants: report.total_mutants,
+            generated_mutants: report.generated_mutants,
+            dropped_by_budget: report.dropped_by_budget,
+            dropped_by_site_cap: report.dropped_by_site_cap,
+            outcomes: report.mutant_outcomes.clone(),
+            skipped_reason: report.skipped_reason.clone(),
+        }
+    } else {
+        MutateCacheEntry::First {
+            total_mutants: report.total_mutants,
+            generated_mutants: report.generated_mutants,
+            dropped_by_budget: report.dropped_by_budget,
+            dropped_by_site_cap: report.dropped_by_site_cap,
+            caught_by: report.caught_by.clone(),
+            survived_operators: report.survived_operators.clone(),
+            skipped_reason: report.skipped_reason.clone(),
+        }
+    }
+}
+
+fn report_from_cache(
+    item: &PreparedLaw<'_>,
+    entry: &MutateCacheEntry,
+    full_report: bool,
+    def_map: &HashMap<String, &Def>,
+    ctor_map: &HashMap<String, CtorInfo>,
+) -> Option<LawMutationReport> {
+    match entry {
+        MutateCacheEntry::Full {
+            total_mutants,
+            generated_mutants,
+            dropped_by_budget,
+            dropped_by_site_cap,
+            outcomes,
+            skipped_reason,
+        } => {
+            let caught_by = outcomes.iter().find_map(|o| match &o.status {
+                MutantStatus::Caught(ce) => Some((o.description.clone(), ce.clone())),
+                _ => None,
+            });
+            let survived_operators: Vec<String> = outcomes
+                .iter()
+                .map(|o| o.operator.clone())
+                .collect::<BTreeSet<_>>()
+                .into_iter()
+                .collect();
+            Some(LawMutationReport {
+                law_name: item.law.name.clone(),
+                cone: item.cone.clone(),
+                total_mutants: *total_mutants,
+                generated_mutants: *generated_mutants,
+                dropped_by_budget: *dropped_by_budget,
+                dropped_by_site_cap: *dropped_by_site_cap,
+                caught_by,
+                survived_operators,
+                mutant_outcomes: if full_report {
+                    outcomes.clone()
+                } else {
+                    Vec::new()
+                },
+                skipped_reason: skipped_reason.clone(),
+                from_cache: true,
+            })
+        }
+        MutateCacheEntry::First {
+            total_mutants,
+            generated_mutants,
+            dropped_by_budget,
+            dropped_by_site_cap,
+            caught_by,
+            survived_operators,
+            skipped_reason,
+        } => {
+            if full_report {
+                if skipped_reason.is_some() {
+                    return Some(LawMutationReport {
+                        law_name: item.law.name.clone(),
+                        cone: item.cone.clone(),
+                        total_mutants: *total_mutants,
+                        generated_mutants: *generated_mutants,
+                        dropped_by_budget: *dropped_by_budget,
+                        dropped_by_site_cap: *dropped_by_site_cap,
+                        caught_by: None,
+                        survived_operators: Vec::new(),
+                        mutant_outcomes: Vec::new(),
+                        skipped_reason: skipped_reason.clone(),
+                        from_cache: true,
+                    });
+                }
+                if caught_by.is_none() {
+                    let generated =
+                        generate_mutants_for_cone_with_stats(&item.cone_defs, def_map, ctor_map);
+                    let outcomes = generated
+                        .mutants
+                        .into_iter()
+                        .map(|m| MutantOutcome {
+                            def_name: m.def_name,
+                            operator: m.operator,
+                            description: m.description,
+                            status: MutantStatus::Survived,
+                        })
+                        .collect();
+                    return Some(LawMutationReport {
+                        law_name: item.law.name.clone(),
+                        cone: item.cone.clone(),
+                        total_mutants: *total_mutants,
+                        generated_mutants: *generated_mutants,
+                        dropped_by_budget: *dropped_by_budget,
+                        dropped_by_site_cap: *dropped_by_site_cap,
+                        caught_by: None,
+                        survived_operators: survived_operators.clone(),
+                        mutant_outcomes: outcomes,
+                        skipped_reason: None,
+                        from_cache: true,
+                    });
+                }
+                // `First::Caught` must be upgraded to `Full` under `Report` mode.
+                return None;
+            }
+            Some(LawMutationReport {
+                law_name: item.law.name.clone(),
+                cone: item.cone.clone(),
+                total_mutants: *total_mutants,
+                generated_mutants: *generated_mutants,
+                dropped_by_budget: *dropped_by_budget,
+                dropped_by_site_cap: *dropped_by_site_cap,
+                caught_by: caught_by.clone(),
+                survived_operators: survived_operators.clone(),
+                mutant_outcomes: Vec::new(),
+                skipped_reason: skipped_reason.clone(),
+                from_cache: true,
+            })
+        }
+    }
+}
+
+fn load_mutate_cache(path: &Path) -> BTreeMap<String, MutateCacheEntry> {
     let mut map = BTreeMap::new();
     let Ok(raw) = fs::read_to_string(path) else {
         return map;
     };
+    let mut current_full_key: Option<String> = None;
     for line in raw.lines() {
-        let parts: Vec<&str> = line.splitn(4, '\t').collect();
-        if parts.len() == 4 && parts[1] == "CAUGHT" {
-            map.insert(
-                parts[0].to_string(),
-                (parts[2].to_string(), parts[3].to_string()),
-            );
+        if line.is_empty() || line.starts_with('#') {
+            continue;
+        }
+        if let Some(rest) = line.strip_prefix("\tM\t") {
+            let Some(ref key) = current_full_key else {
+                continue;
+            };
+            let parts: Vec<&str> = rest.splitn(5, '\t').collect();
+            if parts.len() == 5 {
+                let status = match parts[3] {
+                    "CAUGHT" => MutantStatus::Caught(parts[4].to_string()),
+                    "SURVIVED" => MutantStatus::Survived,
+                    _ => continue,
+                };
+                if let Some(MutateCacheEntry::Full { outcomes, .. }) = map.get_mut(key) {
+                    outcomes.push(MutantOutcome {
+                        def_name: parts[0].to_string(),
+                        operator: parts[1].to_string(),
+                        description: parts[2].to_string(),
+                        status,
+                    });
+                }
+            }
+            continue;
+        }
+        current_full_key = None;
+        let parts: Vec<&str> = line.split('\t').collect();
+        if parts.len() < 7 {
+            continue;
+        }
+        let key = parts[0].to_string();
+        let Ok(total_mutants) = parts[3].parse::<usize>() else {
+            continue;
+        };
+        let Ok(generated_mutants) = parts[4].parse::<usize>() else {
+            continue;
+        };
+        let Ok(dropped_by_budget) = parts[5].parse::<usize>() else {
+            continue;
+        };
+        let Ok(dropped_by_site_cap) = parts[6].parse::<usize>() else {
+            continue;
+        };
+        match (parts[1], parts[2]) {
+            ("FIRST", "CAUGHT") if parts.len() >= 9 => {
+                map.insert(
+                    key,
+                    MutateCacheEntry::First {
+                        total_mutants,
+                        generated_mutants,
+                        dropped_by_budget,
+                        dropped_by_site_cap,
+                        caught_by: Some((parts[7].to_string(), parts[8..].join("\t"))),
+                        survived_operators: Vec::new(),
+                        skipped_reason: None,
+                    },
+                );
+            }
+            ("FIRST", "SURVIVED") => {
+                let ops = parts
+                    .get(7)
+                    .map(|s| {
+                        s.split(',')
+                            .map(str::trim)
+                            .filter(|x| !x.is_empty())
+                            .map(ToOwned::to_owned)
+                            .collect()
+                    })
+                    .unwrap_or_default();
+                map.insert(
+                    key,
+                    MutateCacheEntry::First {
+                        total_mutants,
+                        generated_mutants,
+                        dropped_by_budget,
+                        dropped_by_site_cap,
+                        caught_by: None,
+                        survived_operators: ops,
+                        skipped_reason: None,
+                    },
+                );
+            }
+            ("FIRST", "SKIPPED") if parts.len() >= 8 => {
+                map.insert(
+                    key,
+                    MutateCacheEntry::First {
+                        total_mutants,
+                        generated_mutants,
+                        dropped_by_budget,
+                        dropped_by_site_cap,
+                        caught_by: None,
+                        survived_operators: Vec::new(),
+                        skipped_reason: Some(parts[7..].join("\t")),
+                    },
+                );
+            }
+            ("FULL", "SKIPPED") if parts.len() >= 8 => {
+                map.insert(
+                    key,
+                    MutateCacheEntry::Full {
+                        total_mutants,
+                        generated_mutants,
+                        dropped_by_budget,
+                        dropped_by_site_cap,
+                        outcomes: Vec::new(),
+                        skipped_reason: Some(parts[7..].join("\t")),
+                    },
+                );
+            }
+            ("FULL", "DONE") => {
+                current_full_key = Some(key.clone());
+                map.insert(
+                    key,
+                    MutateCacheEntry::Full {
+                        total_mutants,
+                        generated_mutants,
+                        dropped_by_budget,
+                        dropped_by_site_cap,
+                        outcomes: Vec::new(),
+                        skipped_reason: None,
+                    },
+                );
+            }
+            _ => {}
         }
     }
     map
 }
 
-fn save_mutate_cache(path: &Path, map: &BTreeMap<String, (String, String)>) -> Result<(), String> {
-    let mut lines = Vec::with_capacity(map.len());
-    for (k, (desc, ce)) in map {
-        lines.push(format!(
-            "{k}\tCAUGHT\t{}\t{}",
-            desc.replace(['\t', '\n', '\r'], " "),
-            ce.replace(['\t', '\n', '\r'], " ")
-        ));
+fn save_mutate_cache(path: &Path, map: &BTreeMap<String, MutateCacheEntry>) -> Result<(), String> {
+    let mut lines = vec![format!("# rb-mutate-cache-{MUTATE_CACHE_VERSION}")];
+    for (k, entry) in map {
+        match entry {
+            MutateCacheEntry::First {
+                total_mutants,
+                generated_mutants,
+                dropped_by_budget,
+                dropped_by_site_cap,
+                caught_by,
+                survived_operators,
+                skipped_reason,
+            } => {
+                if let Some(reason) = skipped_reason {
+                    lines.push(format!(
+                        "{k}\tFIRST\tSKIPPED\t{total_mutants}\t{generated_mutants}\t{dropped_by_budget}\t{dropped_by_site_cap}\t{}",
+                        sanitize_cache_field(reason)
+                    ));
+                } else if let Some((desc, ce)) = caught_by {
+                    lines.push(format!(
+                        "{k}\tFIRST\tCAUGHT\t{total_mutants}\t{generated_mutants}\t{dropped_by_budget}\t{dropped_by_site_cap}\t{}\t{}",
+                        sanitize_cache_field(desc),
+                        sanitize_cache_field(ce)
+                    ));
+                } else {
+                    lines.push(format!(
+                        "{k}\tFIRST\tSURVIVED\t{total_mutants}\t{generated_mutants}\t{dropped_by_budget}\t{dropped_by_site_cap}\t{}",
+                        sanitize_cache_field(&survived_operators.join(","))
+                    ));
+                }
+            }
+            MutateCacheEntry::Full {
+                total_mutants,
+                generated_mutants,
+                dropped_by_budget,
+                dropped_by_site_cap,
+                outcomes,
+                skipped_reason,
+            } => {
+                if let Some(reason) = skipped_reason {
+                    lines.push(format!(
+                        "{k}\tFULL\tSKIPPED\t{total_mutants}\t{generated_mutants}\t{dropped_by_budget}\t{dropped_by_site_cap}\t{}",
+                        sanitize_cache_field(reason)
+                    ));
+                } else {
+                    lines.push(format!(
+                        "{k}\tFULL\tDONE\t{total_mutants}\t{generated_mutants}\t{dropped_by_budget}\t{dropped_by_site_cap}"
+                    ));
+                    for o in outcomes {
+                        let (kind, extra) = match &o.status {
+                            MutantStatus::Caught(ce) => ("CAUGHT", sanitize_cache_field(ce)),
+                            MutantStatus::Survived => ("SURVIVED", String::new()),
+                            MutantStatus::BuildError(_) => continue,
+                        };
+                        lines.push(format!(
+                            "\tM\t{}\t{}\t{}\t{kind}\t{extra}",
+                            sanitize_cache_field(&o.def_name),
+                            sanitize_cache_field(&o.operator),
+                            sanitize_cache_field(&o.description)
+                        ));
+                    }
+                }
+            }
+        }
     }
-    fs::write(path, lines.join("\n")).map_err(|e| e.to_string())
+    fs::write(path, format!("{}\n", lines.join("\n"))).map_err(|e| e.to_string())
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
-    use std::sync::atomic::{AtomicUsize, Ordering};
+    use crate::law_test::law_dependency_cone;
 
     static MSEQ: AtomicUsize = AtomicUsize::new(0);
 
@@ -11958,6 +13049,258 @@ law keep_same:
             .expect_err("an uncompilable mutant must not count as a survivor");
         assert!(err.contains("[E_MUTANT_BUILD]"), "{err}");
         assert!(err.contains("keep: body -> True{} [Test]"), "{err}");
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn mutate_mode_all_covers_new_laws_and_report_mode_lists_every_mutant_and_caches() {
+        let dir = tmp_dir("issue19_report");
+        let core = dir.join("ledger.bend");
+        let lock_file = dir.join("rusty-bends.lock");
+        let out_dir = dir.join("out");
+
+        let base_src = r#"import Base
+
+def total_items(+a: Nat, +b: Nat) -> Nat:
+  Nat.add(a, b)
+
+def bump(+n: Nat) -> Nat:
+  1n+n
+
+# promise: the total never drops below the first delivery
+law total_covers_first:
+  for +a: Nat
+  for +b: Nat
+  {Nat.is_le(a, total_items(a, b)) == True{} : Bool}
+
+# promise: a write always changes the stamp
+law bump_changes:
+  for +m: Nat
+  {Nat.is_eq(m, bump(m)) == False{} : Bool}
+"#;
+        fs::write(&core, base_src).unwrap();
+        lock::enforce_law_lock(&lock_file, std::slice::from_ref(&core), true).unwrap();
+
+        let with_new_src = format!(
+            "{base_src}\n# promise: the total never drops below the second delivery\nlaw total_covers_second:\n  for +a: Nat\n  for +b: Nat\n  {{Nat.is_le(b, total_items(a, b)) == True{{}} : Bool}}\n"
+        );
+        fs::write(&core, &with_new_src).unwrap();
+        let report = lock::check_law_lock(&lock_file, std::slice::from_ref(&core), false).unwrap();
+        assert!(report.new_names.contains("total_covers_second"));
+        assert!(report.locked_names.contains("total_covers_first"));
+        assert!(report.locked_names.contains("bump_changes"));
+
+        // `RUSTY_BENDS_MUTATE=all` covers both locked laws AND new laws.
+        let all_summary = run_mutation_checks(&with_new_src, &report, MutateMode::All, &out_dir)
+            .expect("MutateMode::All covers new and locked laws");
+        assert!(all_summary.report_path.is_none());
+        assert_eq!(all_summary.warnings.len(), 3, "{:?}", all_summary.warnings);
+        for name in ["total_covers_first", "bump_changes", "total_covers_second"] {
+            assert!(
+                all_summary
+                    .warnings
+                    .iter()
+                    .any(|w| w.contains(&format!("[{name}]"))),
+                "missing {name} in =all output: {:?}",
+                all_summary.warnings
+            );
+        }
+
+        // `RUSTY_BENDS_MUTATE=report` evaluates EVERY mutant of every law and writes OUT_DIR/rusty-bends-mutants.txt.
+        let rep_summary = run_mutation_checks(&with_new_src, &report, MutateMode::Report, &out_dir)
+            .expect("MutateMode::Report evaluates every mutant");
+        let report_path = rep_summary.report_path.as_ref().expect("report_path");
+        assert!(report_path.ends_with("rusty-bends-mutants.txt"));
+        assert!(report_path.exists());
+        let file_text = fs::read_to_string(report_path).unwrap();
+
+        let first = rep_summary
+            .reports
+            .iter()
+            .find(|r| r.law_name == "total_covers_first")
+            .unwrap();
+        assert!(!first.from_cache, "upgrade from FIRST to FULL must re-run");
+        for expected_desc in [
+            "total_items: Nat.add -> Nat.sub [NatCmpArith]",
+            "total_items: Nat.add -> Nat.mul [NatCmpArith]",
+            "total_items: return parameter 'a' unchanged [ReturnUnchanged]",
+            "total_items: return parameter 'b' unchanged [ReturnUnchanged]",
+            "total_items: result -> Nat.add(result, 1n) [NatBound]",
+            "total_items: result -> Nat.sub(result, 1n) [NatBound]",
+            "total_items: result -> 0n [NatBound]",
+        ] {
+            assert!(
+                first
+                    .mutant_outcomes
+                    .iter()
+                    .any(|o| o.description == expected_desc),
+                "missing {expected_desc} in {:?}",
+                first.mutant_outcomes
+            );
+            assert!(
+                file_text.contains(expected_desc),
+                "missing {expected_desc} in file:\n{file_text}"
+            );
+        }
+        assert!(first.mutant_outcomes.iter().any(|o| {
+            o.description == "total_items: result -> Nat.add(result, 1n) [NatBound]"
+                && matches!(o.status, MutantStatus::Survived)
+        }));
+        assert!(first.mutant_outcomes.iter().any(|o| {
+            o.description == "total_items: Nat.add -> Nat.sub [NatCmpArith]"
+                && matches!(o.status, MutantStatus::Caught(_))
+        }));
+
+        // Second Report run hits cache with identical per-mutant outcomes.
+        let rep_cached = run_mutation_checks(&with_new_src, &report, MutateMode::Report, &out_dir)
+            .expect("cached report run succeeds");
+        for r in &rep_cached.reports {
+            assert!(r.from_cache, "expected {} to hit cache", r.law_name);
+        }
+        let first_cached = rep_cached
+            .reports
+            .iter()
+            .find(|r| r.law_name == "total_covers_first")
+            .unwrap();
+        assert_eq!(first_cached.mutant_outcomes, first.mutant_outcomes);
+
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn mutation_reports_dropped_by_budget_and_site_cap_and_caches_survived() {
+        let dir = tmp_dir("issue19_dropped_and_survived");
+        let core = dir.join("core.bend");
+        let lock_file = dir.join("rusty-bends.lock");
+        let out_dir = dir.join("out");
+
+        // Build a def with > 8 Nat literal sites AND > 48 legacy comparisons so both caps trigger.
+        let mut expr = String::from("Bool.and(Nat.is_eq(x, 1n), Nat.is_eq(x, 2n))");
+        for k in 3..=45 {
+            expr = format!("Bool.and({expr}, Nat.is_eq(x, {k}n))");
+        }
+        let src = format!(
+            "import Base\n\ndef many_checks(+x: Nat) -> Bool:\n  {expr}\n\n# promise: tautology fixture\nlaw many_taut:\n  for +x: Nat\n  {{many_checks(x) == many_checks(x) : Bool}}\n"
+        );
+        fs::write(&core, &src).unwrap();
+        lock::enforce_law_lock(&lock_file, std::slice::from_ref(&core), true).unwrap();
+        let report = lock::check_law_lock(&lock_file, std::slice::from_ref(&core), false).unwrap();
+
+        let summary = run_mutation_checks(&src, &report, MutateMode::All, &out_dir)
+            .expect("locked surviving law runs under MutateMode::All");
+        assert_eq!(summary.reports.len(), 1);
+        let r = &summary.reports[0];
+        assert!(r.dropped_by_budget > 0, "{r:?}");
+        assert!(r.dropped_by_site_cap > 0, "{r:?}");
+        assert!(
+            summary.warnings[0].contains("dropped by budget")
+                && summary.warnings[0].contains("dropped by site cap"),
+            "warnings: {:?}",
+            summary.warnings
+        );
+
+        // Warm All run hits cached SURVIVED entry without recompiling.
+        let summary2 = run_mutation_checks(&src, &report, MutateMode::All, &out_dir).unwrap();
+        assert!(summary2.reports[0].from_cache);
+        assert!(summary2.warnings[0].contains("[cached]"));
+
+        // Warm Report run upgrades from First::Survived cleanly.
+        let summary_rep = run_mutation_checks(&src, &report, MutateMode::Report, &out_dir).unwrap();
+        assert!(summary_rep.reports[0].from_cache);
+        assert!(!summary_rep.reports[0].mutant_outcomes.is_empty());
+
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn batched_multi_law_evaluation_handles_many_laws_and_keyword_report() {
+        let dir = tmp_dir("issue19_batch");
+        let core = dir.join("core.bend");
+        let lock_file = dir.join("rusty-bends.lock");
+        let out_dir = dir.join("out");
+
+        let src = r#"import Base
+
+def loop(+as: Nat) -> Nat:
+  Nat.add(as, 1n)
+
+def double(+x: Nat) -> Nat:
+  Nat.add(x, x)
+
+def clamp_zero(+x: Nat) -> Nat:
+  Nat.sub(x, x)
+
+def is_nonzero(+x: Nat) -> Bool:
+  Nat.is_gt(x, 0n)
+
+# promise: loop increments zero to one
+law loop_zero:
+  {loop(0n) == 1n : Nat}
+
+# promise: loop is strictly above input
+law loop_above:
+  for +as: Nat
+  {Nat.is_lt(as, loop(as)) == True{} : Bool}
+
+# promise: doubling two gives four
+law double_two:
+  {double(2n) == 4n : Nat}
+
+# promise: subtracting self gives zero
+law clamp_zero_ok:
+  for +x: Nat
+  {clamp_zero(x) == 0n : Nat}
+
+# promise: one is nonzero
+law one_nonzero:
+  {is_nonzero(1n) == True{} : Bool}
+"#;
+        fs::write(&core, src).unwrap();
+        let report = lock::check_law_lock(&lock_file, std::slice::from_ref(&core), false).unwrap();
+        let summary = run_mutation_checks(src, &report, MutateMode::Report, &out_dir)
+            .expect("batched report over 5 laws including keyword names succeeds");
+        assert_eq!(summary.reports.len(), 5);
+        for r in &summary.reports {
+            assert!(r.caught_by.is_some(), "{} was not caught", r.law_name);
+        }
+
+        // Verify batch fallback preserves valid laws while isolating an uncompilable mutant.
+        let laws = parse_laws(src);
+        let (types, defs) = parse_book_items(src).unwrap();
+        let type_env = TypeEnv::build(&types, &defs, &collect_law_source_slices(&laws));
+        let def_map: HashMap<String, &Def> = defs.iter().map(|d| (d.name.clone(), d)).collect();
+        let type_map: HashMap<String, &TypeDef> =
+            types.iter().map(|t| (t.name.clone(), t)).collect();
+        let bad_mutant = Mutant {
+            operator: "Test".to_string(),
+            description: "double: body -> True{} [Test]".to_string(),
+            def_name: "double".to_string(),
+            mutated_body: "True{}".to_string(),
+        };
+        let good_defs = vec![def_map["loop"].clone()];
+        let good_muts = generate_mutants_for_cone(&good_defs, &def_map, &type_env.ctor_map);
+        let bad_defs = vec![def_map["double"].clone()];
+        let work = vec![
+            LawWorkItem {
+                prepared_idx: 0,
+                law: &laws[0],
+                is_locked: false,
+                cone_defs: &good_defs,
+                mutants: &good_muts,
+            },
+            LawWorkItem {
+                prepared_idx: 1,
+                law: &laws[2],
+                is_locked: false,
+                cone_defs: &bad_defs,
+                mutants: std::slice::from_ref(&bad_mutant),
+            },
+        ];
+        let res = evaluate_work_items_batched(&work, &types, &type_map, &type_env, true, &out_dir)
+            .unwrap();
+        assert!(matches!(res[0], EvaluatedLawResult::Complete { .. }));
+        assert!(matches!(res[1], EvaluatedLawResult::BuildFailed { .. }));
+
         let _ = fs::remove_dir_all(&dir);
     }
 }
@@ -13527,7 +14870,7 @@ def cancel_idempotent(s):
   - **Division, modulo & alignment (`b = 1n+bp > 0`):** `nat_mod_lt(a, bp)` (`a % (1n+bp) < 1n+bp`), `nat_div_mod(a, bp)` (`a % (1n+bp) + (a / (1n+bp)) * (1n+bp) == a`), `nat_div_mod_r(a, bp)` (`(a / (1n+bp)) * (1n+bp) + a % (1n+bp) == a`), `nat_div_lt_of_lt_mul(a, n, bp, h)` (`a < n * (1n+bp) -> a / (1n+bp) < n`), `nat_div_lt_of_lt_mul_l(a, n, bp, h)` (`a < (1n+bp) * n -> a / (1n+bp) < n`), `nat_split_unique_q(q1, r1, q2, r2, bp, h1, h2, e)` (`q1 * b + r1 == q2 * b + r2` with `r1, r2 < b` gives `q1 == q2`), `nat_split_unique_r(q1, r1, q2, r2, bp, h1, h2, e)` (`r1 == r2`), `nat_div_split(q, r, bp, h)` (`(q * b + r) / b == q`), `nat_mod_split(q, r, bp, h)` (`(q * b + r) % b == r`), `nat_div_small(a, bp, h)` (`a < b -> a / b == 0`), `nat_mod_small(a, bp, h)` (`a < b -> a % b == a`), `nat_eq_of_div_mod(a, c, bp, hq, hr)` (equal quotient and remainder give `a == c`), `nat_split_lt(q, r, n, bp, hq, hr)` (`q < n, r < b -> q * b + r < n * b`), `nat_mod_mul(q, bp)` (`(q * b) % b == 0`), `nat_div_mul(q, bp)` (`(q * b) / b == q`), and `nat_align_down_le(a, bp)` (`(a / b) * b <= a`).
 - **Generated per-law Rust tests:** every `law` also emits a `#[cfg(test)]` Rust test into `OUT_DIR/verified.rs` (run automatically by `cargo test`) that checks the emitted functions across small values, `u64::MAX - 1`, `u64::MAX`, ADT constructors, and deterministic PRNG samples (skipping only checked `Nat` overflow panics).
 - **Counterexample vs proof-failure diagnosis:** when `bend --check-only` fails on a law, `rusty-bends-build` evaluates the emitted Rust on concrete inputs first and reports `[E_LAW_FALSE]` with aligned `lhs`/`rhs` values if the law is false, or notes `"no counterexample up to ...: the law may be true; the proof is what failed"` if no counterexample exists.
-- **Mutation checking before sealing (`E_LAW_VACUOUS`):** every unlocked/new law is checked against small mutants of the live functions in its dependency cone (`True{}`/`False{}` swap, `Nat.is_le`/`Nat.is_lt` swap, `Nat.add`/`Nat.sub` swap, `Bool.and`/`Bool.or` operand drop, returning a constructor argument unchanged, swapping match arms) and fails with `[E_LAW_VACUOUS]` if it catches none. Bound and safety laws are covered too: `NatBound` pushes a `Nat` result past a bound (`+ 1n`, `- 1n`, `0n`), `SiblingCtor` replaces a returned constructor with its sibling constructors, `BoolConst` replaces a `Bool` variable with `True{}` / `False{}`, and `FlipCmp` loosens comparisons (`Nat.is_le` <-> `Nat.is_ge`, `Nat.is_lt` <-> `Nat.is_gt`). `ReturnCtor` replaces a returned variable or function call (e.g. a fallthrough `case st _: st`) with each constructor of the return type, and `NatLit` changes `Nat` literals (`k` -> `0n`, `k + 1`, `k - 1`, at most 8 sites per function). Each reported mutant ends with its operator, e.g. `caught by f: result -> Nat.add(result, 1n) [NatBound]`. Run `RUSTY_BENDS_MUTATE=all cargo check` to report caught/survived status for already-locked laws without failing.
+- **Mutation checking before sealing (`E_LAW_VACUOUS`):** every unlocked/new law is checked against small mutants of the live functions in its dependency cone (`True{}`/`False{}` swap, `Nat.is_le`/`Nat.is_lt` swap, `Nat.add`/`Nat.sub` swap, `Bool.and`/`Bool.or` operand drop, returning a constructor argument unchanged, swapping match arms) and fails with `[E_LAW_VACUOUS]` if it catches none. Bound and safety laws are covered too: `NatBound` pushes a `Nat` result past a bound (`+ 1n`, `- 1n`, `0n`), `SiblingCtor` replaces a returned constructor with its sibling constructors, `BoolConst` replaces a `Bool` variable with `True{}` / `False{}`, and `FlipCmp` loosens comparisons (`Nat.is_le` <-> `Nat.is_ge`, `Nat.is_lt` <-> `Nat.is_gt`). `ReturnCtor` replaces a returned variable or function call (e.g. a fallthrough `case st _: st`) with each constructor of the return type, and `NatLit` changes `Nat` literals (`k` -> `0n`, `k + 1`, `k - 1`, at most 8 sites per function). Each reported mutant ends with its operator, e.g. `caught by f: result -> Nat.add(result, 1n) [NatBound]`. Run `RUSTY_BENDS_MUTATE=all cargo check` to report one summary line for every law (new and locked) without failing on locked laws, or `RUSTY_BENDS_MUTATE=report cargo check` to evaluate every generated mutant of every law, print per-mutant `caught`/`survived` lines (noting any budget/site-cap drops), and write the report to `OUT_DIR/rusty-bends-mutants.txt`.
 - **Unevaluable new laws (`E_LAW_UNCHECKED`):** a new law the checker cannot evaluate (`exs`, a `where` refinement, an unparsable clause, or a goal without `==`) fails the build, naming the reason and the supported forms. If it truly cannot be sampled, add `# unchecked: <why>` in the comment block directly above `law <name>:`; the marker is stored in `rusty-bends.lock` and shown as `[unchecked: <why>]` by the law listing. Locked laws only warn.
 - **Mutants that do not compile (`E_MUTANT_BUILD`):** a mutant the generated Rust cannot build was never tested, so it never counts as a survivor. The build stops with `[E_MUTANT_BUILD]`, naming the mutant and the first rustc error; that is a RustyBends bug to report, not a weak law.
 - **Names that are Rust keywords:** any Bend name may be used, including ones Rust reserves (`as`, `in`, `fn`, `ref`, `mut`, `dyn`, `loop`, `move`, `self`, `crate`, `super`, ...). The emitted Rust spells them `r#as`, `r#in`, ... and, where Rust allows no raw form, `__rb_self`, `__rb_crate`, `__rb_super`, `__rb_Self`. Call them from Rust by those names, e.g. `verified::r#loop(2, 3)`.
