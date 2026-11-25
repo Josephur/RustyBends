@@ -489,6 +489,13 @@ where
         ));
     }
 
+    // Imports must stay inside verified/: the lock, the checker, and the emitter must
+    // all read the same files.
+    for file in &bend_files {
+        let text = fs::read_to_string(file).map_err(|e| e.to_string())?;
+        check_import_paths(file, &text, &cfg.verified_dir)?;
+    }
+
     // Every .bend file and directory under verified/ is a build input, on cache hits too.
     for line in rerun_if_changed_lines(&cfg.verified_dir, &bend_files) {
         println!("{line}");
@@ -547,6 +554,8 @@ where
     // 3. Pre-read all sources and run real Bend 2 checker (--check-only, plus --verdict when laws are present)
     let mut file_sources: Vec<(&PathBuf, String)> = Vec::with_capacity(bend_files.len());
     let mut combined_source = String::new();
+    let mut declared_names: std::collections::BTreeMap<String, (&'static str, PathBuf)> =
+        std::collections::BTreeMap::new();
     for file in &bend_files {
         let text = fs::read_to_string(file).map_err(|e| e.to_string())?;
         if let Some(bad) = find_unchecked_defs(&text).first() {
@@ -559,6 +568,7 @@ where
                 cfg.verified_dir.display()
             ));
         }
+        record_top_level_names(file, &text, &mut declared_names)?;
         combined_source.push_str(&emit::resolve_import_aliases(&text));
         combined_source.push('\n');
         file_sources.push((file, text));
@@ -1084,6 +1094,107 @@ pub fn collect_bend_files(dir: &Path, out: &mut Vec<PathBuf>) -> Result<(), Stri
     Ok(())
 }
 
+/// Rejects `import` lines in `file` that read anything outside `verified_dir`: a
+/// `../` path, an absolute path, a symlink out, or a BendHub (`0x<hash>/`,
+/// `name@version/`) import. Only `import Base` and `.bend` files under
+/// `verified_dir` are allowed, so `rusty-bends.lock`, `bend --check-only`, and the
+/// emitted Rust all see the same code.
+pub fn check_import_paths(file: &Path, text: &str, verified_dir: &Path) -> Result<(), String> {
+    let root = fs::canonicalize(verified_dir).map_err(|e| {
+        format!(
+            "[E_NO_VERIFIED_DIR] Cannot resolve '{}': {e}",
+            verified_dir.display()
+        )
+    })?;
+    let base_dir = file.parent().unwrap_or(Path::new("."));
+    for (idx, raw) in text.lines().enumerate() {
+        if raw.starts_with([' ', '\t']) {
+            continue;
+        }
+        let code = emit::strip_comment(raw).trim();
+        let Some(rest) = code.strip_prefix("import") else {
+            continue;
+        };
+        if !rest.starts_with(char::is_whitespace) {
+            continue;
+        }
+        let target = rest.split_whitespace().next().unwrap_or("");
+        if target == "Base" {
+            continue;
+        }
+        let fail = |why: &str| {
+            Err(format!(
+                "[E_IMPORT_OUTSIDE_VERIFIED] {}:{}: 'import {target}' {why}.\nHint: copy the file into '{}' and import it by a path inside that directory.",
+                file.display(),
+                idx + 1,
+                verified_dir.display()
+            ))
+        };
+        if !target.ends_with(".bend") {
+            return fail("is not a .bend file under the verified directory");
+        }
+        let resolved = match fs::canonicalize(base_dir.join(target)) {
+            Ok(p) => p,
+            Err(_) => return fail("does not name an existing file"),
+        };
+        if !resolved.starts_with(&root) {
+            return fail("resolves outside the verified directory");
+        }
+    }
+    Ok(())
+}
+
+/// Records each top-level `def`, `type`, and `law` name of `file`, failing with
+/// `[E_NAME_COLLISION]` when another file already declared the same name. Bend gives
+/// every file its own namespace, but RustyBends emits one flat Rust module, so a
+/// repeated name would silently replace (or, for a law, erase) the other one. A law
+/// and its proof def share a name only within one file.
+fn record_top_level_names(
+    file: &Path,
+    text: &str,
+    seen: &mut std::collections::BTreeMap<String, (&'static str, PathBuf)>,
+) -> Result<(), String> {
+    let mut own: std::collections::BTreeMap<String, &'static str> =
+        std::collections::BTreeMap::new();
+    for raw in text.lines() {
+        if raw.starts_with([' ', '\t']) {
+            continue;
+        }
+        let code = emit::strip_comment(raw).trim();
+        let (kind, rest) = if let Some(r) = code.strip_prefix("def") {
+            ("def", r)
+        } else if let Some(r) = code.strip_prefix("type") {
+            ("type", r)
+        } else if let Some(r) = code.strip_prefix("law") {
+            ("law", r)
+        } else {
+            continue;
+        };
+        if !rest.starts_with(char::is_whitespace) {
+            continue;
+        }
+        let name = rest
+            .trim_start()
+            .split(|c: char| c == '(' || c == ':' || c == '<' || c == '?' || c.is_whitespace())
+            .next()
+            .unwrap_or("");
+        if !name.is_empty() {
+            own.entry(name.to_string()).or_insert(kind);
+        }
+    }
+    for (name, kind) in own {
+        if let Some((other_kind, other_file)) = seen.get(&name) {
+            return Err(format!(
+                "[E_NAME_COLLISION] '{name}' is declared in both {} ({other_kind}) and {} ({kind}).\nHint: RustyBends emits all of verified/ into one Rust module; rename one of them.",
+                other_file.display(),
+                file.display()
+            ));
+        }
+        seen.insert(name, (kind, file.to_path_buf()));
+    }
+    Ok(())
+}
+
 /// `cargo:rerun-if-changed` lines for `verified_dir`, each subdirectory under it
 /// (so added or removed files are noticed), and every collected `.bend` file.
 fn rerun_if_changed_lines(verified_dir: &Path, bend_files: &[PathBuf]) -> Vec<String> {
@@ -1258,6 +1369,79 @@ mod tests {
         assert!(verify_bend_version_str("0.2.38", "bend 0.2.38 (commit abc123)").is_ok());
         let err = verify_bend_version_str("0.2.38", "bend 0.3.0").unwrap_err();
         assert!(err.contains("E_BEND_VERSION_MISMATCH"));
+    }
+
+    #[test]
+    fn imports_that_leave_the_verified_directory_are_rejected() {
+        let root = temp_workspace("import_escape");
+        let rules = "import Base\n\ndef limit() -> Nat:\n  10n\n";
+        fs::write(root.join("verified/rules.bend"), rules).unwrap();
+        fs::write(root.join("fake_rules.bend"), rules.replace("10n", "99n")).unwrap();
+        fs::create_dir_all(root.join("verified/sub")).unwrap();
+        fs::write(
+            root.join("verified/sub/more.bend"),
+            rules.replace("limit", "more_limit"),
+        )
+        .unwrap();
+        let core = root.join("verified/core.bend");
+        let body = "\ndef within(n: Nat) -> Bool:\n  Nat.is_le(n, R.limit())\n";
+
+        // Inside verified/ (same directory or a subdirectory): accepted.
+        let ok = format!("import Base\nimport rules.bend as R\nimport sub/more.bend as M\n{body}");
+        fs::write(&core, &ok).unwrap();
+        check_import_paths(&core, &ok, &root.join("verified")).unwrap();
+
+        // Differential: the reference checker accepts the escaping import, which is why
+        // the gate must refuse it itself.
+        let escaping = format!("import Base\nimport ../fake_rules.bend as R\n{body}");
+        fs::write(&core, &escaping).unwrap();
+        let bend = resolve_bend_bin(
+            env::var("BEND_BIN").ok(),
+            env::var_os("PATH"),
+            env::var_os("HOME").map(PathBuf::from),
+        );
+        if let Ok(out) = Command::new(&bend).arg(&core).arg("--check-only").output() {
+            assert!(out.status.success(), "reference accepts ../ imports");
+        }
+        let cfg = make_cfg(&root);
+        let err = run_with_checker(&cfg, |_, _| Ok(())).unwrap_err();
+        assert!(err.contains("E_IMPORT_OUTSIDE_VERIFIED"), "{err}");
+        assert!(err.contains("../fake_rules.bend"), "{err}");
+
+        for bad in [
+            "import /etc/fake.bend as R",
+            "import 0xabcdef/lib.bend as R",
+            "import missing.bend as R",
+        ] {
+            let src = format!("import Base\n{bad}\n{body}");
+            let err = check_import_paths(&core, &src, &root.join("verified")).unwrap_err();
+            assert!(err.contains("E_IMPORT_OUTSIDE_VERIFIED"), "{bad}: {err}");
+        }
+        let _ = fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn names_declared_in_two_files_are_rejected() {
+        let root = temp_workspace("name_collision");
+        fs::write(
+            root.join("verified/a.bend"),
+            "import Base\n\ndef step(n: Nat) -> Nat:\n  Nat.add(n, 1n)\n",
+        )
+        .unwrap();
+        fs::write(
+            root.join("verified/b.bend"),
+            "import Base\n\ndef inc(n: Nat) -> Nat:\n  Nat.add(n, 1n)\n\n# promise: inc adds one\nlaw step:\n  for n: Nat\n  {inc(n) == Nat.add(n, 1n) : Nat}\n\ndef step(n):\n  {==}\n",
+        )
+        .unwrap();
+        let cfg = make_cfg(&root);
+        let err = run_with_checker(&cfg, |_, _| Ok(())).unwrap_err();
+        assert!(err.contains("E_NAME_COLLISION"), "{err}");
+        assert!(err.contains("'step'"), "{err}");
+
+        // A law and its proof def in one file share a name legitimately.
+        fs::remove_file(root.join("verified/a.bend")).unwrap();
+        run_with_checker(&cfg, |_, _| Ok(())).unwrap();
+        let _ = fs::remove_dir_all(&root);
     }
 
     #[test]

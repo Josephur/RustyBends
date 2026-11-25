@@ -1,8 +1,10 @@
 //! AST/token-aware anti-cheat law lock for RustyBends v1.
 //!
 //! Unlike naive line scanners, this module strips comments (# and --), tokenizes the full
-//! multi-line `law ...` declaration up to the next top-level item (`type`, `def`, `law`, `proof`),
-//! and hashes the canonical token stream.
+//! multi-line `law ...` declaration up to the next unindented code line outside any open
+//! bracket (Bend 2 layout, so binders named `proof` or string literals never cut a law
+//! short), and hashes the canonical token stream. The lock compares both the hash and
+//! the stored canonical signature, and duplicate law names fail with `E_LAW_DUPLICATE`.
 //!
 //! Guarantees:
 //! - Reformatting whitespace or adding comments inside a law NEVER triggers false lock failures.
@@ -35,11 +37,25 @@ pub struct LawDocs {
 }
 
 /// Extracts all `law` blocks across the provided `.bend` files in canonical token form.
+///
+/// Fails with `[E_LAW_DUPLICATE]` when two `law` declarations share a name (in one file
+/// or across files): the lock is keyed by law name, so a second copy would silently
+/// shadow the first.
 pub fn extract_canonical_laws(files: &[PathBuf]) -> Result<BTreeMap<String, CanonicalLaw>, String> {
     let mut map = BTreeMap::new();
+    let mut origin: BTreeMap<String, PathBuf> = BTreeMap::new();
     for file in files {
         let content = fs::read_to_string(file).map_err(|e| e.to_string())?;
         for law in extract_laws_from_source(&content) {
+            if let Some(first) = origin.get(&law.name) {
+                return Err(format!(
+                    "[E_LAW_DUPLICATE] Law '{}' is declared more than once ({} and {}).\nHint: give each law a unique name; rusty-bends.lock keys laws by name.",
+                    law.name,
+                    first.display(),
+                    file.display()
+                ));
+            }
+            origin.insert(law.name.clone(), file.clone());
             map.insert(law.name.clone(), law);
         }
     }
@@ -63,19 +79,15 @@ pub fn extract_laws_from_source(source: &str) -> Vec<CanonicalLaw> {
     let aliases: BTreeSet<String> = crate::emit::parse_import_aliases(source)
         .into_iter()
         .collect();
-    let tokens = tokenize_bend(source);
     let mut laws = Vec::new();
-    let mut i = 0usize;
-
-    while i < tokens.len() {
-        if tokens[i] == "law" && i + 1 < tokens.len() {
-            let name = tokens[i + 1].clone();
-            let start = i;
-            i += 2;
-            while i < tokens.len() && !is_top_level_keyword(&tokens[i]) {
-                i += 1;
-            }
-            let canonical_sig = tokens[start..i]
+    for block in top_level_law_blocks(source) {
+        let tokens = tokenize_bend(&block);
+        if tokens.len() < 2 || tokens[0] != "law" {
+            continue;
+        }
+        {
+            let name = tokens[1].clone();
+            let canonical_sig = tokens
                 .iter()
                 .map(|tok| normalize_alias_token(tok, &aliases))
                 .collect::<Vec<_>>()
@@ -94,12 +106,55 @@ pub fn extract_laws_from_source(source: &str) -> Vec<CanonicalLaw> {
                 harm,
                 unchecked,
             });
-            continue;
         }
-        i += 1;
     }
 
     laws
+}
+
+fn bracket_delta(tokens: &[String]) -> i32 {
+    tokens
+        .iter()
+        .map(|t| match t.as_str() {
+            "(" | "[" | "{" => 1,
+            ")" | "]" | "}" => -1,
+            _ => 0,
+        })
+        .sum()
+}
+
+/// Source text of every top-level `law` declaration: from an unindented `law <name>`
+/// line up to (not including) the next unindented code line outside any open bracket.
+/// Layout decides where a law ends, so binders or parameters named `proof`, `law`,
+/// `def`, ... never cut a law short or start a phantom one.
+fn top_level_law_blocks(source: &str) -> Vec<String> {
+    let lines: Vec<&str> = source.lines().collect();
+    let mut blocks = Vec::new();
+    let mut idx = 0usize;
+    while idx < lines.len() {
+        let raw = lines[idx];
+        let starts_law = !raw.starts_with([' ', '\t']) && {
+            let toks = tokenize_bend(raw);
+            toks.first().is_some_and(|t| t == "law") && toks.len() >= 2
+        };
+        if !starts_law {
+            idx += 1;
+            continue;
+        }
+        let mut depth = bracket_delta(&tokenize_bend(raw));
+        let mut end = idx + 1;
+        while end < lines.len() {
+            let toks = tokenize_bend(lines[end]);
+            if depth <= 0 && !toks.is_empty() && !lines[end].starts_with([' ', '\t']) {
+                break;
+            }
+            depth += bracket_delta(&toks);
+            end += 1;
+        }
+        blocks.push(lines[idx..end].join("\n"));
+        idx = end;
+    }
+    blocks
 }
 
 fn normalize_doc_ws(raw: &str) -> String {
@@ -389,6 +444,15 @@ fn parse_existing_lock(expected_raw: &str) -> (BTreeMap<String, CanonicalLaw>, V
     (entries, malformed)
 }
 
+/// A locked entry matches the current law only when both the hash and the stored
+/// canonical token signature agree: the 64-bit FNV-1a hash alone is not collision
+/// resistant, while the signature is the law itself. Entries written without a
+/// signature fall back to the hash.
+fn lock_entry_matches(locked: &CanonicalLaw, current: &CanonicalLaw) -> bool {
+    locked.hash == current.hash
+        && (locked.canonical_sig.is_empty() || locked.canonical_sig == current.canonical_sig)
+}
+
 fn diff_comment_fields(old: &CanonicalLaw, new: &CanonicalLaw) -> Vec<String> {
     let mut changed = Vec::new();
     if old.promise != new.promise {
@@ -490,7 +554,7 @@ pub fn check_law_lock_with_mode(
                             "[E_LAW_LOCK_TAMPERED] Locked law '{law_name}' was deleted.\nHint: Restore 'law {law_name}' in verified/, or approve intentionally with RUSTY_BENDS_UPDATE_LAWS={law_name} cargo check (or RUSTY_BENDS_UPDATE_LAWS=1)."
                         ));
                     }
-                    Some(actual) if actual.hash != old_entry.hash => {
+                    Some(actual) if !lock_entry_matches(old_entry, actual) => {
                         return Err(format!(
                             "[E_LAW_LOCK_TAMPERED] Locked law '{law_name}' was modified (expected {}, got {}).\nHint: Restore the original law statement, or approve intentionally with RUSTY_BENDS_UPDATE_LAWS={law_name} cargo check (or RUSTY_BENDS_UPDATE_LAWS=1).",
                             old_entry.hash, actual.hash
@@ -502,7 +566,10 @@ pub fn check_law_lock_with_mode(
         }
 
         for (name, law) in &current {
-            if existing.get(name).is_some_and(|e| e.hash == law.hash) {
+            if existing
+                .get(name)
+                .is_some_and(|e| lock_entry_matches(e, law))
+            {
                 locked_names.insert(name.clone());
             } else {
                 new_names.insert(name.clone());
@@ -523,7 +590,7 @@ pub fn check_law_lock_with_mode(
                 for (name, cur) in &current {
                     match existing.get(name) {
                         None => update_summary.sealed.push(name.clone()),
-                        Some(old) if old.hash != cur.hash => {
+                        Some(old) if !lock_entry_matches(old, cur) => {
                             update_summary.reaccepted.push((
                                 name.clone(),
                                 old.hash.clone(),
@@ -566,7 +633,7 @@ pub fn check_law_lock_with_mode(
                             update_summary.sealed.push(target.clone());
                         }
                         (Some(old), Some(cur)) => {
-                            if old.hash != cur.hash {
+                            if !lock_entry_matches(old, cur) {
                                 update_summary.reaccepted.push((
                                     target.clone(),
                                     old.hash.clone(),
@@ -717,10 +784,6 @@ pub fn read_locked_law_names(lock_file: &Path) -> BTreeSet<String> {
     names
 }
 
-fn is_top_level_keyword(tok: &str) -> bool {
-    matches!(tok, "import" | "type" | "def" | "law" | "proof")
-}
-
 /// Strips '#' and '--' comments and splits Bend source into canonical lexical tokens.
 pub fn tokenize_bend(source: &str) -> Vec<String> {
     let mut tokens = Vec::new();
@@ -738,6 +801,23 @@ pub fn tokenize_bend(source: &str) -> Vec<String> {
             while i < chars.len() && chars[i] != '\n' {
                 i += 1;
             }
+            continue;
+        }
+
+        // String literals are one token, so '#' or spaces inside them stay part of the law.
+        if ch == '"' {
+            let start = i;
+            i += 1;
+            while i < chars.len() && chars[i] != '"' && chars[i] != '\n' {
+                if chars[i] == '\\' && i + 1 < chars.len() {
+                    i += 1;
+                }
+                i += 1;
+            }
+            if i < chars.len() && chars[i] == '"' {
+                i += 1;
+            }
+            tokens.push(chars[start..i].iter().collect());
             continue;
         }
 
@@ -1247,6 +1327,117 @@ law total_covers_second:
         assert!(!r_del.serialized.contains("bump_changes"));
         assert!(!r_del.serialized.contains("bump_not_lower"));
 
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    const PROOF_BINDER_SRC: &str = r#"import Base
+
+def under_ten(x: Nat) -> Bool:
+  Nat.is_le(x, 10n)
+
+def motto() -> String:
+  "law first: obey the proofs"
+
+# promise: under_ten holds whenever its hypothesis holds
+law under_ten_holds:
+  for +x: Nat
+  for proof: {Nat.is_le(x, 10n) == True{} : Bool}
+  {under_ten(x) == True{} : Bool}
+
+def under_ten_holds(x, proof):
+  proof
+"#;
+
+    #[test]
+    fn proof_binder_does_not_truncate_and_strings_do_not_invent_laws() {
+        let laws = extract_laws_from_source(PROOF_BINDER_SRC);
+        assert_eq!(laws.len(), 1, "no phantom law from the string literal");
+        let sig = &laws[0].canonical_sig;
+        assert!(sig.contains("for proof :"), "{sig}");
+        assert!(
+            sig.ends_with("{ under_ten ( x ) == True { } : Bool }"),
+            "{sig}"
+        );
+
+        // Differential: the reference checker accepts both names as binders.
+        let dir = tmp_dir("proof_binder");
+        let file = dir.join("core.bend");
+        fs::write(&file, PROOF_BINDER_SRC).unwrap();
+        let bend = crate::resolve_bend_bin(
+            std::env::var("BEND_BIN").ok(),
+            std::env::var_os("PATH"),
+            std::env::var_os("HOME").map(PathBuf::from),
+        );
+        if let Ok(out) = std::process::Command::new(&bend)
+            .arg(&file)
+            .arg("--check-only")
+            .output()
+        {
+            assert!(
+                out.status.success(),
+                "bend --check-only: {}{}",
+                String::from_utf8_lossy(&out.stdout),
+                String::from_utf8_lossy(&out.stderr)
+            );
+        }
+
+        // Weakening the hypothesis or the goal is caught.
+        let lock = dir.join("rusty-bends.lock");
+        enforce_law_lock(&lock, std::slice::from_ref(&file), false).unwrap();
+        for edit in [
+            PROOF_BINDER_SRC.replace("Nat.is_le(x, 10n) == True{}", "Nat.is_le(x, 99n) == True{}"),
+            PROOF_BINDER_SRC.replace(
+                "{under_ten(x) == True{} : Bool}",
+                "{True{} == True{} : Bool}",
+            ),
+        ] {
+            fs::write(&file, &edit).unwrap();
+            let err = enforce_law_lock(&lock, std::slice::from_ref(&file), false).unwrap_err();
+            assert!(err.contains("E_LAW_LOCK_TAMPERED"), "{err}");
+        }
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn string_literals_are_single_tokens_in_the_law_lock() {
+        let src = "law greets:\n  {greet(\"# not a comment\") == \"hi  there\" : String}\n";
+        let laws = extract_laws_from_source(src);
+        assert_eq!(
+            laws[0].canonical_sig,
+            "law greets : { greet ( \"# not a comment\" ) == \"hi  there\" : String }"
+        );
+        let edited = src.replace("# not a comment", "# changed");
+        assert_ne!(extract_laws_from_source(&edited)[0].hash, laws[0].hash);
+    }
+
+    #[test]
+    fn lock_compares_the_canonical_signature_not_only_the_hash() {
+        let dir = tmp_dir("sig_compare");
+        let file = dir.join("core.bend");
+        let lock = dir.join("rusty-bends.lock");
+        let src = "# promise: p\nlaw keeps:\n  for n: Nat\n  {keep(n) == n : Nat}\n";
+        fs::write(&file, src).unwrap();
+        enforce_law_lock(&lock, std::slice::from_ref(&file), false).unwrap();
+        // Simulate a hash collision: same hash, different locked statement.
+        let raw = fs::read_to_string(&lock).unwrap();
+        let forged = raw.replace("keep ( n ) == n", "keep ( n ) == 0n");
+        assert_ne!(raw, forged);
+        fs::write(&lock, forged).unwrap();
+        let err = enforce_law_lock(&lock, std::slice::from_ref(&file), false).unwrap_err();
+        assert!(err.contains("E_LAW_LOCK_TAMPERED"), "{err}");
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn duplicate_law_names_across_files_are_rejected() {
+        let dir = tmp_dir("dup_laws");
+        let a = dir.join("a.bend");
+        let b = dir.join("b.bend");
+        fs::write(&a, "# promise: p\nlaw same:\n  {f(0n) == 0n : Nat}\n").unwrap();
+        fs::write(&b, "# promise: q\nlaw same:\n  {g(0n) == 0n : Nat}\n").unwrap();
+        let err = extract_canonical_laws(&[a, b]).unwrap_err();
+        assert!(err.contains("E_LAW_DUPLICATE"), "{err}");
+        assert!(err.contains("'same'"), "{err}");
         let _ = fs::remove_dir_all(&dir);
     }
 }

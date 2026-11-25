@@ -55,7 +55,7 @@ pub fn parse_laws(source: &str) -> Vec<ParsedLaw> {
 
     while i < lines.len() {
         let stripped = strip_comment(lines[i]).trim();
-        if stripped.starts_with("law ") {
+        if stripped.starts_with("law ") && !lines[i].starts_with([' ', '\t']) {
             let mut block_parts = vec![stripped.to_string()];
             i += 1;
             while i < lines.len() {
