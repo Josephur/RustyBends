@@ -6900,6 +6900,12 @@ fn emit_expr_with_ctx(expr: &str, ctx: &EmitCtx<'_>, mode: ArithMode) -> Result<
 
     // Right-to-left top-level '+' or '-' (checked add / saturating sub for Nat; wrapping for U32/U64/I32/I64)
     if let Some((op, lhs, rhs)) = split_last_additive(s) {
+        // `1n+x` (no spaces) is Bend's Nat successor sugar: Nat whatever the context.
+        let mode = if op == '+' && is_nat_successor(s, lhs) {
+            ArithMode::NatChecked
+        } else {
+            mode
+        };
         let l = emit_expr_with_ctx(lhs, ctx, mode)?;
         let r = emit_expr_with_ctx(rhs, ctx, mode)?;
         return Ok(match (mode, op) {
@@ -6962,7 +6968,10 @@ fn emit_expr_with_ctx(expr: &str, ctx: &EmitCtx<'_>, mode: ArithMode) -> Result<
                 } else {
                     trimmed
                 };
-                let emitted = emit_expr_with_ctx(val, ctx, mode)?;
+                let field_mode = info_opt
+                    .and_then(|i| i.field_types.get(idx))
+                    .map_or(mode, |ty| arith_mode_for_type(ty, mode));
+                let emitted = emit_expr_with_ctx(val, ctx, field_mode)?;
                 let is_boxed = info_opt
                     .and_then(|i| i.boxed_fields.get(idx).copied())
                     .unwrap_or(false);
@@ -6995,7 +7004,11 @@ fn emit_expr_with_ctx(expr: &str, ctx: &EmitCtx<'_>, mode: ArithMode) -> Result<
             if let Some(info) = ctors.get(callee) {
                 let mut emitted_args = Vec::with_capacity(raw_args.len());
                 for (idx, a) in raw_args.iter().enumerate() {
-                    let emitted = emit_expr_with_ctx(a, ctx, mode)?;
+                    let field_mode = info
+                        .field_types
+                        .get(idx)
+                        .map_or(mode, |ty| arith_mode_for_type(ty, mode));
+                    let emitted = emit_expr_with_ctx(a, ctx, field_mode)?;
                     let is_boxed = info.boxed_fields.get(idx).copied().unwrap_or(false);
                     if is_boxed {
                         emitted_args.push(format!("Box::new({emitted})"));
@@ -7014,14 +7027,17 @@ fn emit_expr_with_ctx(expr: &str, ctx: &EmitCtx<'_>, mode: ArithMode) -> Result<
             let mut emitted_args = Vec::new();
             let target_def = defs.get(callee);
             for (idx, arg) in raw_args.iter().enumerate() {
+                let mut arg_mode = mode;
                 if let Some(def) = target_def {
                     if let Some(param) = def.params.get(idx) {
                         if param.q == Quantity::Dead {
                             continue;
                         }
+                        // Arguments take the callee's parameter type, not the caller's.
+                        arg_mode = arith_mode_for_type(&param.ty, mode);
                     }
                 }
-                emitted_args.push(emit_expr_with_ctx(arg, ctx, mode)?);
+                emitted_args.push(emit_expr_with_ctx(arg, ctx, arg_mode)?);
             }
             if let Some(def) = target_def {
                 if ctx.total && ctx.total_cone.contains(callee) {
@@ -7457,6 +7473,19 @@ pub(crate) fn split_top_level_once(s: &str, delim: char) -> Option<(&str, &str)>
         }
     }
     None
+}
+
+/// True when `s` is `lhs+rhs` written as Bend's Nat successor sugar: `lhs` ends in a
+/// Nat literal (`1n`, `1n+1n`) and the `+` touches both operands. Bend requires spaces and
+/// a type annotation around a real infix `+`, so this form is never fixed-width.
+fn is_nat_successor(s: &str, lhs: &str) -> bool {
+    let lb = lhs.as_bytes();
+    let n = lb.len();
+    let ends_in_nat_lit = n >= 2 && lb[n - 1] == b'n' && lb[n - 2].is_ascii_digit();
+    let tight = s
+        .get(lhs.len()..)
+        .is_some_and(|rest| rest.starts_with('+') && !rest[1..].starts_with(char::is_whitespace));
+    ends_in_nat_lit && tight && !s.starts_with(char::is_whitespace)
 }
 
 pub(crate) fn split_last_additive(s: &str) -> Option<(char, &str, &str)> {
@@ -8575,6 +8604,58 @@ law quot_by_zero_is_zero:
 def quot_by_zero_is_zero():
   {==}
 "#;
+
+    const SUCC_IN_U32_SRC: &str = r#"import Base
+
+def take_nat(x: Nat) -> U32:
+  match x:
+    case 0n: 0
+    case 1n+_: 1
+
+def check_succ(n: Nat) -> U32:
+  take_nat(1n+n)
+
+def wrap_sum(a: U32, b: U32) -> U32:
+  (a + b : U32)
+
+def nat_sum_small(a: Nat, b: Nat) -> Bool:
+  Nat.is_le((a + b : Nat), 10n)
+
+# promise: the successor of any Nat is not zero
+law succ_not_zero:
+  for n: Nat
+  {check_succ(n) == 1 : U32}
+
+def succ_not_zero(n):
+  {==}
+"#;
+
+    #[test]
+    fn nat_successor_stays_checked_inside_fixed_width_functions() {
+        if let Some((ok, text)) = reference_check_only("succ_u32", SUCC_IN_U32_SRC) {
+            assert!(ok, "reference bend must accept the fixture:\n{text}");
+        }
+        let summary = emit_verified_rust(SUCC_IN_U32_SRC, 1).unwrap();
+        let src = &summary.rust_source;
+        assert!(
+            src.contains("take_nat((1_u64).checked_add(n).expect(\"rusty-bends: Nat overflow\"))"),
+            "{src}"
+        );
+        assert!(!src.contains("(1_u64).wrapping_add"), "{src}");
+        assert!(src.contains("(a).wrapping_add(b)"), "{src}");
+        assert!(src.contains("(a).checked_add(b).expect("), "{src}");
+        assert!(summary
+            .panic_sites
+            .iter()
+            .any(|p| p.function == "check_succ" && p.op == "Nat.add"));
+        let runtime_only = src.split("#[cfg(test)]").next().unwrap();
+        let harness = format!(
+            "{runtime_only}\nfn main() {{\n    assert_eq!(check_succ(5), 1);\n    assert!(std::panic::catch_unwind(|| check_succ(u64::MAX)).is_err());\n    assert_eq!(wrap_sum(u32::MAX, 1), 0);\n    assert!(nat_sum_small(4, 6));\n}}\n"
+        );
+        compile_and_run("succ_u32", &harness, &["-A", "dead_code"]);
+        let out = compile_and_run("succ_u32_laws", src, &["--test", "-A", "dead_code"]);
+        assert!(out.contains("law_succ_not_zero ... ok"), "{out}");
+    }
 
     #[test]
     fn u32_remainder_by_zero_matches_reference_semantics() {
