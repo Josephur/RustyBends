@@ -9,6 +9,7 @@
 //!     rusty_bends_build::verify_and_emit("verified");
 //! }
 
+pub mod coverage;
 pub mod emit;
 pub mod law_test;
 pub mod lock;
@@ -61,6 +62,12 @@ pub struct Config {
     /// `RUSTY_BENDS_LIST_PANICS=1`: print every checked-growth panic site as
     /// `function: op at file:line` (Issue #13).
     pub list_panics: bool,
+    /// `RUSTY_BENDS_LIST_COVERAGE=1`: print which emitted functions each law covers,
+    /// which emitted functions no law reaches, and which laws name only uncalled functions.
+    pub list_coverage: bool,
+    /// Optional crate root (`CARGO_MANIFEST_DIR`) scanned under `list_coverage` for `src/`,
+    /// `tests/`, and `benches/` call-site checks.
+    pub crate_root: Option<PathBuf>,
     /// `RUSTY_BENDS_NO_CACHE=1`: bypass the incremental build cache in `OUT_DIR`
     /// and re-run verification and code generation.
     pub no_cache: bool,
@@ -86,7 +93,9 @@ impl Default for Config {
         };
         let list_laws = env_flag("RUSTY_BENDS_LIST_LAWS");
         let list_panics = env_flag("RUSTY_BENDS_LIST_PANICS");
+        let list_coverage = env_flag("RUSTY_BENDS_LIST_COVERAGE");
         let no_cache = env_flag("RUSTY_BENDS_NO_CACHE");
+        let crate_root = env::var_os("CARGO_MANIFEST_DIR").map(PathBuf::from);
         let lock_update = env::var("RUSTY_BENDS_UPDATE_LAWS")
             .map(|v| LockUpdateMode::parse(&v))
             .unwrap_or(LockUpdateMode::None);
@@ -113,6 +122,8 @@ impl Default for Config {
             mutate_mode,
             list_laws,
             list_panics,
+            list_coverage,
+            crate_root,
             no_cache,
         }
     }
@@ -205,6 +216,7 @@ pub fn run(cfg: &Config) -> Result<Option<PathBuf>, String> {
     println!("cargo:rerun-if-env-changed=RUSTY_BENDS_MUTATE");
     println!("cargo:rerun-if-env-changed=RUSTY_BENDS_LIST_LAWS");
     println!("cargo:rerun-if-env-changed=RUSTY_BENDS_LIST_PANICS");
+    println!("cargo:rerun-if-env-changed=RUSTY_BENDS_LIST_COVERAGE");
     println!("cargo:rerun-if-env-changed=RUSTY_BENDS_NO_CACHE");
     println!("cargo:rerun-if-env-changed=BEND_BIN");
     println!("cargo:rerun-if-env-changed=BEND_PIN_VERSION");
@@ -449,6 +461,7 @@ where
         && lock_report.new_names.is_empty()
         && cfg.mutate_mode == MutateMode::NewOnly
         && !cfg.list_panics
+        && !cfg.list_coverage
     {
         return Ok(if cfg.emit_rust {
             Some(verified_rs)
@@ -550,6 +563,12 @@ where
             .map(|(f, t)| (f.as_path(), t.as_str()))
             .collect();
         for line in format_panic_sites(&summary.panic_sites, &files) {
+            println!("cargo:warning={line}");
+        }
+    }
+    if cfg.list_coverage {
+        let cov = coverage::analyze_coverage(&combined_source, cfg.crate_root.as_deref())?;
+        for line in coverage::format_coverage_report(&cov) {
             println!("cargo:warning={line}");
         }
     }
@@ -853,6 +872,8 @@ mod tests {
             mutate_mode: MutateMode::NewOnly,
             list_laws: false,
             list_panics: false,
+            list_coverage: false,
+            crate_root: Some(root.to_path_buf()),
             no_cache: false,
         }
     }
@@ -1946,6 +1967,58 @@ def bump_changes(m):
         assert!(lock_after.contains("inc_zero"));
         assert!(lock_after.contains("inc_one"));
         assert!(!lock_after.contains("inc_two"));
+
+        let _ = fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn list_coverage_runs_through_pipeline_and_bypasses_warm_cache() {
+        let root = temp_workspace("issue21_pipeline");
+        fs::create_dir_all(root.join("src")).unwrap();
+        fs::write(
+            root.join("verified/ledger.bend"),
+            r#"import Base
+
+def order_fits(+used: Nat, +want: Nat, +cap: Nat) -> Bool:
+  Nat.is_le(want, Nat.sub(cap, used))
+
+def order_fits_spec(+used: Nat, +want: Nat, +cap: Nat) -> Bool:
+  Nat.is_le(Nat.add(used, want), cap)
+
+def round_up(+x: Nat, +step: Nat) -> Nat:
+  Nat.mul(Nat.div(Nat.add(x, Nat.sub(step, 1n)), step), step)
+
+# promise: an empty order always fits
+law order_fits_empty:
+  for +cap: Nat
+  {order_fits_spec(0n, 0n, cap) == True{} : Bool}
+"#,
+        )
+        .unwrap();
+        fs::write(
+            root.join("src/main.rs"),
+            "fn main() { let _ = (verified::order_fits(3, 4, 10), verified::round_up(5, 4)); }\n",
+        )
+        .unwrap();
+
+        let cfg = make_cfg(&root);
+        let mut calls = 0usize;
+        run_with_checker(&cfg, |_, _| {
+            calls += 1;
+            Ok(())
+        })
+        .unwrap();
+        assert_eq!(calls, 1);
+
+        // With list_coverage = true, the build bypasses warm cache and runs coverage listing.
+        let mut cov_cfg = make_cfg(&root);
+        cov_cfg.list_coverage = true;
+        run_with_checker(&cov_cfg, |_, _| {
+            calls += 1;
+            Ok(())
+        })
+        .unwrap();
+        assert_eq!(calls, 2);
 
         let _ = fs::remove_dir_all(&root);
     }

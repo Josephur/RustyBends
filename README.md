@@ -135,13 +135,14 @@ Import it in any file under `verified/` with `import nat_lemmas.bend as L`. Ever
 | `RUSTY_BENDS_MUTATE` | `all`: evaluates both new and locked laws and prints one caught/survived summary line per law (plus any dropped-mutant counts). `report`: evaluates every generated mutant of every law (new and locked), prints per-mutant `caught`/`survived` lines, and writes `OUT_DIR/rusty-bends-mutants.txt`. |
 | `RUSTY_BENDS_LIST_LAWS` | `1`: prints each law as `name: promise` during builds so reviewers can read plain-English guarantees without reading Bend 2 syntax (also available via `cargo run -p rusty-bends-build --bin rusty-bends-laws -- [dir]`). Laws with an `# unchecked:` marker show `[unchecked: <why>]`. |
 | `RUSTY_BENDS_LIST_PANICS` | `1`: prints every checked-growth `Nat` panic site in the emitted Rust as `RustyBends panic [function]: op at file:line`, plus a total. |
+| `RUSTY_BENDS_LIST_COVERAGE` | `1`: prints each emitted function's direct and transitive law coverage, functions reached by no law, and laws naming only functions never mentioned in `src/`/`tests/`/`benches/` (also via `rusty-bends-laws --coverage [dir]`). |
 | `RUSTY_BENDS_NO_CACHE` | `1`: bypasses the incremental `OUT_DIR/rusty-bends.cache` check for that build (the cache is also keyed by verdict status, CLI flags, and Bend binary/version). |
 
 ## Repository layout
 
 | Path | What |
 |---|---|
-| `rusty-bends-build/` | The build crate: proof gate (`lib.rs`), law lock & `# promise:` parser (`lock.rs`), Rust emitter (`emit.rs`), per-law test & counterexample evaluator (`law_test.rs`), mutation checker (`mutate.rs`), bundled `Nat` lemma library (`lemmas/nat_lemmas.bend`), and CLI lister (`src/bin/rusty-bends-laws.rs`). |
+| `rusty-bends-build/` | The build crate: proof gate (`lib.rs`), law lock & `# promise:` parser (`lock.rs`), Rust emitter (`emit.rs`), per-law test & counterexample evaluator (`law_test.rs`), mutation checker (`mutate.rs`), coverage analyzer (`coverage.rs`), bundled `Nat` lemma library (`lemmas/nat_lemmas.bend`), and CLI lister (`src/bin/rusty-bends-laws.rs`). |
 | `example-app/` | A minimal crate using it. |
 | `BEND_GUIDE.md` | Bend 2 + RustyBends coding guide. |
 | `src/`, `index.html`, `package.json` | **BendTT Kernel Workbench**, a browser tool (React + Vite) to parse Bend, inspect the AST and quantity erasure, trace proofs, suggest laws and preview the emitted Rust. Run it with `npm install && npm run dev`. It is an exploration aid; the build crate is the authority. |
