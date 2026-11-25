@@ -355,6 +355,18 @@ fn sanitize_cache_field(s: &str) -> String {
     s.replace(['\r', '\n'], " ").trim().to_string()
 }
 
+fn format_cargo_warning_lines(msg: &str) -> Vec<String> {
+    msg.lines()
+        .map(|line| format!("cargo:warning={line}"))
+        .collect()
+}
+
+fn emit_cargo_warning(msg: &str) {
+    for line in format_cargo_warning_lines(msg) {
+        println!("{line}");
+    }
+}
+
 fn format_cache_stamp(
     cfg: &Config,
     files_hash: &str,
@@ -428,16 +440,14 @@ where
     let law_count = lock_report.current.len();
 
     for w in &lock_report.warnings {
-        println!("cargo:warning={w}");
+        emit_cargo_warning(w);
     }
     if effective_lock_mode != LockUpdateMode::None && !lock_report.needs_write {
-        println!("cargo:warning=RustyBends lock: no lock changes to write");
+        emit_cargo_warning("RustyBends lock: no lock changes to write");
     }
     if cfg.list_laws {
         let listing = lock::format_law_list(&lock_report.current);
-        for line in listing.lines() {
-            println!("cargo:warning={line}");
-        }
+        emit_cargo_warning(&listing);
     }
 
     // 2. Check incremental build cache (includes file contents, verdict mode/status, flags, and bend version)
@@ -540,14 +550,14 @@ where
         &cfg.out_dir,
     )?;
     for w in &mut_summary.warnings {
-        println!("cargo:warning={w}");
+        emit_cargo_warning(w);
     }
 
     // 5. Persist rusty-bends.lock only after Bend proofs and mutation checks succeed
     if lock_report.needs_write {
         lock::write_law_lock(&cfg.lock_file, &lock_report)?;
         for note in lock::format_lock_update_notes(&lock_report.update_summary) {
-            println!("cargo:warning={note}");
+            emit_cargo_warning(&note);
         }
     }
 
@@ -563,13 +573,13 @@ where
             .map(|(f, t)| (f.as_path(), t.as_str()))
             .collect();
         for line in format_panic_sites(&summary.panic_sites, &files) {
-            println!("cargo:warning={line}");
+            emit_cargo_warning(&line);
         }
     }
     if cfg.list_coverage {
         let cov = coverage::analyze_coverage(&combined_source, cfg.crate_root.as_deref())?;
         for line in coverage::format_coverage_report(&cov) {
-            println!("cargo:warning={line}");
+            emit_cargo_warning(&line);
         }
     }
     let emitted_path = match summary {
@@ -2021,5 +2031,23 @@ law order_fits_empty:
         assert_eq!(calls, 2);
 
         let _ = fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn multiline_warning_formats_one_cargo_warning_per_line() {
+        let lines = format_cargo_warning_lines(
+            "[E_MUTANT_BUILD] Law 'foo': 1 of 2 mutants did not compile\nFirst failing mutant: f: x -> Y\nrustc: error[E0308]: mismatched types",
+        );
+        assert_eq!(
+            lines,
+            vec![
+                "cargo:warning=[E_MUTANT_BUILD] Law 'foo': 1 of 2 mutants did not compile",
+                "cargo:warning=First failing mutant: f: x -> Y",
+                "cargo:warning=rustc: error[E0308]: mismatched types",
+            ]
+        );
+        for line in &lines {
+            assert!(!line.contains('\n'));
+        }
     }
 }

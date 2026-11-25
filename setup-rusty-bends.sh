@@ -381,6 +381,18 @@ fn sanitize_cache_field(s: &str) -> String {
     s.replace(['\r', '\n'], " ").trim().to_string()
 }
 
+fn format_cargo_warning_lines(msg: &str) -> Vec<String> {
+    msg.lines()
+        .map(|line| format!("cargo:warning={line}"))
+        .collect()
+}
+
+fn emit_cargo_warning(msg: &str) {
+    for line in format_cargo_warning_lines(msg) {
+        println!("{line}");
+    }
+}
+
 fn format_cache_stamp(
     cfg: &Config,
     files_hash: &str,
@@ -454,16 +466,14 @@ where
     let law_count = lock_report.current.len();
 
     for w in &lock_report.warnings {
-        println!("cargo:warning={w}");
+        emit_cargo_warning(w);
     }
     if effective_lock_mode != LockUpdateMode::None && !lock_report.needs_write {
-        println!("cargo:warning=RustyBends lock: no lock changes to write");
+        emit_cargo_warning("RustyBends lock: no lock changes to write");
     }
     if cfg.list_laws {
         let listing = lock::format_law_list(&lock_report.current);
-        for line in listing.lines() {
-            println!("cargo:warning={line}");
-        }
+        emit_cargo_warning(&listing);
     }
 
     // 2. Check incremental build cache (includes file contents, verdict mode/status, flags, and bend version)
@@ -566,14 +576,14 @@ where
         &cfg.out_dir,
     )?;
     for w in &mut_summary.warnings {
-        println!("cargo:warning={w}");
+        emit_cargo_warning(w);
     }
 
     // 5. Persist rusty-bends.lock only after Bend proofs and mutation checks succeed
     if lock_report.needs_write {
         lock::write_law_lock(&cfg.lock_file, &lock_report)?;
         for note in lock::format_lock_update_notes(&lock_report.update_summary) {
-            println!("cargo:warning={note}");
+            emit_cargo_warning(&note);
         }
     }
 
@@ -589,13 +599,13 @@ where
             .map(|(f, t)| (f.as_path(), t.as_str()))
             .collect();
         for line in format_panic_sites(&summary.panic_sites, &files) {
-            println!("cargo:warning={line}");
+            emit_cargo_warning(&line);
         }
     }
     if cfg.list_coverage {
         let cov = coverage::analyze_coverage(&combined_source, cfg.crate_root.as_deref())?;
         for line in coverage::format_coverage_report(&cov) {
-            println!("cargo:warning={line}");
+            emit_cargo_warning(&line);
         }
     }
     let emitted_path = match summary {
@@ -2047,6 +2057,24 @@ law order_fits_empty:
         assert_eq!(calls, 2);
 
         let _ = fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn multiline_warning_formats_one_cargo_warning_per_line() {
+        let lines = format_cargo_warning_lines(
+            "[E_MUTANT_BUILD] Law 'foo': 1 of 2 mutants did not compile\nFirst failing mutant: f: x -> Y\nrustc: error[E0308]: mismatched types",
+        );
+        assert_eq!(
+            lines,
+            vec![
+                "cargo:warning=[E_MUTANT_BUILD] Law 'foo': 1 of 2 mutants did not compile",
+                "cargo:warning=First failing mutant: f: x -> Y",
+                "cargo:warning=rustc: error[E0308]: mismatched types",
+            ]
+        );
+        for line in &lines {
+            assert!(!line.contains('\n'));
+        }
     }
 }
 RUSTY_BENDS_EOF
@@ -9453,7 +9481,7 @@ const MAX_ADD_MAX_MIN_MUTANTS_PER_LAW: usize = 32;
 /// At most this many `Nat` literal sites per function are mutated by `NatLit`.
 const MAX_NAT_LIT_SITES_PER_DEF: usize = 8;
 /// Version tag baked into mutation cone hashes so cache keys invalidate when mutators change.
-const MUTATE_CACHE_VERSION: &str = "v3";
+const MUTATE_CACHE_VERSION: &str = "v4";
 /// Maximum mutants packed into one compiled multi-law harness binary.
 const BATCH_MAX_MUTANTS: usize = 160;
 /// Maximum distinct laws packed into one compiled multi-law harness binary.
@@ -9574,6 +9602,12 @@ fn format_dropped_suffix(
         parts.push(format!("{dropped_by_site_cap} dropped by site cap"));
     }
     format!(" [evaluated {evaluated}/{generated}: {}]", parts.join(", "))
+}
+
+fn emit_law_build_warnings(law_name: &str, build_err: &str, warnings: &mut Vec<String>) {
+    for line in build_err.lines() {
+        warnings.push(format!("RustyBends mutate [{law_name}]: {line}"));
+    }
 }
 
 /// Runs mutation checks according to `mode`:
@@ -9875,10 +9909,7 @@ pub fn run_mutation_checks(
         let is_locked = prepared[idx].is_locked;
         if let Some(ref build_err) = build_errors[idx] {
             if is_locked {
-                warnings.push(format!(
-                    "RustyBends mutate [{}]: {build_err}",
-                    report.law_name
-                ));
+                emit_law_build_warnings(&report.law_name, build_err, &mut warnings);
                 continue;
             }
             return Err(build_err.clone());
@@ -11007,31 +11038,338 @@ fn mutate_sibling_ctor(
     out
 }
 
-/// Byte spans of candidate returned expressions in `body`: every whole (trimmed) line, and the
-/// inline body of each `case <pat>: <expr>` arm. Callers filter by shape (variable, call).
-fn return_leaf_spans(body: &str) -> Vec<(usize, usize)> {
-    let mut spans = Vec::new();
-    let mut offset = 0usize;
-    for raw_line in body.split_inclusive('\n') {
-        let line = raw_line.strip_suffix('\n').unwrap_or(raw_line);
-        let trimmed = line.trim();
-        if !trimmed.is_empty() {
-            let ws = line.len() - line.trim_start().len();
-            if let Some(after_case) = line.trim_start().strip_prefix("case ") {
-                if let Some((_, inline_body)) = split_case_arm(after_case) {
-                    let ib = inline_body.trim();
-                    if !ib.is_empty() && line.trim_end().ends_with(ib) {
-                        let start = offset + line.trim_end().len() - ib.len();
-                        spans.push((start, start + ib.len()));
-                    }
-                }
+struct BodyLine {
+    code_lo: usize,
+    code_hi: usize,
+    indent: usize,
+}
+
+fn slice_non_empty_lines(body: &str, lo: usize, hi: usize) -> Vec<BodyLine> {
+    let mut out = Vec::new();
+    let mut offset = lo;
+    for raw in body[lo..hi].split_inclusive('\n') {
+        let without_nl = raw.trim_end_matches(['\n', '\r']);
+        if !without_nl.trim().is_empty() {
+            let ws_start = without_nl.len() - without_nl.trim_start().len();
+            let code_lo = offset + ws_start;
+            let code_hi = offset + without_nl.trim_end().len();
+            let line_start = body[..code_lo].rfind('\n').map_or(0, |p| p + 1);
+            let prefix = &body[line_start..code_lo];
+            let indent = if prefix.bytes().all(|b| b == b' ' || b == b'\t') {
+                leading_indent(prefix)
             } else {
-                spans.push((offset + ws, offset + ws + trimmed.len()));
+                0
+            };
+            out.push(BodyLine {
+                code_lo,
+                code_hi,
+                indent,
+            });
+        }
+        offset += raw.len();
+    }
+    out
+}
+
+fn delim_delta(s: &str) -> i32 {
+    let bytes = s.as_bytes();
+    let mut delta = 0i32;
+    let mut in_string = false;
+    let mut i = 0usize;
+    while i < bytes.len() {
+        if in_string {
+            if bytes[i] == b'\\' && i + 1 < bytes.len() {
+                i += 2;
+                continue;
+            }
+            if bytes[i] == b'"' {
+                in_string = false;
+            }
+            i += 1;
+            continue;
+        }
+        match bytes[i] {
+            b'"' => in_string = true,
+            b'(' | b'{' | b'[' => delta += 1,
+            b')' | b'}' | b']' => delta -= 1,
+            _ => {}
+        }
+        i += 1;
+    }
+    delta
+}
+
+fn subslice_span(parent: &str, sub: &str) -> (usize, usize) {
+    let lo = sub.as_ptr() as usize - parent.as_ptr() as usize;
+    (lo, lo + sub.len())
+}
+
+fn split_matching_else(s: &str) -> Option<(&str, &str)> {
+    let bytes = s.as_bytes();
+    let mut depth = 0i32;
+    let mut if_depth = 0usize;
+    let mut in_string = false;
+    let mut i = 0usize;
+    while i < bytes.len() {
+        if in_string {
+            if bytes[i] == b'\\' && i + 1 < bytes.len() {
+                i += 2;
+                continue;
+            }
+            if bytes[i] == b'"' {
+                in_string = false;
+            }
+            i += 1;
+            continue;
+        }
+        match bytes[i] {
+            b'"' => in_string = true,
+            b'(' | b'{' | b'[' => depth += 1,
+            b')' | b'}' | b']' => depth -= 1,
+            _ if depth == 0 => {
+                let prev_non_ident = i == 0
+                    || (!bytes[i - 1].is_ascii_alphanumeric()
+                        && bytes[i - 1] != b'_'
+                        && bytes[i - 1] != b'.');
+                if prev_non_ident
+                    && s[i..].starts_with("if")
+                    && bytes.get(i + 2).is_some_and(u8::is_ascii_whitespace)
+                {
+                    if_depth += 1;
+                    i += 2;
+                    continue;
+                }
+                if i > 0 && bytes[i - 1].is_ascii_whitespace() && s[i..].starts_with("else:") {
+                    if if_depth == 0 {
+                        return Some((&s[..i], &s[i + "else:".len()..]));
+                    }
+                    if_depth -= 1;
+                    i += "else:".len();
+                    continue;
+                }
+            }
+            _ => {}
+        }
+        i += 1;
+    }
+    None
+}
+
+fn split_inline_case_arms(inline_arms: &str) -> Vec<&str> {
+    let bytes = inline_arms.as_bytes();
+    let mut depth = 0i32;
+    let mut in_string = false;
+    let mut markers = Vec::new();
+    let mut i = 0usize;
+    while i < bytes.len() {
+        if in_string {
+            if bytes[i] == b'\\' && i + 1 < bytes.len() {
+                i += 2;
+                continue;
+            }
+            if bytes[i] == b'"' {
+                in_string = false;
+            }
+            i += 1;
+            continue;
+        }
+        match bytes[i] {
+            b'"' => in_string = true,
+            b'(' | b'{' | b'[' => depth += 1,
+            b')' | b'}' | b']' => depth -= 1,
+            _ if depth == 0 => {
+                let prev_non_ident = i == 0
+                    || (!bytes[i - 1].is_ascii_alphanumeric()
+                        && bytes[i - 1] != b'_'
+                        && bytes[i - 1] != b'.');
+                if prev_non_ident
+                    && inline_arms[i..].starts_with("case")
+                    && bytes.get(i + 4).is_some_and(u8::is_ascii_whitespace)
+                {
+                    markers.push(i);
+                    i += 4;
+                    continue;
+                }
+            }
+            _ => {}
+        }
+        i += 1;
+    }
+
+    let mut arms = Vec::with_capacity(markers.len());
+    for (idx, &start) in markers.iter().enumerate() {
+        let end = markers.get(idx + 1).copied().unwrap_or(inline_arms.len());
+        let trimmed = inline_arms[start + "case".len()..end]
+            .trim()
+            .trim_end_matches(';')
+            .trim();
+        if !trimmed.is_empty() {
+            arms.push(trimmed);
+        }
+    }
+    arms
+}
+
+fn collect_return_leaf_spans(body: &str, lo: usize, hi: usize, out: &mut Vec<(usize, usize)>) {
+    let lines = slice_non_empty_lines(body, lo, hi);
+    let Some(first_line) = lines.first() else {
+        return;
+    };
+    let span_lo = first_line.code_lo;
+    let span_hi = lines.last().unwrap().code_hi;
+    let first = &body[first_line.code_lo..first_line.code_hi];
+
+    // 1. Multi-line `let <pat> = <val>\n  <body>`
+    if lines.len() > 1 && first.starts_with("let ") && split_top_level_once(first, ';').is_none() {
+        if let Some((_, val_first)) = split_top_level_once(&first["let ".len()..], '=') {
+            let let_indent = first_line.indent;
+            let mut depth = delim_delta(val_first);
+            let mut split_idx = 1;
+            while split_idx < lines.len() && (depth > 0 || lines[split_idx].indent > let_indent) {
+                let line_txt = &body[lines[split_idx].code_lo..lines[split_idx].code_hi];
+                depth += delim_delta(line_txt);
+                split_idx += 1;
+            }
+            if split_idx < lines.len() {
+                collect_return_leaf_spans(body, lines[split_idx].code_lo, span_hi, out);
+                return;
             }
         }
-        offset += raw_line.len();
     }
+
+    // 2. `match <scrut>: ...` (multi-line or single-line)
+    if let Some(after_match) = first.strip_prefix("match ") {
+        if lines.len() > 1 {
+            let mut depth = delim_delta(first);
+            let mut first_case = None;
+            for (idx, line) in lines.iter().enumerate().skip(1) {
+                let txt = &body[line.code_lo..line.code_hi];
+                if depth == 0 && txt.starts_with("case ") {
+                    first_case = Some(idx);
+                    break;
+                }
+                depth += delim_delta(txt);
+            }
+            if let Some(fc) = first_case {
+                let case_indent = lines[fc].indent;
+                let mut arm_starts = Vec::new();
+                let mut arm_depth = 0i32;
+                for (idx, line) in lines.iter().enumerate().skip(fc) {
+                    let txt = &body[line.code_lo..line.code_hi];
+                    if arm_depth == 0 && line.indent == case_indent && txt.starts_with("case ") {
+                        arm_starts.push(idx);
+                    }
+                    arm_depth += delim_delta(txt);
+                }
+                for (ai, &start_idx) in arm_starts.iter().enumerate() {
+                    let end_idx = arm_starts.get(ai + 1).copied().unwrap_or(lines.len());
+                    let arm_hdr = &body[lines[start_idx].code_lo..lines[start_idx].code_hi];
+                    let Some(after_case) = arm_hdr.strip_prefix("case ") else {
+                        continue;
+                    };
+                    let Some((_, inline_body)) = split_case_arm(after_case) else {
+                        continue;
+                    };
+                    let arm_hi = lines[end_idx - 1].code_hi;
+                    if !inline_body.is_empty() {
+                        let (inline_lo, _) = subslice_span(body, inline_body);
+                        collect_return_leaf_spans(body, inline_lo, arm_hi, out);
+                    } else if start_idx + 1 < end_idx {
+                        collect_return_leaf_spans(body, lines[start_idx + 1].code_lo, arm_hi, out);
+                    }
+                }
+                return;
+            }
+        } else if let Some((_, inline_arms)) = split_top_level_once(after_match, ':') {
+            for arm in split_inline_case_arms(inline_arms) {
+                if let Some((_, inline_body)) = split_case_arm(arm) {
+                    if !inline_body.is_empty() {
+                        let (sub_lo, sub_hi) = subslice_span(body, inline_body);
+                        collect_return_leaf_spans(body, sub_lo, sub_hi, out);
+                    }
+                }
+            }
+            return;
+        }
+    }
+
+    let sub = &body[span_lo..span_hi];
+
+    // 3. `if <cond>: <then> else: <else>` (single-line or multi-line)
+    if let Some(rest) = sub.strip_prefix("if ") {
+        if let Some((before_else, after_else)) = split_matching_else(rest) {
+            if let Some((_, then_b)) = split_top_level_once(before_else, ':') {
+                let then_t = then_b.trim();
+                if !then_t.is_empty() {
+                    let (tlo, thi) = subslice_span(body, then_t);
+                    collect_return_leaf_spans(body, tlo, thi, out);
+                }
+                let else_t = after_else.trim();
+                if !else_t.is_empty() {
+                    let (elo, ehi) = subslice_span(body, else_t);
+                    collect_return_leaf_spans(body, elo, ehi, out);
+                }
+                return;
+            }
+        }
+    }
+
+    // 4. Single-line `let <pat> = <val>; <body>`
+    if let Some(rest) = sub.strip_prefix("let ") {
+        if let Some((_, rest_body)) = split_top_level_once(rest, ';') {
+            let rest_t = rest_body.trim();
+            if !rest_t.is_empty() {
+                let (rlo, rhi) = subslice_span(body, rest_t);
+                collect_return_leaf_spans(body, rlo, rhi, out);
+                return;
+            }
+        }
+    }
+
+    // 5. Outer parentheses or type annotation `(term)` / `(term : Type)` (excluding tuples)
+    if crate::emit::is_wrapped_in_parens(sub) {
+        let inner = sub[1..sub.len() - 1].trim();
+        if split_top_level(inner, ',').len() == 1 {
+            let target = split_top_level_once(inner, ':')
+                .map(|(term_part, _)| term_part.trim())
+                .unwrap_or(inner);
+            if !target.is_empty() {
+                let (tlo, thi) = subslice_span(body, target);
+                collect_return_leaf_spans(body, tlo, thi, out);
+                return;
+            }
+        }
+    }
+
+    // 6. Base case: whole returned expression (including multi-line calls).
+    out.push((span_lo, span_hi));
+}
+
+/// Byte spans of returned leaf expressions in `body`, preserving whole multi-line calls while
+/// skipping `let` RHS bindings, `match` scrutinees, `if` conditions, and nested arguments.
+fn return_leaf_spans(body: &str) -> Vec<(usize, usize)> {
+    let mut spans = Vec::new();
+    collect_return_leaf_spans(body, 0, body.len(), &mut spans);
     spans
+}
+
+fn format_inline_leaf(leaf: &str) -> String {
+    let mut out = String::with_capacity(leaf.len());
+    let mut pending_space = false;
+    for ch in leaf.chars() {
+        if ch.is_whitespace() {
+            if !out.is_empty() && !out.ends_with('(') {
+                pending_space = true;
+            }
+            continue;
+        }
+        if pending_space && !matches!(ch, ')' | ',') {
+            out.push(' ');
+        }
+        pending_space = false;
+        out.push(ch);
+    }
+    out
 }
 
 /// True when `s` is exactly one call of a user `def`: `f(...)` with balanced parentheses.
@@ -11099,10 +11437,11 @@ fn mutate_return_ctor(
             replacements.clone()
         };
         let kind = if is_call { "call" } else { "variable" };
+        let label = format_inline_leaf(leaf);
         for repl in candidates {
             out.push((
                 replace_span(body, start, end, &repl),
-                format!("returned {kind} '{leaf}' -> {repl}"),
+                format!("returned {kind} '{label}' -> {repl}"),
             ));
         }
     }
@@ -13671,6 +14010,243 @@ law wrap_u32_eq:
             "U32 infix + must not produce NatAddMaxMin mutants: {:?}",
             u32_rep.mutant_outcomes
         );
+
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn return_ctor_mutates_whole_multiline_call_and_skips_nested_args_and_let_rhs() {
+        let dir = tmp_dir("issue23_multiline_return_ctor");
+        let core = dir.join("steps.bend");
+        let lock_file = dir.join("rusty-bends.lock");
+        let out_dir = dir.join("out");
+
+        let src = r#"import Base
+
+type Step is Data:
+  Go{}
+  Stop{}
+
+def is_done(+a: Nat, +b: Nat) -> Bool:
+  Nat.is_le(
+    a,
+    b
+  )
+
+def step_pick(ready: Bool, done: Bool) -> Step:
+  match ready:
+    case True{}:
+      Go{}
+    case False{}:
+      Stop{}
+
+def step_next(+ready: Bool, +done: Bool) -> Step:
+  step_pick(
+    ready,
+    done
+  )
+
+def step_with_call_arg(+ready: Bool, +a: Nat, +b: Nat) -> Step:
+  step_pick(
+    ready,
+    is_done(a, b)
+  )
+
+def step_with_let_and_branch(+ready: Bool, +a: Nat, +b: Nat) -> Step:
+  let ok =
+    is_done(
+      a,
+      b)
+  match step_pick(ready, ok):
+    case Go{}:
+      if ok:
+        step_pick(
+          ready,
+          False{}
+        )
+      else:
+        step_pick(
+          ready,
+          True{}
+        )
+    case Stop{}:
+      Stop{}
+
+def loop(+as: Bool, +self: Bool) -> Step:
+  step_pick(
+    as,
+    self
+  )
+
+# promise: a ready step goes
+law step_ready_goes:
+  for +d: Bool
+  {step_next(True{}, d) == Go{} : Step}
+
+# promise: when a <= b a ready step goes cleanly
+law step_call_arg_ready:
+  for +a: Nat
+  for +b: Nat
+  {step_with_call_arg(True{}, a, b) == Go{} : Step}
+
+# promise: a step with let/match/if returns Go when ready
+law step_let_branch_ready:
+  for +a: Nat
+  for +b: Nat
+  {step_with_let_and_branch(True{}, a, b) == Go{} : Step}
+
+# promise: ordering check matches Nat.is_le
+law is_done_ok:
+  for +a: Nat
+  for +b: Nat
+  {is_done(a, b) == Nat.is_le(a, b) : Bool}
+
+# promise: keyword-named wrapper delegates to step_pick
+law loop_ready_goes:
+  for +self: Bool
+  {loop(True{}, self) == Go{} : Step}
+"#;
+        fs::write(&core, src).unwrap();
+        let report = lock::check_law_lock(&lock_file, std::slice::from_ref(&core), false).unwrap();
+        let summary = run_mutation_checks(src, &report, MutateMode::Report, &out_dir)
+            .expect("multi-line calls and let/match/if bodies must compile without E_MUTANT_BUILD");
+
+        for rep in &summary.reports {
+            assert!(
+                !rep.mutant_outcomes
+                    .iter()
+                    .any(|o| matches!(o.status, MutantStatus::BuildError(_))),
+                "{} had build errors: {:?}",
+                rep.law_name,
+                rep.mutant_outcomes
+            );
+            for o in &rep.mutant_outcomes {
+                assert!(
+                    !o.description.contains('\n'),
+                    "mutant description must stay single-line: {:?}",
+                    o.description
+                );
+            }
+        }
+
+        let next_rep = summary
+            .reports
+            .iter()
+            .find(|r| r.law_name == "step_ready_goes")
+            .unwrap();
+        assert!(
+            next_rep.mutant_outcomes.iter().any(|o| {
+                o.operator == "ReturnCtor"
+                    && o.description
+                        == "step_next: returned call 'step_pick(ready, done)' -> Step.Stop{} [ReturnCtor]"
+                    && matches!(o.status, MutantStatus::Caught(_))
+            }),
+            "{:?}",
+            next_rep.mutant_outcomes
+        );
+        assert!(
+            !next_rep
+                .mutant_outcomes
+                .iter()
+                .any(|o| o.description.contains("returned variable 'done'")),
+            "must never mutate last argument 'done': {:?}",
+            next_rep.mutant_outcomes
+        );
+
+        let arg_rep = summary
+            .reports
+            .iter()
+            .find(|r| r.law_name == "step_call_arg_ready")
+            .unwrap();
+        assert!(
+            arg_rep.mutant_outcomes.iter().any(|o| {
+                o.operator == "ReturnCtor"
+                    && o.description
+                        .contains("returned call 'step_pick(ready, is_done(a, b))'")
+            }),
+            "{:?}",
+            arg_rep.mutant_outcomes
+        );
+        assert!(
+            !arg_rep
+                .mutant_outcomes
+                .iter()
+                .any(|o| o.description.contains("returned call 'is_done(a, b)'")),
+            "must never mutate nested call argument 'is_done(a, b)': {:?}",
+            arg_rep.mutant_outcomes
+        );
+
+        let kw_rep = summary
+            .reports
+            .iter()
+            .find(|r| r.law_name == "loop_ready_goes")
+            .unwrap();
+        assert!(
+            kw_rep.mutant_outcomes.iter().any(|o| {
+                o.operator == "ReturnCtor"
+                    && o.description
+                        .contains("returned call 'step_pick(as, self)'")
+                    && matches!(o.status, MutantStatus::Caught(_))
+            }),
+            "{:?}",
+            kw_rep.mutant_outcomes
+        );
+
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn locked_mutant_build_error_emits_separate_single_line_warnings() {
+        let dir = tmp_dir("issue23_locked_build_warn");
+        let src = r#"import Base
+
+def keep(+n: Nat) -> Nat:
+  n
+
+law keep_same:
+  for +n: Nat
+  {keep(n) == n : Nat}
+"#;
+        let laws = parse_laws(src);
+        let law = &laws[0];
+        let (types, defs) = parse_book_items(src).unwrap();
+        let type_env = TypeEnv::build(&types, &defs, &collect_law_source_slices(&laws));
+        let type_map: HashMap<String, &TypeDef> =
+            types.iter().map(|t| (t.name.clone(), t)).collect();
+        let bad = Mutant {
+            operator: "Test".to_string(),
+            description: "keep: body -> True{} [Test]".to_string(),
+            def_name: "keep".to_string(),
+            mutated_body: "True{}".to_string(),
+        };
+        let item = LawWorkItem {
+            prepared_idx: 0,
+            law,
+            is_locked: true,
+            cone_defs: &defs,
+            mutants: std::slice::from_ref(&bad),
+        };
+        let EvaluatedLawResult::BuildFailed { error_message, .. } =
+            run_single_law_per_mutant_fallback(&item, &types, &type_map, &type_env, false, &dir)
+        else {
+            panic!("expected BuildFailed for uncompilable mutant");
+        };
+        let mut warnings = Vec::new();
+        emit_law_build_warnings(&law.name, &error_message, &mut warnings);
+        assert_eq!(warnings.len(), 3, "{warnings:?}");
+        for w in &warnings {
+            assert!(!w.contains('\n'), "warning must not contain newline: {w:?}");
+            assert!(
+                w.starts_with("RustyBends mutate [keep_same]: "),
+                "unexpected prefix: {w:?}"
+            );
+        }
+        assert!(warnings[0].contains("[E_MUTANT_BUILD]"), "{warnings:?}");
+        assert!(
+            warnings[1].contains("First failing mutant: keep: body -> True{} [Test]"),
+            "{warnings:?}"
+        );
+        assert!(warnings[2].contains("rustc:"), "{warnings:?}");
 
         let _ = fs::remove_dir_all(&dir);
     }
