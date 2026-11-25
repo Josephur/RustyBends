@@ -227,7 +227,7 @@ def cancel_idempotent(s):
 4. **NEVER delete, comment out, or weaken laws in \`verified/\`.**
    \`rusty-bends.lock\` uses an AST/token canonicalizer (safe across whitespace/comment edits, strict on law changes) and fails with \`E_LAW_LOCK_TAMPERED\`.
 5. **Every new law MUST have a plain-English \`# promise:\` comment directly above \`law <name>:\`** (\`# harm:\` is optional). Missing promises on new laws fail with \`E_LAW_NO_PROMISE\` (locked laws warn if missing). Promises are stored in \`rusty-bends.lock\` outside the law hash, so improving \`# promise:\` wording is reported in build output without tripping \`E_LAW_LOCK_TAMPERED\`. Run \`RUSTY_BENDS_LIST_LAWS=1 cargo check\` or \`cargo run -p rusty-bends-build --bin rusty-bends-laws -- verified\` to print every law as \`name: promise\`.
-6. **Lean \`--verdict\` kernel cross-check**: \`rusty-bends-build\` always runs \`bend <file> --check-only\` (which checks all laws and proofs). By default (\`BEND_VERDICT=auto\`), it also runs \`--verdict\` whenever Lean (\`~/.elan/bin/lean\`) or \`$BENDTT\` is installed, and skips \`--verdict\` with a warning otherwise. Set \`BEND_VERDICT=require\` in CI to enforce Lean cross-checking, or \`BEND_VERDICT=off\` to disable it.
+6. **Lean \`--verdict\` kernel cross-check**: \`rusty-bends-build\` always runs \`bend <file> --check-only\` (which checks all laws and proofs). By default (\`BEND_VERDICT=auto\`), it also runs \`--verdict\` whenever Lean (\`~/.elan/bin/lean\`) or \`$BENDTT\` is installed, and skips \`--verdict\` with a warning otherwise. Set \`BEND_VERDICT=require\` in CI to enforce Lean cross-checking, or \`BEND_VERDICT=off\` to disable it. The incremental build cache records the verdict status (\`ran\`/\`skipped\`/\`off\`), CLI flags, and Bend binary/version, so switching from \`off\` or \`skipped\` to \`require\` re-runs verification; set \`RUSTY_BENDS_NO_CACHE=1\` to bypass the cache unconditionally.
 7. **Pin Bend 2 if upstream drifts**: uncomment the version prefix (e.g. \`2.0.\`) in \`bend.pin\` or set \`BEND_PIN_VERSION\`.
 `;
 
@@ -4859,6 +4859,7 @@ impl VerdictMode {
     }
 }
 
+#[derive(Debug, Clone)]
 pub struct Config {
     pub verified_dir: PathBuf,
     pub bend_bin: String,
@@ -4876,6 +4877,9 @@ pub struct Config {
     /// \`RUSTY_BENDS_LIST_PANICS=1\`: print every checked-growth panic site as
     /// \`function: op at file:line\` (Issue #13).
     pub list_panics: bool,
+    /// \`RUSTY_BENDS_NO_CACHE=1\`: bypass the incremental build cache in \`OUT_DIR\`
+    /// and re-run verification and code generation.
+    pub no_cache: bool,
 }
 
 impl Default for Config {
@@ -4898,6 +4902,7 @@ impl Default for Config {
         };
         let list_laws = env_flag("RUSTY_BENDS_LIST_LAWS");
         let list_panics = env_flag("RUSTY_BENDS_LIST_PANICS");
+        let no_cache = env_flag("RUSTY_BENDS_NO_CACHE");
         Self {
             verified_dir: PathBuf::from("verified"),
             bend_bin: resolve_bend_bin(
@@ -4919,6 +4924,7 @@ impl Default for Config {
             mutate_mode,
             list_laws,
             list_panics,
+            no_cache,
         }
     }
 }
@@ -5000,21 +5006,33 @@ pub fn run(cfg: &Config) -> Result<Option<PathBuf>, String> {
     println!("cargo:rerun-if-env-changed=RUSTY_BENDS_MUTATE");
     println!("cargo:rerun-if-env-changed=RUSTY_BENDS_LIST_LAWS");
     println!("cargo:rerun-if-env-changed=RUSTY_BENDS_LIST_PANICS");
+    println!("cargo:rerun-if-env-changed=RUSTY_BENDS_NO_CACHE");
     println!("cargo:rerun-if-env-changed=BEND_BIN");
     println!("cargo:rerun-if-env-changed=BEND_PIN_VERSION");
+    println!("cargo:rerun-if-env-changed=BEND_CHECK_FLAG");
+    println!("cargo:rerun-if-env-changed=BEND_VERDICT_FLAG");
     println!("cargo:rerun-if-env-changed=BEND_VERDICT");
     println!("cargo:rerun-if-env-changed=BENDTT");
 
-    // Verify Bend CLI version pin if bend.pin or BEND_PIN_VERSION is configured
-    if let Some(expected_pin) = read_active_pin(cfg)? {
+    // Verify Bend CLI version pin if bend.pin or BEND_PIN_VERSION is configured,
+    // and capture the active Bend version so upgrades invalidate the build cache.
+    let bend_version = if let Some(expected_pin) = read_active_pin(cfg)? {
         let actual_ver = query_bend_version(&cfg.bend_bin)?;
         verify_bend_version_str(&expected_pin, &actual_ver)?;
-    }
+        Some(actual_ver)
+    } else {
+        query_bend_version(&cfg.bend_bin).ok()
+    };
 
-    run_with_checker(cfg, |file, has_laws| {
-        println!("cargo:rerun-if-changed={}", file.display());
-        verify_with_bend_cli(cfg, file, has_laws)
-    })
+    run_pipeline(
+        cfg,
+        bend_version.as_deref(),
+        has_verdict_runtime(),
+        |file, has_laws| {
+            println!("cargo:rerun-if-changed={}", file.display());
+            verify_with_bend_cli(cfg, file, has_laws)
+        },
+    )
 }
 
 /// Reads an active version pin from BEND_PIN_VERSION or non-comment lines in bend.pin.
@@ -5095,10 +5113,81 @@ fn query_bend_version(bend_bin: &str) -> Result<String, String> {
     ))
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum VerdictApplied {
+    Ran,
+    Skipped,
+    Off,
+}
+
+impl VerdictApplied {
+    fn as_str(self) -> &'static str {
+        match self {
+            Self::Ran => "ran",
+            Self::Skipped => "skipped",
+            Self::Off => "off",
+        }
+    }
+}
+
+fn expected_verdict_applied(cfg: &Config, verdict_runtime_available: bool) -> VerdictApplied {
+    if cfg.verdict_mode == VerdictMode::Off || cfg.verdict_flag.trim().is_empty() {
+        VerdictApplied::Off
+    } else if cfg.verdict_mode == VerdictMode::Auto && !verdict_runtime_available {
+        VerdictApplied::Skipped
+    } else {
+        VerdictApplied::Ran
+    }
+}
+
+fn sanitize_cache_field(s: &str) -> String {
+    s.replace(['\\r', '\\n'], " ").trim().to_string()
+}
+
+fn format_cache_stamp(
+    cfg: &Config,
+    files_hash: &str,
+    verdict: VerdictApplied,
+    bend_version: &str,
+) -> String {
+    format!(
+        "v3\\nhash={files_hash}\\nverdict={}\\nbend_bin={}\\nbend_version={}\\ncheck_flag={}\\nverdict_flag={}\\n",
+        verdict.as_str(),
+        sanitize_cache_field(&cfg.bend_bin),
+        sanitize_cache_field(bend_version),
+        sanitize_cache_field(&cfg.check_flag),
+        sanitize_cache_field(&cfg.verdict_flag),
+    )
+}
+
+fn is_bend_cli_invocation_error(err: &str) -> bool {
+    err.starts_with("[E_BEND_MISSING]")
+        || is_missing_lean_error(err)
+        || err.contains("unknown option")
+        || err.contains("see bend --help")
+}
+
 /// Core pipeline with pluggable 'bend' runner for deterministic unit testing.
 pub fn run_with_checker<F>(cfg: &Config, mut checker: F) -> Result<Option<PathBuf>, String>
 where
     F: FnMut(&Path, bool) -> Result<(), String>,
+{
+    let runtime_ok = has_verdict_runtime();
+    let expected = expected_verdict_applied(cfg, runtime_ok);
+    run_pipeline(cfg, Some(""), runtime_ok, |file, has_laws| {
+        checker(file, has_laws)?;
+        Ok(expected)
+    })
+}
+
+fn run_pipeline<F>(
+    cfg: &Config,
+    bend_version: Option<&str>,
+    verdict_runtime_available: bool,
+    mut checker: F,
+) -> Result<Option<PathBuf>, String>
+where
+    F: FnMut(&Path, bool) -> Result<VerdictApplied, String>,
 {
     if !cfg.verified_dir.exists() {
         return Err(format!(
@@ -5135,15 +5224,21 @@ where
         }
     }
 
-    // 2. Check incremental content-hash cache for fast no-op rebuilds
+    // 2. Check incremental build cache (includes file contents, verdict mode/status, flags, and bend version)
     fs::create_dir_all(&cfg.out_dir).map_err(|e| e.to_string())?;
     let cache_file = cfg.out_dir.join("rusty-bends.cache");
     let verified_rs = cfg.out_dir.join("verified.rs");
     let combined_hash = hash_files(&bend_files)?;
+    let expected_verdict = expected_verdict_applied(cfg, verdict_runtime_available);
+    let expected_stamp =
+        bend_version.map(|ver| format_cache_stamp(cfg, &combined_hash, expected_verdict, ver));
 
-    let cache_hit = fs::read_to_string(&cache_file)
-        .map(|s| s.trim() == combined_hash)
-        .unwrap_or(false);
+    let cache_hit = !cfg.no_cache
+        && expected_stamp.as_ref().is_some_and(|stamp| {
+            fs::read_to_string(&cache_file)
+                .map(|s| s == *stamp)
+                .unwrap_or(false)
+        });
     if cache_hit
         && (!cfg.emit_rust || verified_rs.exists())
         && !lock_report.needs_write
@@ -5168,6 +5263,7 @@ where
         file_sources.push((file, text));
     }
 
+    let mut saw_verdict_skipped = false;
     for (file, text) in &file_sources {
         let is_laws_file = file
             .file_name()
@@ -5176,28 +5272,48 @@ where
             .unwrap_or(false);
         let has_laws = is_laws_file || !lock::extract_laws_from_source(text).is_empty();
 
-        if let Err(err) = checker(file, has_laws) {
-            let file_laws = law_test::parse_laws(text);
-            if !file_laws.is_empty() {
-                let target_names = match law_test::extract_failed_def_name(&err) {
-                    Some(failed) if file_laws.iter().any(|l| l.name == failed) => vec![failed],
-                    _ => file_laws.iter().map(|l| l.name.clone()).collect(),
-                };
-                if let Ok(outcomes) = law_test::evaluate_laws_for_counterexamples(
-                    &combined_source,
-                    &target_names,
-                    &cfg.out_dir,
-                ) {
-                    let diagnosis =
-                        law_test::format_counterexample_diagnosis(&outcomes, &pre_locked_laws);
-                    if !diagnosis.is_empty() {
-                        return Err(format!("{diagnosis}\\n\\n{err}"));
+        match checker(file, has_laws) {
+            Ok(VerdictApplied::Skipped) => {
+                saw_verdict_skipped = true;
+            }
+            Ok(VerdictApplied::Ran | VerdictApplied::Off) => {}
+            Err(err) => {
+                if !is_bend_cli_invocation_error(&err) {
+                    let file_laws = law_test::parse_laws(text);
+                    if !file_laws.is_empty() {
+                        let target_names = match law_test::extract_failed_def_name(&err) {
+                            Some(failed) if file_laws.iter().any(|l| l.name == failed) => {
+                                vec![failed]
+                            }
+                            _ => file_laws.iter().map(|l| l.name.clone()).collect(),
+                        };
+                        if let Ok(outcomes) = law_test::evaluate_laws_for_counterexamples(
+                            &combined_source,
+                            &target_names,
+                            &cfg.out_dir,
+                        ) {
+                            let diagnosis = law_test::format_counterexample_diagnosis(
+                                &outcomes,
+                                &pre_locked_laws,
+                            );
+                            if !diagnosis.is_empty() {
+                                return Err(format!("{diagnosis}\\n\\n{err}"));
+                            }
+                        }
                     }
                 }
+                return Err(err);
             }
-            return Err(err);
         }
     }
+    let applied_verdict =
+        if cfg.verdict_mode == VerdictMode::Off || cfg.verdict_flag.trim().is_empty() {
+            VerdictApplied::Off
+        } else if saw_verdict_skipped {
+            VerdictApplied::Skipped
+        } else {
+            VerdictApplied::Ran
+        };
 
     // 4. Mutation-check every unlocked/new law before sealing (and report all locked laws under RUSTY_BENDS_MUTATE=all)
     let mut_summary = mutate::run_mutation_checks(
@@ -5238,36 +5354,49 @@ where
         _ => None,
     };
 
-    // 7. Persist passing content hash
-    fs::write(&cache_file, &combined_hash).map_err(|e| e.to_string())?;
+    // 7. Persist passing build cache stamp (skip if Bend version could not be read so stale runs never hit)
+    if let Some(ver) = bend_version {
+        let stamp = format_cache_stamp(cfg, &combined_hash, applied_verdict, ver);
+        fs::write(&cache_file, stamp).map_err(|e| e.to_string())?;
+    }
     Ok(emitted_path)
 }
 
-fn verify_with_bend_cli(cfg: &Config, file: &Path, has_laws: bool) -> Result<(), String> {
+fn verify_with_bend_cli(
+    cfg: &Config,
+    file: &Path,
+    has_laws: bool,
+) -> Result<VerdictApplied, String> {
     run_bend_step(&cfg.bend_bin, &cfg.check_flag, file)?;
-    if !has_laws || cfg.verdict_flag.trim().is_empty() || cfg.verdict_mode == VerdictMode::Off {
-        return Ok(());
+    if cfg.verdict_mode == VerdictMode::Off || cfg.verdict_flag.trim().is_empty() {
+        return Ok(VerdictApplied::Off);
+    }
+    if !has_laws {
+        return Ok(expected_verdict_applied(cfg, has_verdict_runtime()));
     }
 
     match cfg.verdict_mode {
-        VerdictMode::Off => Ok(()),
-        VerdictMode::Require => run_bend_step(&cfg.bend_bin, &cfg.verdict_flag, file),
+        VerdictMode::Off => Ok(VerdictApplied::Off),
+        VerdictMode::Require => {
+            run_bend_step(&cfg.bend_bin, &cfg.verdict_flag, file)?;
+            Ok(VerdictApplied::Ran)
+        }
         VerdictMode::Auto => {
             if !has_verdict_runtime() {
                 println!(
                     "cargo:warning=RustyBends: {} passed --check-only; skipping optional --verdict Lean cross-check (install Lean/elan or set BEND_VERDICT=require in CI).",
                     file.display()
                 );
-                return Ok(());
+                return Ok(VerdictApplied::Skipped);
             }
             match run_bend_step(&cfg.bend_bin, &cfg.verdict_flag, file) {
-                Ok(()) => Ok(()),
+                Ok(()) => Ok(VerdictApplied::Ran),
                 Err(err) if is_missing_lean_error(&err) => {
                     println!(
                         "cargo:warning=RustyBends: {} passed --check-only; skipping optional --verdict (Lean kernel unavailable). Set BEND_VERDICT=require to enforce.",
                         file.display()
                     );
-                    Ok(())
+                    Ok(VerdictApplied::Skipped)
                 }
                 Err(err) => Err(err),
             }
@@ -5516,6 +5645,7 @@ mod tests {
             mutate_mode: MutateMode::NewOnly,
             list_laws: false,
             list_panics: false,
+            no_cache: false,
         }
     }
 
@@ -6417,6 +6547,153 @@ def align_down_le(a):
             String::from_utf8_lossy(&run_tests.stdout),
             String::from_utf8_lossy(&run_tests.stderr)
         );
+
+        let _ = fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn cache_rejects_verdict_require_after_off_or_skipped_build_and_tracks_flags() {
+        let root = temp_workspace("issue18_cache");
+        let _ = write_nat_lemmas(root.join("verified")).unwrap();
+        let ledger = root.join("verified/ledger.bend");
+        fs::write(
+            &ledger,
+            r#"import Base
+import nat_lemmas.bend as L
+
+def total_items(+a: Nat, +b: Nat) -> Nat:
+  Nat.add(a, b)
+
+def bump(+n: Nat) -> Nat:
+  1n+n
+
+# promise: the total never drops below the first delivery
+law total_covers_first:
+  for +a: Nat
+  for +b: Nat
+  {Nat.is_le(a, total_items(a, b)) == True{} : Bool}
+
+def total_covers_first(a, b):
+  L.nat_add_le_r(a, b)
+
+# promise: a write always changes the stamp
+law bump_changes:
+  for +m: Nat
+  {Nat.is_eq(m, bump(m)) == False{} : Bool}
+
+def bump_changes(m):
+  match m:
+    case 0n:
+      {==}
+    case 1n+mp:
+      bump_changes(mp)
+"#,
+        )
+        .unwrap();
+
+        let real_bend = resolve_bend_bin(
+            env::var("BEND_BIN").ok(),
+            env::var_os("PATH"),
+            env::var_os("HOME").map(PathBuf::from),
+        );
+
+        // 1. Failing --verdict invocation (unknown flag) fails directly without misleading proof note.
+        let mut bad_req = make_cfg(&root);
+        bad_req.bend_bin = real_bend.clone();
+        bad_req.verdict_mode = VerdictMode::Require;
+        bad_req.verdict_flag = "--no-such-flag".to_string();
+        let err1 = run(&bad_req).expect_err("unknown verdict flag must fail");
+        assert!(err1.contains("unknown option --no-such-flag"), "{err1}");
+        assert!(
+            !err1.contains("the proof is what failed"),
+            "CLI error must not misdiagnose proof failure:\\n{err1}"
+        );
+
+        // 2. BEND_VERDICT=off succeeds and records verdict=off in cache.
+        let mut off_cfg = make_cfg(&root);
+        off_cfg.bend_bin = real_bend.clone();
+        off_cfg.verdict_mode = VerdictMode::Off;
+        run(&off_cfg).expect("off build passes");
+        let cache_off = fs::read_to_string(root.join("out/rusty-bends.cache")).unwrap();
+        assert!(cache_off.contains("verdict=off\\n"), "{cache_off}");
+
+        // 3. Subsequent BEND_VERDICT=require with bad flag must NOT hit cache.
+        let err2 = run(&bad_req).expect_err("require build after off build must miss cache");
+        assert!(err2.contains("unknown option --no-such-flag"), "{err2}");
+
+        // 4. Skipped Auto verdict (no Lean runtime) followed by Require must also miss cache.
+        let mut auto_cfg = make_cfg(&root);
+        auto_cfg.verdict_mode = VerdictMode::Auto;
+        let mut calls = 0usize;
+        run_pipeline(&auto_cfg, Some("bend 2.0.40"), false, |_file, _has_laws| {
+            calls += 1;
+            Ok(VerdictApplied::Skipped)
+        })
+        .expect("auto skipped build passes");
+        assert_eq!(calls, 2);
+        let cache_skip = fs::read_to_string(root.join("out/rusty-bends.cache")).unwrap();
+        assert!(cache_skip.contains("verdict=skipped\\n"), "{cache_skip}");
+
+        let mut req_cfg = make_cfg(&root);
+        req_cfg.verdict_mode = VerdictMode::Require;
+        run_pipeline(&req_cfg, Some("bend 2.0.40"), true, |_file, _has_laws| {
+            calls += 1;
+            Ok(VerdictApplied::Ran)
+        })
+        .expect("require build runs checker");
+        assert_eq!(calls, 4, "require after skipped must miss cache");
+
+        // Repeating Require with identical config hits cache.
+        run_pipeline(&req_cfg, Some("bend 2.0.40"), true, |_file, _has_laws| {
+            calls += 1;
+            Ok(VerdictApplied::Ran)
+        })
+        .expect("matching require build hits cache");
+        assert_eq!(calls, 4);
+
+        // 5. Changing flags, bend_bin, bend_version, or no_cache misses cache.
+        let mut diff_check = req_cfg.clone();
+        diff_check.check_flag = "--check-only-alt".to_string();
+        run_pipeline(&diff_check, Some("bend 2.0.40"), true, |_, _| {
+            calls += 1;
+            Ok(VerdictApplied::Ran)
+        })
+        .unwrap();
+        assert_eq!(calls, 6);
+
+        let mut diff_verdict_flag = req_cfg.clone();
+        diff_verdict_flag.verdict_flag = "--verdict-alt".to_string();
+        run_pipeline(&diff_verdict_flag, Some("bend 2.0.40"), true, |_, _| {
+            calls += 1;
+            Ok(VerdictApplied::Ran)
+        })
+        .unwrap();
+        assert_eq!(calls, 8);
+
+        let mut diff_bin = req_cfg.clone();
+        diff_bin.bend_bin = "/opt/bend".to_string();
+        run_pipeline(&diff_bin, Some("bend 2.0.40"), true, |_, _| {
+            calls += 1;
+            Ok(VerdictApplied::Ran)
+        })
+        .unwrap();
+        assert_eq!(calls, 10);
+
+        run_pipeline(&diff_bin, Some("bend 2.0.41"), true, |_, _| {
+            calls += 1;
+            Ok(VerdictApplied::Ran)
+        })
+        .unwrap();
+        assert_eq!(calls, 12);
+
+        let mut no_cache_cfg = diff_bin.clone();
+        no_cache_cfg.no_cache = true;
+        run_pipeline(&no_cache_cfg, Some("bend 2.0.41"), true, |_, _| {
+            calls += 1;
+            Ok(VerdictApplied::Ran)
+        })
+        .unwrap();
+        assert_eq!(calls, 14);
 
         let _ = fs::remove_dir_all(&root);
     }
