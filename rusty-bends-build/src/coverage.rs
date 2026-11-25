@@ -14,12 +14,27 @@ use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet, VecDeque};
 use std::fs;
 use std::path::{Path, PathBuf};
 
+/// Where host Rust code refers to an emitted function.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum RustUse {
+    /// Called (or imported / named by path) from non-test code.
+    Production,
+    /// Referred to only from `tests/`, `benches/`, `#[cfg(test)]` items, or `#[test]` fns.
+    TestOnly,
+    /// Never referred to.
+    Unused,
+}
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct FunctionCoverage {
     pub name: String,
     pub direct_laws: Vec<String>,
     pub cone_laws: Vec<String>,
+    /// `Some(true)` when production Rust code calls the function (`None` when no Rust
+    /// sources were scanned). Test-only references count as `Some(false)`.
     pub mentioned_in_rust: Option<bool>,
+    /// Finer-grained view of `mentioned_in_rust`.
+    pub rust_use: Option<RustUse>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -71,22 +86,24 @@ pub fn analyze_coverage(
         cone_laws_by_fn.insert(name.clone(), BTreeSet::new());
     }
 
-    let mut rust_tokens: Option<HashSet<String>> = None;
+    let mut rust_mentions: Option<RustMentions> = None;
     if let Some(root) = crate_root {
         if has_rust_source_dirs(root) {
-            rust_tokens = Some(scan_crate_rust_idents(root)?);
+            rust_mentions = Some(scan_crate_rust_mentions(root)?);
         }
     }
-    let rust_scanned = rust_tokens.is_some();
+    let rust_scanned = rust_mentions.is_some();
 
-    let mentioned_map: BTreeMap<String, Option<bool>> = def_names
+    let use_map: BTreeMap<String, Option<RustUse>> = def_names
         .iter()
         .map(|name| {
-            let mentioned = rust_tokens
-                .as_ref()
-                .map(|tokens| tokens.contains(&rust_ident(name)));
-            (name.clone(), mentioned)
+            let used = rust_mentions.as_ref().map(|m| m.use_of(&rust_ident(name)));
+            (name.clone(), used)
         })
+        .collect();
+    let mentioned_map: BTreeMap<String, Option<bool>> = use_map
+        .iter()
+        .map(|(name, used)| (name.clone(), used.map(|u| u == RustUse::Production)))
         .collect();
 
     let mut law_coverages = Vec::with_capacity(laws.len());
@@ -155,6 +172,7 @@ pub fn analyze_coverage(
             direct_laws,
             cone_laws,
             mentioned_in_rust: mentioned_map.get(name).copied().flatten(),
+            rust_use: use_map.get(name).copied().flatten(),
         });
     }
 
@@ -198,9 +216,10 @@ pub fn format_coverage_report(report: &CoverageReport) -> Vec<String> {
         } else {
             func.cone_laws.join(", ")
         };
-        let rust_tag = match func.mentioned_in_rust {
-            Some(true) => "; rust=mentioned",
-            Some(false) => "; rust=unmentioned",
+        let rust_tag = match func.rust_use {
+            Some(RustUse::Production) => "; rust=mentioned",
+            Some(RustUse::TestOnly) => "; rust=tests-only",
+            Some(RustUse::Unused) => "; rust=unmentioned",
             None => "",
         };
         lines.push(format!(
@@ -231,8 +250,24 @@ pub fn format_coverage_report(report: &CoverageReport) -> Vec<String> {
         } else {
             for law in &report.laws {
                 if law.only_unmentioned_functions {
+                    let tests_only: Vec<&str> = law
+                        .unmentioned_direct_functions
+                        .iter()
+                        .filter(|f| {
+                            report
+                                .functions
+                                .iter()
+                                .any(|c| &c.name == *f && c.rust_use == Some(RustUse::TestOnly))
+                        })
+                        .map(String::as_str)
+                        .collect();
+                    let suffix = if tests_only.is_empty() {
+                        String::new()
+                    } else {
+                        format!(" (called only from tests: {})", tests_only.join(", "))
+                    };
                     lines.push(format!(
-                        "RustyBends coverage [law {}]: names only functions not mentioned in Rust sources: {}",
+                        "RustyBends coverage [law {}]: names only functions not mentioned in Rust sources: {}{suffix}",
                         law.name,
                         law.unmentioned_direct_functions.join(", ")
                     ));
@@ -321,21 +356,141 @@ pub fn has_rust_source_dirs(root: &Path) -> bool {
         .any(|sub| root.join(sub).is_dir())
 }
 
-fn scan_crate_rust_idents(root: &Path) -> Result<HashSet<String>, String> {
-    let mut rs_files = Vec::new();
-    for sub in ["src", "tests", "benches"] {
-        let dir = root.join(sub);
-        if dir.is_dir() {
-            collect_rust_files(&dir, &mut rs_files)?;
+/// Function references found in host Rust sources, split into production and test code.
+#[derive(Debug, Default)]
+pub(crate) struct RustMentions {
+    production: HashSet<String>,
+    tests: HashSet<String>,
+}
+
+impl RustMentions {
+    fn use_of(&self, ident: &str) -> RustUse {
+        if self.production.contains(ident) {
+            RustUse::Production
+        } else if self.tests.contains(ident) {
+            RustUse::TestOnly
+        } else {
+            RustUse::Unused
         }
     }
-    rs_files.sort();
-    let mut idents = HashSet::new();
-    for file in rs_files {
-        let text = fs::read_to_string(&file).map_err(|e| e.to_string())?;
-        collect_rust_idents(&text, &mut idents);
+}
+
+fn scan_crate_rust_mentions(root: &Path) -> Result<RustMentions, String> {
+    let mut mentions = RustMentions::default();
+    for sub in ["src", "tests", "benches"] {
+        let dir = root.join(sub);
+        if !dir.is_dir() {
+            continue;
+        }
+        let mut rs_files = Vec::new();
+        collect_rust_files(&dir, &mut rs_files)?;
+        rs_files.sort();
+        for file in rs_files {
+            let text = fs::read_to_string(&file).map_err(|e| e.to_string())?;
+            collect_rust_mentions(&text, sub != "src", &mut mentions);
+        }
     }
-    Ok(idents)
+    Ok(mentions)
+}
+
+/// Keywords after which an identifier is being declared or bound, not referred to.
+const RUST_BINDING_KEYWORDS: &[&str] = &[
+    "fn",
+    "let",
+    "mut",
+    "struct",
+    "enum",
+    "union",
+    "mod",
+    "const",
+    "static",
+    "type",
+    "trait",
+    "macro_rules",
+];
+
+/// Records identifiers that host Rust code uses as a function: a call `name(..)` or
+/// `name::<T>(..)`, a path `module::name`, or a name in a `use` statement. Method calls
+/// and field accesses (`x.name`), declarations (`fn name`, `let name`), struct fields, and
+/// plain local variables do not count. References inside `#[cfg(test)]` / `#[test]` items,
+/// or anywhere when `all_test` is set (files under `tests/` and `benches/`), are test-only.
+pub(crate) fn collect_rust_mentions(source: &str, all_test: bool, out: &mut RustMentions) {
+    let toks = rust_tokens(source);
+    let mut depth = 0usize;
+    let mut test_until: Option<usize> = None;
+    let mut pending_test = false;
+    let mut in_use = false;
+    let text = |i: usize| toks.get(i).map(|t| t.text.as_str()).unwrap_or("");
+    for (i, tok) in toks.iter().enumerate() {
+        let t = tok.text.as_str();
+        // Attributes: #[cfg(test)], #[test], #[bench] mark the next item as test code.
+        if t == "#" && text(i + 1) == "[" {
+            let is_test_attr = matches!(
+                (text(i + 2), text(i + 3), text(i + 4), text(i + 5)),
+                ("test" | "bench", "]", _, _) | ("cfg", "(", "test", ")")
+            );
+            if is_test_attr {
+                pending_test = true;
+            }
+            continue;
+        }
+        match t {
+            "{" => {
+                if pending_test && test_until.is_none() {
+                    test_until = Some(depth);
+                }
+                pending_test = false;
+                depth += 1;
+                continue;
+            }
+            "}" => {
+                depth = depth.saturating_sub(1);
+                if test_until == Some(depth) {
+                    test_until = None;
+                }
+                continue;
+            }
+            ";" => {
+                if test_until.is_none() {
+                    pending_test = false;
+                }
+                in_use = false;
+                continue;
+            }
+            "use" if tok.is_ident => {
+                in_use = true;
+                continue;
+            }
+            _ => {}
+        }
+        if !tok.is_ident {
+            continue;
+        }
+        let prev = if i > 0 { text(i - 1) } else { "" };
+        if prev == "." || RUST_BINDING_KEYWORDS.contains(&prev) {
+            continue;
+        }
+        let next = text(i + 1);
+        let is_call = next == "(" || (next == ":" && text(i + 2) == ":" && text(i + 3) == "<");
+        let after_path = prev == ":" && i >= 2 && text(i - 2) == ":";
+        if !(in_use || is_call || after_path) {
+            continue;
+        }
+        // `name::rest`: only the last path segment names the function.
+        if next == ":" && text(i + 2) == ":" && text(i + 3) != "<" {
+            continue;
+        }
+        if all_test || test_until.is_some() || pending_test {
+            out.tests.insert(t.to_string());
+        } else {
+            out.production.insert(t.to_string());
+        }
+    }
+}
+
+struct RustTok {
+    text: String,
+    is_ident: bool,
 }
 
 fn collect_rust_files(dir: &Path, out: &mut Vec<PathBuf>) -> Result<(), String> {
@@ -364,9 +519,11 @@ fn is_rust_ident_continue(b: u8) -> bool {
     b.is_ascii_alphanumeric() || b == b'_'
 }
 
-/// Tokenizes Rust source identifiers (including raw `r#ident` tokens) while ignoring
-/// line/block comments, normal/byte/c/raw string literals, char literals, and lifetimes.
-pub(crate) fn collect_rust_idents(source: &str, out: &mut HashSet<String>) {
+/// Identifiers and single-character punctuation of Rust source (including raw
+/// `r#ident` tokens), skipping line/block comments, normal/byte/c/raw string literals,
+/// numbers, char literals, and lifetimes.
+fn rust_tokens(source: &str) -> Vec<RustTok> {
+    let mut out: Vec<RustTok> = Vec::new();
     let bytes = source.as_bytes();
     let mut i = 0usize;
 
@@ -459,7 +616,10 @@ pub(crate) fn collect_rust_idents(source: &str, out: &mut HashSet<String>) {
                 while i < bytes.len() && is_rust_ident_continue(bytes[i]) {
                     i += 1;
                 }
-                out.insert(source[start..i].to_string());
+                out.push(RustTok {
+                    text: source[start..i].to_string(),
+                    is_ident: true,
+                });
                 continue;
             }
         }
@@ -509,12 +669,30 @@ pub(crate) fn collect_rust_idents(source: &str, out: &mut HashSet<String>) {
             while i < bytes.len() && is_rust_ident_continue(bytes[i]) {
                 i += 1;
             }
-            out.insert(source[start..i].to_string());
+            out.push(RustTok {
+                text: source[start..i].to_string(),
+                is_ident: true,
+            });
             continue;
         }
 
-        i += 1;
+        if b.is_ascii_digit() {
+            while i < bytes.len() && (bytes[i].is_ascii_alphanumeric() || bytes[i] == b'_') {
+                i += 1;
+            }
+            continue;
+        }
+
+        let ch = source[i..].chars().next().unwrap();
+        if !ch.is_whitespace() {
+            out.push(RustTok {
+                text: ch.to_string(),
+                is_ident: false,
+            });
+        }
+        i += ch.len_utf8();
     }
+    out
 }
 
 fn skip_quoted_string(bytes: &[u8], mut i: usize) -> usize {
@@ -757,6 +935,138 @@ impl Holder {
             vec!["a_ok", "hidden_ok", "self_ok"]
         );
 
+        let _ = fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn coverage_separates_production_calls_from_tests_fields_and_methods() {
+        let root = tmp_crate("prod_vs_test");
+        fs::create_dir_all(root.join("tests")).unwrap();
+        fs::write(
+            root.join("verified/core.bend"),
+            r#"import Base
+
+def step(+n: Nat) -> Nat:
+  Nat.add(n, 1n)
+
+def size(+n: Nat) -> Nat:
+  n
+
+def check(+n: Nat) -> Nat:
+  n
+
+def total(+n: Nat) -> Nat:
+  Nat.add(n, n)
+
+def scaled(+n: Nat) -> Nat:
+  Nat.mul(n, 2n)
+
+def imported(+n: Nat) -> Nat:
+  n
+
+# promise: step adds one
+law step_adds_one:
+  for +n: Nat
+  {step(n) == Nat.add(n, 1n) : Nat}
+
+# promise: size is the identity
+law size_is_id:
+  for +n: Nat
+  {size(n) == n : Nat}
+
+# promise: check is the identity
+law check_is_id:
+  for +n: Nat
+  {check(n) == n : Nat}
+
+# promise: total doubles
+law total_doubles:
+  for +n: Nat
+  {total(n) == Nat.add(n, n) : Nat}
+
+# promise: scaled doubles
+law scaled_doubles:
+  for +n: Nat
+  {scaled(n) == Nat.mul(n, 2n) : Nat}
+
+# promise: imported is the identity
+law imported_is_id:
+  for +n: Nat
+  {imported(n) == n : Nat}
+"#,
+        )
+        .unwrap();
+        fs::write(
+            root.join("src/main.rs"),
+            r#"mod verified {
+    include!(concat!(env!("OUT_DIR"), "/verified.rs"));
+}
+use verified::imported;
+struct Counter { step: u64, size: u64 }
+impl Counter {
+    fn check(&self) -> bool { self.step < self.size }
+}
+fn main() {
+    let c = Counter { step: 1, size: 2 };
+    let step = c.step;
+    let _ = c.check();
+    let _ = (step, imported);
+    let f = verified::scaled;
+    println!("{}", f(2));
+}
+#[cfg(test)]
+mod tests {
+    #[test]
+    fn uses_total() {
+        assert_eq!(super::verified::total(2), 4);
+    }
+}
+"#,
+        )
+        .unwrap();
+        fs::write(
+            root.join("tests/it.rs"),
+            "#[test]\nfn calls_size() { let _ = my_app::verified::size(3); }\n",
+        )
+        .unwrap();
+
+        let report = analyze_coverage_dir(&root.join("verified"), Some(&root)).unwrap();
+        let by_fn: HashMap<&str, &FunctionCoverage> = report
+            .functions
+            .iter()
+            .map(|f| (f.name.as_str(), f))
+            .collect();
+        // Fields, locals, and methods with the same name do not count.
+        assert_eq!(by_fn["step"].rust_use, Some(RustUse::Unused));
+        assert_eq!(by_fn["check"].rust_use, Some(RustUse::Unused));
+        // Calls from #[cfg(test)] and tests/ are test-only.
+        assert_eq!(by_fn["total"].rust_use, Some(RustUse::TestOnly));
+        assert_eq!(by_fn["size"].rust_use, Some(RustUse::TestOnly));
+        assert_eq!(by_fn["total"].mentioned_in_rust, Some(false));
+        // Paths and `use` imports are production references.
+        assert_eq!(by_fn["scaled"].rust_use, Some(RustUse::Production));
+        assert_eq!(by_fn["imported"].rust_use, Some(RustUse::Production));
+        assert_eq!(
+            report.laws_only_unmentioned,
+            vec![
+                "check_is_id",
+                "size_is_id",
+                "step_adds_one",
+                "total_doubles"
+            ]
+        );
+        let lines = format_coverage_report(&report);
+        assert!(
+            lines
+                .iter()
+                .any(|l| l.contains("[fn total]") && l.contains("rust=tests-only")),
+            "{lines:#?}"
+        );
+        assert!(
+            lines.iter().any(|l| l.contains("[law total_doubles]")
+                && l.ends_with("(called only from tests: total)")),
+            "{lines:#?}"
+        );
         let _ = fs::remove_dir_all(&root);
     }
 }

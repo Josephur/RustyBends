@@ -992,6 +992,7 @@ fn locate_def(name: &str, files: &[(&Path, &str)]) -> Option<(usize, usize, usiz
 }
 
 /// Number of places in `line` where the Bend source of a checked-growth `op` appears.
+/// `line` has its comment stripped and import aliases resolved.
 fn op_occurrences(line: &str, op: &str) -> usize {
     let is_ident = |b: u8| b.is_ascii_alphanumeric() || b == b'_' || b == b'.';
     let count_calls = |callee: &str| {
@@ -1003,22 +1004,105 @@ fn op_occurrences(line: &str, op: &str) -> usize {
     match op {
         "Nat.add" => {
             let bytes = line.as_bytes();
-            let infix = line.matches(" + ").count();
             // Successor literals in expressions: `1n+x`.
-            let succ_lit = (1..bytes.len())
-                .filter(|&i| {
-                    bytes[i] == b'+'
-                        && bytes[i - 1] == b'n'
-                        && i >= 2
-                        && bytes[i - 2].is_ascii_digit()
-                })
-                .count();
-            count_calls("Nat.add") + infix + succ_lit
+            let succ_lit = (1..bytes.len()).filter(|&i| is_succ_plus(bytes, i)).count();
+            count_calls("Nat.add") + nat_infix_count(line, b'+') + succ_lit
         }
-        "Nat.mul" => count_calls("Nat.mul") + line.matches(" * ").count(),
+        "Nat.mul" => count_calls("Nat.mul") + nat_infix_count(line, b'*'),
         "Nat.succ" => count_calls("Nat.succ"),
         other => other.strip_prefix("call ").map(count_calls).unwrap_or(0),
     }
+}
+
+/// `bytes[i]` is the `+` of a successor literal such as `1n+x`.
+fn is_succ_plus(bytes: &[u8], i: usize) -> bool {
+    bytes[i] == b'+' && i >= 2 && bytes[i - 1] == b'n' && bytes[i - 2].is_ascii_digit()
+}
+
+/// Counts infix `op` (`+` or `*`) inside annotated groups `( .. : Nat)`, with or without
+/// spaces around the operator. Fixed-width groups such as `(a + b : U32)` wrap instead
+/// of panicking and are not counted.
+fn nat_infix_count(line: &str, op: u8) -> usize {
+    let bytes = line.as_bytes();
+    let mut count = 0;
+    for i in 0..bytes.len() {
+        if bytes[i] != op
+            || (op == b'+' && is_succ_plus(bytes, i))
+            || bytes.get(i + 1) == Some(&op)
+            || (i > 0 && bytes[i - 1] == op)
+        {
+            continue;
+        }
+        // Enclosing '(' .. ')' of this operator.
+        let mut depth = 0i32;
+        let mut open = None;
+        for j in (0..i).rev() {
+            match bytes[j] {
+                b')' | b']' | b'}' => depth += 1,
+                b'(' | b'[' | b'{' if depth > 0 => depth -= 1,
+                b'(' => {
+                    open = Some(j);
+                    break;
+                }
+                b'[' | b'{' => break,
+                _ => {}
+            }
+        }
+        let Some(open) = open else {
+            continue;
+        };
+        let mut depth = 0i32;
+        let mut close = None;
+        for (j, &c) in bytes.iter().enumerate().skip(i + 1) {
+            match c {
+                b'(' | b'[' | b'{' => depth += 1,
+                b')' if depth == 0 => {
+                    close = Some(j);
+                    break;
+                }
+                b')' | b']' | b'}' => depth -= 1,
+                _ => {}
+            }
+        }
+        let Some(close) = close else {
+            continue;
+        };
+        let inner = &line[open + 1..close];
+        let mut depth = 0i32;
+        let mut colon = None;
+        for (j, c) in inner.char_indices() {
+            match c {
+                '(' | '[' | '{' => depth += 1,
+                ')' | ']' | '}' => depth -= 1,
+                ':' if depth == 0 => colon = Some(j),
+                _ => {}
+            }
+        }
+        if colon.is_some_and(|c| inner[c + 1..].trim() == "Nat") {
+            count += 1;
+        }
+    }
+    count
+}
+
+/// The part of a body line that holds expressions: the arm body of `case PAT: expr`
+/// (the pattern holds `1n+p` binders, not additions), the scrutinee of `match e:`,
+/// or the whole line.
+fn expression_part(code: &str) -> &str {
+    let t = code.trim_start();
+    if let Some(rest) = t.strip_prefix("case ") {
+        let mut depth = 0i32;
+        for (j, c) in rest.char_indices() {
+            match c {
+                '(' | '[' | '{' => depth += 1,
+                ')' | ']' | '}' => depth -= 1,
+                ':' if depth == 0 => return &rest[j + 1..],
+                _ => {}
+            }
+        }
+        return "";
+    }
+    t
 }
 
 /// Formats checked-growth panic sites as `RustyBends panic [function]: op at file:line`, plus a
@@ -1042,14 +1126,12 @@ pub fn format_panic_sites(sites: &[emit::PanicSite], files: &[(&Path, &str)]) ->
             continue;
         };
         let path = files[fi].0.display().to_string();
-        let lines: Vec<&str> = files[fi].1.lines().collect();
+        // Alias resolution keeps one output line per input line, so line numbers hold.
+        let resolved = emit::resolve_import_aliases(files[fi].1);
+        let lines: Vec<&str> = resolved.lines().collect();
         let mut candidates = Vec::new();
         for (li, raw) in lines.iter().enumerate().take(end).skip(header + 1) {
-            let code = emit::strip_comment(raw);
-            let t = code.trim_start();
-            if t.starts_with("case ") || t.starts_with("match ") {
-                continue;
-            }
+            let code = expression_part(emit::strip_comment(raw));
             for _ in 0..op_occurrences(code, op) {
                 candidates.push(li + 1);
             }

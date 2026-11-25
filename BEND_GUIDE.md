@@ -93,7 +93,7 @@ def cancel_idempotent(s):
 
 - **`Nat` arithmetic (checked `u64` on growth, saturating subtraction, total division):**
   - `Nat.add`, `Nat.mul`, `Nat.succ` -> `checked_add` / `checked_mul` (panics with `"rusty-bends: Nat overflow"` on `u64` overflow, so emitted Rust agrees with mathematical `Nat` wherever it returns and never silently saturates past `u64::MAX` into a law-violating state).
-  - **List the panic sites:** `RUSTY_BENDS_LIST_PANICS=1 cargo check` prints every checked-growth op as `RustyBends panic [function]: Nat.mul at verified/file.bend:12`, so you can review which functions take untrusted input.
+  - **List the panic sites:** `RUSTY_BENDS_LIST_PANICS=1 cargo check` prints every checked-growth op as `RustyBends panic [function]: Nat.mul at verified/file.bend:12`, so you can review which functions take untrusted input. Callers that reach such a function through non-total calls are listed too, as `call <callee>`.
   - **Refuse instead of panicking (`# rusty-bends: total`):** put `# rusty-bends: total` in the comment block directly above a `def` and it emits as `Option<T>`, returning `None` on overflow anywhere in its call tree (callees get private `Option` variants; their public versions are unchanged). Callers in other `def`s keep panicking semantics (listed as `call <f>`). Its generated per-law tests still run.
   - **Write limit checks that cannot overflow.** Compare against a quotient instead of building a product from untrusted input:
     ```bend

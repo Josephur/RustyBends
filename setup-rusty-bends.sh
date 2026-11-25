@@ -1119,6 +1119,7 @@ fn locate_def(name: &str, files: &[(&Path, &str)]) -> Option<(usize, usize, usiz
 }
 
 /// Number of places in `line` where the Bend source of a checked-growth `op` appears.
+/// `line` has its comment stripped and import aliases resolved.
 fn op_occurrences(line: &str, op: &str) -> usize {
     let is_ident = |b: u8| b.is_ascii_alphanumeric() || b == b'_' || b == b'.';
     let count_calls = |callee: &str| {
@@ -1130,22 +1131,105 @@ fn op_occurrences(line: &str, op: &str) -> usize {
     match op {
         "Nat.add" => {
             let bytes = line.as_bytes();
-            let infix = line.matches(" + ").count();
             // Successor literals in expressions: `1n+x`.
-            let succ_lit = (1..bytes.len())
-                .filter(|&i| {
-                    bytes[i] == b'+'
-                        && bytes[i - 1] == b'n'
-                        && i >= 2
-                        && bytes[i - 2].is_ascii_digit()
-                })
-                .count();
-            count_calls("Nat.add") + infix + succ_lit
+            let succ_lit = (1..bytes.len()).filter(|&i| is_succ_plus(bytes, i)).count();
+            count_calls("Nat.add") + nat_infix_count(line, b'+') + succ_lit
         }
-        "Nat.mul" => count_calls("Nat.mul") + line.matches(" * ").count(),
+        "Nat.mul" => count_calls("Nat.mul") + nat_infix_count(line, b'*'),
         "Nat.succ" => count_calls("Nat.succ"),
         other => other.strip_prefix("call ").map(count_calls).unwrap_or(0),
     }
+}
+
+/// `bytes[i]` is the `+` of a successor literal such as `1n+x`.
+fn is_succ_plus(bytes: &[u8], i: usize) -> bool {
+    bytes[i] == b'+' && i >= 2 && bytes[i - 1] == b'n' && bytes[i - 2].is_ascii_digit()
+}
+
+/// Counts infix `op` (`+` or `*`) inside annotated groups `( .. : Nat)`, with or without
+/// spaces around the operator. Fixed-width groups such as `(a + b : U32)` wrap instead
+/// of panicking and are not counted.
+fn nat_infix_count(line: &str, op: u8) -> usize {
+    let bytes = line.as_bytes();
+    let mut count = 0;
+    for i in 0..bytes.len() {
+        if bytes[i] != op
+            || (op == b'+' && is_succ_plus(bytes, i))
+            || bytes.get(i + 1) == Some(&op)
+            || (i > 0 && bytes[i - 1] == op)
+        {
+            continue;
+        }
+        // Enclosing '(' .. ')' of this operator.
+        let mut depth = 0i32;
+        let mut open = None;
+        for j in (0..i).rev() {
+            match bytes[j] {
+                b')' | b']' | b'}' => depth += 1,
+                b'(' | b'[' | b'{' if depth > 0 => depth -= 1,
+                b'(' => {
+                    open = Some(j);
+                    break;
+                }
+                b'[' | b'{' => break,
+                _ => {}
+            }
+        }
+        let Some(open) = open else {
+            continue;
+        };
+        let mut depth = 0i32;
+        let mut close = None;
+        for (j, &c) in bytes.iter().enumerate().skip(i + 1) {
+            match c {
+                b'(' | b'[' | b'{' => depth += 1,
+                b')' if depth == 0 => {
+                    close = Some(j);
+                    break;
+                }
+                b')' | b']' | b'}' => depth -= 1,
+                _ => {}
+            }
+        }
+        let Some(close) = close else {
+            continue;
+        };
+        let inner = &line[open + 1..close];
+        let mut depth = 0i32;
+        let mut colon = None;
+        for (j, c) in inner.char_indices() {
+            match c {
+                '(' | '[' | '{' => depth += 1,
+                ')' | ']' | '}' => depth -= 1,
+                ':' if depth == 0 => colon = Some(j),
+                _ => {}
+            }
+        }
+        if colon.is_some_and(|c| inner[c + 1..].trim() == "Nat") {
+            count += 1;
+        }
+    }
+    count
+}
+
+/// The part of a body line that holds expressions: the arm body of `case PAT: expr`
+/// (the pattern holds `1n+p` binders, not additions), the scrutinee of `match e:`,
+/// or the whole line.
+fn expression_part(code: &str) -> &str {
+    let t = code.trim_start();
+    if let Some(rest) = t.strip_prefix("case ") {
+        let mut depth = 0i32;
+        for (j, c) in rest.char_indices() {
+            match c {
+                '(' | '[' | '{' => depth += 1,
+                ')' | ']' | '}' => depth -= 1,
+                ':' if depth == 0 => return &rest[j + 1..],
+                _ => {}
+            }
+        }
+        return "";
+    }
+    t
 }
 
 /// Formats checked-growth panic sites as `RustyBends panic [function]: op at file:line`, plus a
@@ -1169,14 +1253,12 @@ pub fn format_panic_sites(sites: &[emit::PanicSite], files: &[(&Path, &str)]) ->
             continue;
         };
         let path = files[fi].0.display().to_string();
-        let lines: Vec<&str> = files[fi].1.lines().collect();
+        // Alias resolution keeps one output line per input line, so line numbers hold.
+        let resolved = emit::resolve_import_aliases(files[fi].1);
+        let lines: Vec<&str> = resolved.lines().collect();
         let mut candidates = Vec::new();
         for (li, raw) in lines.iter().enumerate().take(end).skip(header + 1) {
-            let code = emit::strip_comment(raw);
-            let t = code.trim_start();
-            if t.starts_with("case ") || t.starts_with("match ") {
-                continue;
-            }
+            let code = expression_part(emit::strip_comment(raw));
             for _ in 0..op_occurrences(code, op) {
                 candidates.push(li + 1);
             }
@@ -4905,6 +4987,53 @@ pub(crate) fn collect_law_source_slices(laws: &[crate::law_test::ParsedLaw]) -> 
     slices
 }
 
+/// Adds a `call <callee>` panic site to every non-total def that calls a non-total def
+/// that can panic (directly or through its own callees), so `RUSTY_BENDS_LIST_PANICS`
+/// also names the public entry points whose checked growth happens further down.
+fn add_transitive_panic_sites(
+    defs: &[Def],
+    def_map: &HashMap<String, &Def>,
+    panic_sites: &mut Vec<PanicSite>,
+) {
+    let callees: Vec<(String, Vec<String>)> = defs
+        .iter()
+        .filter(|d| !d.total)
+        .map(|d| {
+            let toks = crate::lock::tokenize_bend(&d.body);
+            let mut called = Vec::new();
+            for (i, tok) in toks.iter().enumerate() {
+                let is_call = toks.get(i + 1).is_some_and(|t| t == "(");
+                let is_callee = def_map
+                    .get(tok)
+                    .is_some_and(|c| !c.total && c.name != d.name);
+                if is_call && is_callee && !called.contains(tok) {
+                    called.push(tok.clone());
+                }
+            }
+            (d.name.clone(), called)
+        })
+        .collect();
+    let mut panicking: HashSet<String> = panic_sites.iter().map(|p| p.function.clone()).collect();
+    let mut recorded: HashSet<(String, String)> = HashSet::new();
+    loop {
+        let mut changed = false;
+        for (caller, called) in &callees {
+            for callee in called {
+                if panicking.contains(callee) && recorded.insert((caller.clone(), callee.clone())) {
+                    panic_sites.push(PanicSite {
+                        function: caller.clone(),
+                        op: format!("call {callee}"),
+                    });
+                    changed |= panicking.insert(caller.clone());
+                }
+            }
+        }
+        if !changed {
+            break;
+        }
+    }
+}
+
 pub(crate) fn emit_items_to_rust(
     types: &[TypeDef],
     defs: &[Def],
@@ -5072,6 +5201,8 @@ pub(crate) fn emit_items_to_rust(
             }
         }
     }
+
+    add_transitive_panic_sites(defs, &def_map, &mut panic_sites);
 
     let mut out = String::new();
     out.push_str("// @generated by rusty-bends-build v1 (Verified Core -> Pure Rust)\n");
@@ -8239,16 +8370,28 @@ law zero_width_refused:
             .iter()
             .map(|p| (p.function.as_str(), p.op.as_str()))
             .collect();
-        assert_eq!(sites, vec![("area", "Nat.mul")]);
+        // Callers that reach `area` through non-total calls can panic too.
+        assert_eq!(
+            sites,
+            vec![
+                ("area", "Nat.mul"),
+                ("fits_area_limit", "call area"),
+                ("fits_default_limit", "call fits_area_limit"),
+            ]
+        );
 
         let path = std::path::Path::new("verified/shapes.bend");
         let listing = crate::format_panic_sites(&summary.panic_sites, &[(path, AREA_SRC)]);
         assert_eq!(
-            listing[0],
-            "RustyBends panic [area]: Nat.mul at verified/shapes.bend:4"
+            &listing[..3],
+            &[
+                "RustyBends panic [area]: Nat.mul at verified/shapes.bend:4",
+                "RustyBends panic [fits_area_limit]: call area at verified/shapes.bend:7",
+                "RustyBends panic [fits_default_limit]: call fits_area_limit at verified/shapes.bend:10",
+            ]
         );
-        assert!(listing[1].contains("1 checked-growth panic site(s) in 1 function(s)"));
-        assert!(listing[1].contains("# rusty-bends: total"));
+        assert!(listing[3].contains("3 checked-growth panic site(s) in 3 function(s)"));
+        assert!(listing[3].contains("# rusty-bends: total"));
 
         let none = emit_verified_rust("def id(+n: Nat) -> Nat:\n  n\n", 0).unwrap();
         assert!(none.panic_sites.is_empty());
@@ -8304,6 +8447,70 @@ law zero_width_refused:
             "{runtime_only}\nfn main() {{\n    assert_eq!(fits_area_limit(u64::MAX, u64::MAX, u64::MAX - 1), None);\n    assert_eq!(fits_area_limit(10, 10, 100), Some(true));\n    assert_eq!(fits_area_limit(10, 11, 100), Some(false));\n    assert_eq!(fits_area_limit(0, 5, 100), Some(false));\n    assert!(std::panic::catch_unwind(|| area(u64::MAX, 2)).is_err());\n    assert!(fits_default_limit(10, 10));\n    assert!(!fits_default_limit(100, 100));\n}}\n"
         );
         compile_and_run("runtime", &harness, &[]);
+    }
+
+    const PANIC_LINES_SRC: &str = r#"import Base
+
+def pick_sum(ok: Bool, a: Nat, b: Nat) -> Nat:
+  match ok:
+    case True{}: Nat.add(a, b)
+    case False{}: a
+
+def tight(a: Nat, b: Nat) -> Nat:
+  (a + b : Nat)
+
+def wraps(a: U32, b: U32) -> U32:
+  (a + b : U32)
+
+def grow(n: Nat) -> Nat:
+  match n:
+    case 0n: 1n
+    case 1n+p: (p * 3n : Nat)
+"#;
+
+    #[test]
+    fn panic_listing_attributes_single_line_case_arms_and_annotated_infix() {
+        if let Some((ok, text)) = reference_check_only("panic_lines", PANIC_LINES_SRC) {
+            assert!(
+                ok,
+                "reference bend must accept the panic-line fixture:\n{text}"
+            );
+        }
+        let summary = emit_verified_rust(PANIC_LINES_SRC, 0).unwrap();
+        let path = std::path::Path::new("verified/lines.bend");
+        let listing = crate::format_panic_sites(&summary.panic_sites, &[(path, PANIC_LINES_SRC)]);
+        assert_eq!(
+            &listing[..listing.len() - 1],
+            &[
+                "RustyBends panic [pick_sum]: Nat.add at verified/lines.bend:5",
+                "RustyBends panic [tight]: Nat.add at verified/lines.bend:9",
+                "RustyBends panic [grow]: Nat.mul at verified/lines.bend:17",
+            ],
+            "{listing:#?}"
+        );
+    }
+
+    #[test]
+    fn panic_listing_matches_alias_qualified_calls() {
+        let lib = "import Base\n\ndef double(n: Nat) -> Nat:\n  Nat.mul(n, 2n)\n";
+        let user = "import Base\nimport lib.bend as L\n\ndef quad(n: Nat) -> Nat:\n  L.double(L.double(n))\n";
+        let combined = format!(
+            "{}\n{}\n",
+            resolve_import_aliases(lib),
+            resolve_import_aliases(user)
+        );
+        let summary = emit_verified_rust(&combined, 0).unwrap();
+        let files = [
+            (std::path::Path::new("verified/lib.bend"), lib),
+            (std::path::Path::new("verified/user.bend"), user),
+        ];
+        let listing = crate::format_panic_sites(&summary.panic_sites, &files);
+        assert!(
+            listing.contains(
+                &"RustyBends panic [quad]: call double at verified/user.bend:5".to_string()
+            ),
+            "{listing:#?}"
+        );
     }
 
     #[test]
@@ -15642,12 +15849,27 @@ use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet, VecDeque};
 use std::fs;
 use std::path::{Path, PathBuf};
 
+/// Where host Rust code refers to an emitted function.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum RustUse {
+    /// Called (or imported / named by path) from non-test code.
+    Production,
+    /// Referred to only from `tests/`, `benches/`, `#[cfg(test)]` items, or `#[test]` fns.
+    TestOnly,
+    /// Never referred to.
+    Unused,
+}
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct FunctionCoverage {
     pub name: String,
     pub direct_laws: Vec<String>,
     pub cone_laws: Vec<String>,
+    /// `Some(true)` when production Rust code calls the function (`None` when no Rust
+    /// sources were scanned). Test-only references count as `Some(false)`.
     pub mentioned_in_rust: Option<bool>,
+    /// Finer-grained view of `mentioned_in_rust`.
+    pub rust_use: Option<RustUse>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -15699,22 +15921,24 @@ pub fn analyze_coverage(
         cone_laws_by_fn.insert(name.clone(), BTreeSet::new());
     }
 
-    let mut rust_tokens: Option<HashSet<String>> = None;
+    let mut rust_mentions: Option<RustMentions> = None;
     if let Some(root) = crate_root {
         if has_rust_source_dirs(root) {
-            rust_tokens = Some(scan_crate_rust_idents(root)?);
+            rust_mentions = Some(scan_crate_rust_mentions(root)?);
         }
     }
-    let rust_scanned = rust_tokens.is_some();
+    let rust_scanned = rust_mentions.is_some();
 
-    let mentioned_map: BTreeMap<String, Option<bool>> = def_names
+    let use_map: BTreeMap<String, Option<RustUse>> = def_names
         .iter()
         .map(|name| {
-            let mentioned = rust_tokens
-                .as_ref()
-                .map(|tokens| tokens.contains(&rust_ident(name)));
-            (name.clone(), mentioned)
+            let used = rust_mentions.as_ref().map(|m| m.use_of(&rust_ident(name)));
+            (name.clone(), used)
         })
+        .collect();
+    let mentioned_map: BTreeMap<String, Option<bool>> = use_map
+        .iter()
+        .map(|(name, used)| (name.clone(), used.map(|u| u == RustUse::Production)))
         .collect();
 
     let mut law_coverages = Vec::with_capacity(laws.len());
@@ -15783,6 +16007,7 @@ pub fn analyze_coverage(
             direct_laws,
             cone_laws,
             mentioned_in_rust: mentioned_map.get(name).copied().flatten(),
+            rust_use: use_map.get(name).copied().flatten(),
         });
     }
 
@@ -15826,9 +16051,10 @@ pub fn format_coverage_report(report: &CoverageReport) -> Vec<String> {
         } else {
             func.cone_laws.join(", ")
         };
-        let rust_tag = match func.mentioned_in_rust {
-            Some(true) => "; rust=mentioned",
-            Some(false) => "; rust=unmentioned",
+        let rust_tag = match func.rust_use {
+            Some(RustUse::Production) => "; rust=mentioned",
+            Some(RustUse::TestOnly) => "; rust=tests-only",
+            Some(RustUse::Unused) => "; rust=unmentioned",
             None => "",
         };
         lines.push(format!(
@@ -15859,8 +16085,24 @@ pub fn format_coverage_report(report: &CoverageReport) -> Vec<String> {
         } else {
             for law in &report.laws {
                 if law.only_unmentioned_functions {
+                    let tests_only: Vec<&str> = law
+                        .unmentioned_direct_functions
+                        .iter()
+                        .filter(|f| {
+                            report
+                                .functions
+                                .iter()
+                                .any(|c| &c.name == *f && c.rust_use == Some(RustUse::TestOnly))
+                        })
+                        .map(String::as_str)
+                        .collect();
+                    let suffix = if tests_only.is_empty() {
+                        String::new()
+                    } else {
+                        format!(" (called only from tests: {})", tests_only.join(", "))
+                    };
                     lines.push(format!(
-                        "RustyBends coverage [law {}]: names only functions not mentioned in Rust sources: {}",
+                        "RustyBends coverage [law {}]: names only functions not mentioned in Rust sources: {}{suffix}",
                         law.name,
                         law.unmentioned_direct_functions.join(", ")
                     ));
@@ -15949,21 +16191,141 @@ pub fn has_rust_source_dirs(root: &Path) -> bool {
         .any(|sub| root.join(sub).is_dir())
 }
 
-fn scan_crate_rust_idents(root: &Path) -> Result<HashSet<String>, String> {
-    let mut rs_files = Vec::new();
-    for sub in ["src", "tests", "benches"] {
-        let dir = root.join(sub);
-        if dir.is_dir() {
-            collect_rust_files(&dir, &mut rs_files)?;
+/// Function references found in host Rust sources, split into production and test code.
+#[derive(Debug, Default)]
+pub(crate) struct RustMentions {
+    production: HashSet<String>,
+    tests: HashSet<String>,
+}
+
+impl RustMentions {
+    fn use_of(&self, ident: &str) -> RustUse {
+        if self.production.contains(ident) {
+            RustUse::Production
+        } else if self.tests.contains(ident) {
+            RustUse::TestOnly
+        } else {
+            RustUse::Unused
         }
     }
-    rs_files.sort();
-    let mut idents = HashSet::new();
-    for file in rs_files {
-        let text = fs::read_to_string(&file).map_err(|e| e.to_string())?;
-        collect_rust_idents(&text, &mut idents);
+}
+
+fn scan_crate_rust_mentions(root: &Path) -> Result<RustMentions, String> {
+    let mut mentions = RustMentions::default();
+    for sub in ["src", "tests", "benches"] {
+        let dir = root.join(sub);
+        if !dir.is_dir() {
+            continue;
+        }
+        let mut rs_files = Vec::new();
+        collect_rust_files(&dir, &mut rs_files)?;
+        rs_files.sort();
+        for file in rs_files {
+            let text = fs::read_to_string(&file).map_err(|e| e.to_string())?;
+            collect_rust_mentions(&text, sub != "src", &mut mentions);
+        }
     }
-    Ok(idents)
+    Ok(mentions)
+}
+
+/// Keywords after which an identifier is being declared or bound, not referred to.
+const RUST_BINDING_KEYWORDS: &[&str] = &[
+    "fn",
+    "let",
+    "mut",
+    "struct",
+    "enum",
+    "union",
+    "mod",
+    "const",
+    "static",
+    "type",
+    "trait",
+    "macro_rules",
+];
+
+/// Records identifiers that host Rust code uses as a function: a call `name(..)` or
+/// `name::<T>(..)`, a path `module::name`, or a name in a `use` statement. Method calls
+/// and field accesses (`x.name`), declarations (`fn name`, `let name`), struct fields, and
+/// plain local variables do not count. References inside `#[cfg(test)]` / `#[test]` items,
+/// or anywhere when `all_test` is set (files under `tests/` and `benches/`), are test-only.
+pub(crate) fn collect_rust_mentions(source: &str, all_test: bool, out: &mut RustMentions) {
+    let toks = rust_tokens(source);
+    let mut depth = 0usize;
+    let mut test_until: Option<usize> = None;
+    let mut pending_test = false;
+    let mut in_use = false;
+    let text = |i: usize| toks.get(i).map(|t| t.text.as_str()).unwrap_or("");
+    for (i, tok) in toks.iter().enumerate() {
+        let t = tok.text.as_str();
+        // Attributes: #[cfg(test)], #[test], #[bench] mark the next item as test code.
+        if t == "#" && text(i + 1) == "[" {
+            let is_test_attr = matches!(
+                (text(i + 2), text(i + 3), text(i + 4), text(i + 5)),
+                ("test" | "bench", "]", _, _) | ("cfg", "(", "test", ")")
+            );
+            if is_test_attr {
+                pending_test = true;
+            }
+            continue;
+        }
+        match t {
+            "{" => {
+                if pending_test && test_until.is_none() {
+                    test_until = Some(depth);
+                }
+                pending_test = false;
+                depth += 1;
+                continue;
+            }
+            "}" => {
+                depth = depth.saturating_sub(1);
+                if test_until == Some(depth) {
+                    test_until = None;
+                }
+                continue;
+            }
+            ";" => {
+                if test_until.is_none() {
+                    pending_test = false;
+                }
+                in_use = false;
+                continue;
+            }
+            "use" if tok.is_ident => {
+                in_use = true;
+                continue;
+            }
+            _ => {}
+        }
+        if !tok.is_ident {
+            continue;
+        }
+        let prev = if i > 0 { text(i - 1) } else { "" };
+        if prev == "." || RUST_BINDING_KEYWORDS.contains(&prev) {
+            continue;
+        }
+        let next = text(i + 1);
+        let is_call = next == "(" || (next == ":" && text(i + 2) == ":" && text(i + 3) == "<");
+        let after_path = prev == ":" && i >= 2 && text(i - 2) == ":";
+        if !(in_use || is_call || after_path) {
+            continue;
+        }
+        // `name::rest`: only the last path segment names the function.
+        if next == ":" && text(i + 2) == ":" && text(i + 3) != "<" {
+            continue;
+        }
+        if all_test || test_until.is_some() || pending_test {
+            out.tests.insert(t.to_string());
+        } else {
+            out.production.insert(t.to_string());
+        }
+    }
+}
+
+struct RustTok {
+    text: String,
+    is_ident: bool,
 }
 
 fn collect_rust_files(dir: &Path, out: &mut Vec<PathBuf>) -> Result<(), String> {
@@ -15992,9 +16354,11 @@ fn is_rust_ident_continue(b: u8) -> bool {
     b.is_ascii_alphanumeric() || b == b'_'
 }
 
-/// Tokenizes Rust source identifiers (including raw `r#ident` tokens) while ignoring
-/// line/block comments, normal/byte/c/raw string literals, char literals, and lifetimes.
-pub(crate) fn collect_rust_idents(source: &str, out: &mut HashSet<String>) {
+/// Identifiers and single-character punctuation of Rust source (including raw
+/// `r#ident` tokens), skipping line/block comments, normal/byte/c/raw string literals,
+/// numbers, char literals, and lifetimes.
+fn rust_tokens(source: &str) -> Vec<RustTok> {
+    let mut out: Vec<RustTok> = Vec::new();
     let bytes = source.as_bytes();
     let mut i = 0usize;
 
@@ -16087,7 +16451,10 @@ pub(crate) fn collect_rust_idents(source: &str, out: &mut HashSet<String>) {
                 while i < bytes.len() && is_rust_ident_continue(bytes[i]) {
                     i += 1;
                 }
-                out.insert(source[start..i].to_string());
+                out.push(RustTok {
+                    text: source[start..i].to_string(),
+                    is_ident: true,
+                });
                 continue;
             }
         }
@@ -16137,12 +16504,30 @@ pub(crate) fn collect_rust_idents(source: &str, out: &mut HashSet<String>) {
             while i < bytes.len() && is_rust_ident_continue(bytes[i]) {
                 i += 1;
             }
-            out.insert(source[start..i].to_string());
+            out.push(RustTok {
+                text: source[start..i].to_string(),
+                is_ident: true,
+            });
             continue;
         }
 
-        i += 1;
+        if b.is_ascii_digit() {
+            while i < bytes.len() && (bytes[i].is_ascii_alphanumeric() || bytes[i] == b'_') {
+                i += 1;
+            }
+            continue;
+        }
+
+        let ch = source[i..].chars().next().unwrap();
+        if !ch.is_whitespace() {
+            out.push(RustTok {
+                text: ch.to_string(),
+                is_ident: false,
+            });
+        }
+        i += ch.len_utf8();
     }
+    out
 }
 
 fn skip_quoted_string(bytes: &[u8], mut i: usize) -> usize {
@@ -16385,6 +16770,138 @@ impl Holder {
             vec!["a_ok", "hidden_ok", "self_ok"]
         );
 
+        let _ = fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn coverage_separates_production_calls_from_tests_fields_and_methods() {
+        let root = tmp_crate("prod_vs_test");
+        fs::create_dir_all(root.join("tests")).unwrap();
+        fs::write(
+            root.join("verified/core.bend"),
+            r#"import Base
+
+def step(+n: Nat) -> Nat:
+  Nat.add(n, 1n)
+
+def size(+n: Nat) -> Nat:
+  n
+
+def check(+n: Nat) -> Nat:
+  n
+
+def total(+n: Nat) -> Nat:
+  Nat.add(n, n)
+
+def scaled(+n: Nat) -> Nat:
+  Nat.mul(n, 2n)
+
+def imported(+n: Nat) -> Nat:
+  n
+
+# promise: step adds one
+law step_adds_one:
+  for +n: Nat
+  {step(n) == Nat.add(n, 1n) : Nat}
+
+# promise: size is the identity
+law size_is_id:
+  for +n: Nat
+  {size(n) == n : Nat}
+
+# promise: check is the identity
+law check_is_id:
+  for +n: Nat
+  {check(n) == n : Nat}
+
+# promise: total doubles
+law total_doubles:
+  for +n: Nat
+  {total(n) == Nat.add(n, n) : Nat}
+
+# promise: scaled doubles
+law scaled_doubles:
+  for +n: Nat
+  {scaled(n) == Nat.mul(n, 2n) : Nat}
+
+# promise: imported is the identity
+law imported_is_id:
+  for +n: Nat
+  {imported(n) == n : Nat}
+"#,
+        )
+        .unwrap();
+        fs::write(
+            root.join("src/main.rs"),
+            r#"mod verified {
+    include!(concat!(env!("OUT_DIR"), "/verified.rs"));
+}
+use verified::imported;
+struct Counter { step: u64, size: u64 }
+impl Counter {
+    fn check(&self) -> bool { self.step < self.size }
+}
+fn main() {
+    let c = Counter { step: 1, size: 2 };
+    let step = c.step;
+    let _ = c.check();
+    let _ = (step, imported);
+    let f = verified::scaled;
+    println!("{}", f(2));
+}
+#[cfg(test)]
+mod tests {
+    #[test]
+    fn uses_total() {
+        assert_eq!(super::verified::total(2), 4);
+    }
+}
+"#,
+        )
+        .unwrap();
+        fs::write(
+            root.join("tests/it.rs"),
+            "#[test]\nfn calls_size() { let _ = my_app::verified::size(3); }\n",
+        )
+        .unwrap();
+
+        let report = analyze_coverage_dir(&root.join("verified"), Some(&root)).unwrap();
+        let by_fn: HashMap<&str, &FunctionCoverage> = report
+            .functions
+            .iter()
+            .map(|f| (f.name.as_str(), f))
+            .collect();
+        // Fields, locals, and methods with the same name do not count.
+        assert_eq!(by_fn["step"].rust_use, Some(RustUse::Unused));
+        assert_eq!(by_fn["check"].rust_use, Some(RustUse::Unused));
+        // Calls from #[cfg(test)] and tests/ are test-only.
+        assert_eq!(by_fn["total"].rust_use, Some(RustUse::TestOnly));
+        assert_eq!(by_fn["size"].rust_use, Some(RustUse::TestOnly));
+        assert_eq!(by_fn["total"].mentioned_in_rust, Some(false));
+        // Paths and `use` imports are production references.
+        assert_eq!(by_fn["scaled"].rust_use, Some(RustUse::Production));
+        assert_eq!(by_fn["imported"].rust_use, Some(RustUse::Production));
+        assert_eq!(
+            report.laws_only_unmentioned,
+            vec![
+                "check_is_id",
+                "size_is_id",
+                "step_adds_one",
+                "total_doubles"
+            ]
+        );
+        let lines = format_coverage_report(&report);
+        assert!(
+            lines
+                .iter()
+                .any(|l| l.contains("[fn total]") && l.contains("rust=tests-only")),
+            "{lines:#?}"
+        );
+        assert!(
+            lines.iter().any(|l| l.contains("[law total_doubles]")
+                && l.ends_with("(called only from tests: total)")),
+            "{lines:#?}"
+        );
         let _ = fs::remove_dir_all(&root);
     }
 }
@@ -18075,7 +18592,7 @@ def cancel_idempotent(s):
 
 - **`Nat` arithmetic (checked `u64` on growth, saturating subtraction, total division):**
   - `Nat.add`, `Nat.mul`, `Nat.succ` -> `checked_add` / `checked_mul` (panics with `"rusty-bends: Nat overflow"` on `u64` overflow, so emitted Rust agrees with mathematical `Nat` wherever it returns and never silently saturates past `u64::MAX` into a law-violating state).
-  - **List the panic sites:** `RUSTY_BENDS_LIST_PANICS=1 cargo check` prints every checked-growth op as `RustyBends panic [function]: Nat.mul at verified/file.bend:12`, so you can review which functions take untrusted input.
+  - **List the panic sites:** `RUSTY_BENDS_LIST_PANICS=1 cargo check` prints every checked-growth op as `RustyBends panic [function]: Nat.mul at verified/file.bend:12`, so you can review which functions take untrusted input. Callers that reach such a function through non-total calls are listed too, as `call <callee>`.
   - **Refuse instead of panicking (`# rusty-bends: total`):** put `# rusty-bends: total` in the comment block directly above a `def` and it emits as `Option<T>`, returning `None` on overflow anywhere in its call tree (callees get private `Option` variants; their public versions are unchanged). Callers in other `def`s keep panicking semantics (listed as `call <f>`). Its generated per-law tests still run.
   - **Write limit checks that cannot overflow.** Compare against a quotient instead of building a product from untrusted input:
     ```bend
