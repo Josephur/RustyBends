@@ -2998,6 +2998,8 @@ fn compute_cone_hash_fast(
     buf.extend_from_slice(b"rb-mutate-");
     buf.extend_from_slice(MUTATE_CACHE_VERSION.as_bytes());
     buf.push(0);
+    buf.extend_from_slice(crate::BUILDER_HASH.as_bytes());
+    buf.push(0);
     buf.extend_from_slice(law.name.as_bytes());
     buf.push(0);
     for v in &law.vars {

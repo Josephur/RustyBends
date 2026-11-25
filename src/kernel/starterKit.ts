@@ -227,7 +227,7 @@ def cancel_idempotent(s):
 4. **NEVER delete, comment out, or weaken laws in \`verified/\`.**
    \`rusty-bends.lock\` uses an AST/token canonicalizer (safe across whitespace/comment edits, strict on law changes) and fails with \`E_LAW_LOCK_TAMPERED\`. Use \`RUSTY_BENDS_UPDATE_LAWS=<name>[,<name>...]\` to seal specific reviewed laws, \`=comments\` to refresh comment lines alone without sealing, or \`=1\` to rewrite the whole lock; every lock write prints what was sealed, re-accepted, removed, or reworded.
 5. **Every new law MUST have a plain-English \`# promise:\` comment directly above \`law <name>:\`** (\`# harm:\` is optional). Missing promises on new laws fail with \`E_LAW_NO_PROMISE\` (locked laws warn if missing). Promises are stored in \`rusty-bends.lock\` outside the law hash, so improving \`# promise:\` wording is reported in build output without tripping \`E_LAW_LOCK_TAMPERED\`. Run \`RUSTY_BENDS_LIST_LAWS=1 cargo check\` or \`cargo run -p rusty-bends-build --bin rusty-bends-laws -- verified\` to print every law as \`name: promise\`, and \`RUSTY_BENDS_LIST_COVERAGE=1 cargo check\` (or \`rusty-bends-laws --coverage verified\`) to check which emitted functions no law reaches and which laws name only functions never called by Rust sources.
-6. **Lean \`--verdict\` kernel cross-check**: \`rusty-bends-build\` always runs \`bend <file> --check-only\` (which checks all laws and proofs). By default (\`BEND_VERDICT=auto\`), it also runs \`--verdict\` whenever Lean (\`~/.elan/bin/lean\`) or \`$BENDTT\` is installed, and skips \`--verdict\` with a warning otherwise. Set \`BEND_VERDICT=require\` in CI to enforce Lean cross-checking, or \`BEND_VERDICT=off\` to disable it. The incremental build cache records the verdict status (\`ran\`/\`skipped\`/\`off\`), CLI flags, and Bend binary/version, so switching from \`off\` or \`skipped\` to \`require\` re-runs verification; set \`RUSTY_BENDS_NO_CACHE=1\` to bypass the cache unconditionally.
+6. **Lean \`--verdict\` kernel cross-check**: \`rusty-bends-build\` always runs \`bend <file> --check-only\` (which checks all laws and proofs). By default (\`BEND_VERDICT=auto\`), it also runs \`--verdict\` whenever Lean (\`~/.elan/bin/lean\`) or \`$BENDTT\` is installed, and skips \`--verdict\` with a warning otherwise. Set \`BEND_VERDICT=require\` in CI to enforce Lean cross-checking, or \`BEND_VERDICT=off\` to disable it. The incremental build cache records the \`rusty-bends-build\` source hash, verdict status (\`ran\`/\`skipped\`/\`off\`), CLI flags, and Bend binary/version, so updating \`rusty-bends-build\` or switching from \`off\` or \`skipped\` to \`require\` re-runs verification; set \`RUSTY_BENDS_NO_CACHE=1\` to bypass the cache unconditionally.
 7. **Pin Bend 2 if upstream drifts**: uncomment the version prefix (e.g. \`2.0.\`) in \`bend.pin\` or set \`BEND_PIN_VERSION\`.
 `;
 
@@ -245,6 +245,106 @@ license = "Apache-2.0"
 
 [dependencies]
 # Zero external dependencies — Rust stdlib only!
+`;
+
+  const buildCrateBuildRs = `//! Build script for \`rusty-bends-build\`.
+//!
+//! Computes a deterministic compile-time hash of this crate's own manifest,
+//! build script, \`src/\`, and \`lemmas/\` sources and exposes it via
+//! \`RUSTY_BENDS_BUILD_HASH\`. Downstream build caches include this hash so
+//! updating or patching \`rusty-bends-build\` automatically invalidates cached
+//! \`OUT_DIR/verified.rs\` and mutation results without needing \`cargo clean\`.
+
+use std::env;
+use std::fs;
+use std::path::{Path, PathBuf};
+
+const FNV_OFFSET_BASIS_128: u128 = 0x6c62_272e_07bb_0142_62b8_2175_6295_c58d;
+const FNV_PRIME_128: u128 = 0x0000_0000_0100_0000_0000_0000_0000_013b;
+
+fn fnv1a_update(hash: &mut u128, bytes: &[u8]) {
+    for &b in bytes {
+        *hash ^= u128::from(b);
+        *hash = hash.wrapping_mul(FNV_PRIME_128);
+    }
+}
+
+fn collect_tree(root: &Path, rel: &Path, dirs: &mut Vec<String>, files: &mut Vec<String>) {
+    let full = root.join(rel);
+    if !full.is_dir() {
+        return;
+    }
+    dirs.push(rel.to_string_lossy().replace('\\\\', "/"));
+    let mut entries: Vec<PathBuf> = fs::read_dir(&full)
+        .unwrap_or_else(|e| panic!("failed to read {}: {e}", full.display()))
+        .map(|entry| {
+            entry
+                .unwrap_or_else(|e| panic!("failed to read dir entry in {}: {e}", full.display()))
+                .path()
+        })
+        .collect();
+    entries.sort();
+    for path in entries {
+        let Some(name) = path.file_name() else {
+            continue;
+        };
+        let child_rel = rel.join(name);
+        if path.is_dir() {
+            collect_tree(root, &child_rel, dirs, files);
+        } else if path.is_file() {
+            files.push(child_rel.to_string_lossy().replace('\\\\', "/"));
+        }
+    }
+}
+
+fn main() {
+    let manifest_dir =
+        PathBuf::from(env::var_os("CARGO_MANIFEST_DIR").expect("CARGO_MANIFEST_DIR must be set"));
+
+    let mut dirs = Vec::new();
+    let mut files = Vec::new();
+    for top in ["Cargo.toml", "build.rs"] {
+        if manifest_dir.join(top).is_file() {
+            files.push(top.to_string());
+        }
+    }
+    for tree in ["src", "lemmas"] {
+        collect_tree(&manifest_dir, Path::new(tree), &mut dirs, &mut files);
+    }
+
+    dirs.sort();
+    dirs.dedup();
+    files.sort();
+    files.dedup();
+
+    for dir in &dirs {
+        println!(
+            "cargo:rerun-if-changed={}",
+            manifest_dir.join(dir).display()
+        );
+    }
+    for file in &files {
+        println!(
+            "cargo:rerun-if-changed={}",
+            manifest_dir.join(file).display()
+        );
+    }
+
+    let mut hash = FNV_OFFSET_BASIS_128;
+    fnv1a_update(&mut hash, b"rb-builder-v1\\0");
+    for file in &files {
+        let full = manifest_dir.join(file);
+        let bytes =
+            fs::read(&full).unwrap_or_else(|e| panic!("failed to read {}: {e}", full.display()));
+        fnv1a_update(&mut hash, file.as_bytes());
+        fnv1a_update(&mut hash, b"\\0");
+        fnv1a_update(&mut hash, &(bytes.len() as u64).to_le_bytes());
+        fnv1a_update(&mut hash, &bytes);
+        fnv1a_update(&mut hash, b"\\0");
+    }
+
+    println!("cargo:rustc-env=RUSTY_BENDS_BUILD_HASH={hash:032x}");
+}
 `;
 
   const buildCrateLock = `//! AST/token-aware anti-cheat law lock for RustyBends v1.
@@ -5444,6 +5544,11 @@ impl Config {
 /// Every definition is a \`q=0\` proof/type helper and is completely erased before Rust codegen.
 pub const NAT_LEMMAS_BEND: &str = include_str!("../lemmas/nat_lemmas.bend");
 
+/// Compile-time hash of this \`rusty-bends-build\` crate's sources (\`build.rs\`, \`Cargo.toml\`,
+/// \`src/\`, \`lemmas/\`), baked into \`OUT_DIR\` cache stamps so updating the build crate
+/// invalidates stale generated Rust and mutation caches automatically.
+pub const BUILDER_HASH: &str = env!("RUSTY_BENDS_BUILD_HASH");
+
 /// Writes the bundled \`nat_lemmas.bend\` into \`dir\` (typically \`"verified"\`), creating
 /// the directory if needed. Only writes when the file is missing or differs, keeping
 /// mtime stable for Cargo incremental rebuilds.
@@ -5671,11 +5776,13 @@ fn emit_cargo_warning(msg: &str) {
 fn format_cache_stamp(
     cfg: &Config,
     files_hash: &str,
+    builder_hash: &str,
     verdict: VerdictApplied,
     bend_version: &str,
 ) -> String {
     format!(
-        "v3\\nhash={files_hash}\\nverdict={}\\nbend_bin={}\\nbend_version={}\\ncheck_flag={}\\nverdict_flag={}\\n",
+        "v4\\nhash={files_hash}\\nbuilder={}\\nverdict={}\\nbend_bin={}\\nbend_version={}\\ncheck_flag={}\\nverdict_flag={}\\n",
+        sanitize_cache_field(builder_hash),
         verdict.as_str(),
         sanitize_cache_field(&cfg.bend_bin),
         sanitize_cache_field(bend_version),
@@ -5707,6 +5814,25 @@ where
 fn run_pipeline<F>(
     cfg: &Config,
     bend_version: Option<&str>,
+    verdict_runtime_available: bool,
+    checker: F,
+) -> Result<Option<PathBuf>, String>
+where
+    F: FnMut(&Path, bool) -> Result<VerdictApplied, String>,
+{
+    run_pipeline_with_builder(
+        cfg,
+        bend_version,
+        BUILDER_HASH,
+        verdict_runtime_available,
+        checker,
+    )
+}
+
+fn run_pipeline_with_builder<F>(
+    cfg: &Config,
+    bend_version: Option<&str>,
+    builder_hash: &str,
     verdict_runtime_available: bool,
     mut checker: F,
 ) -> Result<Option<PathBuf>, String>
@@ -5751,14 +5877,14 @@ where
         emit_cargo_warning(&listing);
     }
 
-    // 2. Check incremental build cache (includes file contents, verdict mode/status, flags, and bend version)
+    // 2. Check incremental build cache (file contents, builder hash, verdict mode/status, flags, and bend version)
     fs::create_dir_all(&cfg.out_dir).map_err(|e| e.to_string())?;
     let cache_file = cfg.out_dir.join("rusty-bends.cache");
     let verified_rs = cfg.out_dir.join("verified.rs");
     let combined_hash = hash_files(&bend_files)?;
     let expected_verdict = expected_verdict_applied(cfg, verdict_runtime_available);
-    let expected_stamp =
-        bend_version.map(|ver| format_cache_stamp(cfg, &combined_hash, expected_verdict, ver));
+    let expected_stamp = bend_version
+        .map(|ver| format_cache_stamp(cfg, &combined_hash, builder_hash, expected_verdict, ver));
 
     let cache_hit = !cfg.no_cache
         && expected_stamp.as_ref().is_some_and(|stamp| {
@@ -5893,7 +6019,7 @@ where
 
     // 7. Persist passing build cache stamp (skip if Bend version could not be read so stale runs never hit)
     if let Some(ver) = bend_version {
-        let stamp = format_cache_stamp(cfg, &combined_hash, applied_verdict, ver);
+        let stamp = format_cache_stamp(cfg, &combined_hash, builder_hash, applied_verdict, ver);
         fs::write(&cache_file, stamp).map_err(|e| e.to_string())?;
     }
     Ok(emitted_path)
@@ -7350,6 +7476,216 @@ law order_fits_empty:
         for line in &lines {
             assert!(!line.contains('\\n'));
         }
+    }
+
+    #[test]
+    fn cache_invalidates_when_builder_hash_changes() {
+        assert_eq!(BUILDER_HASH.len(), 32, "BUILDER_HASH={BUILDER_HASH}");
+        assert!(
+            BUILDER_HASH.chars().all(|c| c.is_ascii_hexdigit()),
+            "BUILDER_HASH={BUILDER_HASH}"
+        );
+
+        let root = temp_workspace("issue24_builder_hash");
+        fs::write(
+            root.join("verified/core.bend"),
+            "import Base\\n\\ndef add_one(+n: Nat) -> Nat:\\n  Nat.add(n, 1n)\\n\\n# promise: zero increments to one\\nlaw add_one_zero:\\n  {add_one(0n) == 1n : Nat}\\n",
+        )
+        .unwrap();
+
+        let cfg = make_cfg(&root);
+        let mut calls = 0usize;
+        let out_rs =
+            run_pipeline_with_builder(&cfg, Some("bend 2.0.40"), "builder_a", true, |_, _| {
+                calls += 1;
+                Ok(VerdictApplied::Ran)
+            })
+            .expect("first build with builder_a succeeds")
+            .expect("verified.rs emitted");
+        assert_eq!(calls, 1);
+        let cache_a = fs::read_to_string(root.join("out/rusty-bends.cache")).unwrap();
+        assert!(cache_a.starts_with("v4\\n"), "{cache_a}");
+        assert!(cache_a.contains("builder=builder_a\\n"), "{cache_a}");
+
+        // Repeating with identical builder hash hits cache.
+        run_pipeline_with_builder(&cfg, Some("bend 2.0.40"), "builder_a", true, |_, _| {
+            calls += 1;
+            Ok(VerdictApplied::Ran)
+        })
+        .expect("second build with builder_a hits cache");
+        assert_eq!(calls, 1);
+
+        // Switching builder hash invalidates the warm stamp and regenerates verified.rs.
+        fs::write(&out_rs, "// stale-verified\\n").unwrap();
+        run_pipeline_with_builder(&cfg, Some("bend 2.0.40"), "builder_b", true, |_, _| {
+            calls += 1;
+            Ok(VerdictApplied::Ran)
+        })
+        .expect("build with builder_b misses cache and regenerates");
+        assert_eq!(calls, 2);
+        let emitted_b = fs::read_to_string(&out_rs).unwrap();
+        assert!(
+            !emitted_b.contains("stale-verified"),
+            "expected regenerated verified.rs, got:\\n{emitted_b}"
+        );
+        let cache_b = fs::read_to_string(root.join("out/rusty-bends.cache")).unwrap();
+        assert!(cache_b.contains("builder=builder_b\\n"), "{cache_b}");
+
+        let _ = fs::remove_dir_all(&root);
+    }
+
+    fn copy_dir_recursive(src: &Path, dst: &Path) {
+        fs::create_dir_all(dst).unwrap();
+        for entry in fs::read_dir(src).unwrap() {
+            let entry = entry.unwrap();
+            let src_path = entry.path();
+            let dst_path = dst.join(entry.file_name());
+            if src_path.is_dir() {
+                copy_dir_recursive(&src_path, &dst_path);
+            } else if src_path.is_file() {
+                fs::copy(&src_path, &dst_path).unwrap();
+            }
+        }
+    }
+
+    fn find_app_out_file(build_dir: &Path, file_name: &str) -> PathBuf {
+        let mut matches = Vec::new();
+        for entry in fs::read_dir(build_dir).unwrap() {
+            let path = entry.unwrap().path();
+            let is_app = path
+                .file_name()
+                .and_then(|n| n.to_str())
+                .is_some_and(|n| n.starts_with("app-"));
+            if is_app {
+                let candidate = path.join("out").join(file_name);
+                if candidate.is_file() {
+                    matches.push(candidate);
+                }
+            }
+        }
+        assert_eq!(
+            matches.len(),
+            1,
+            "expected exactly one {file_name} under {}, got {matches:?}",
+            build_dir.display()
+        );
+        matches.pop().unwrap()
+    }
+
+    #[test]
+    fn cargo_rebuild_invalidates_cache_when_rusty_bends_build_changes() {
+        let root = temp_workspace("issue24_cargo_rebuild");
+        let manifest = Path::new(env!("CARGO_MANIFEST_DIR"));
+        let rb = root.join("rb");
+        fs::create_dir_all(&rb).unwrap();
+        fs::copy(manifest.join("Cargo.toml"), rb.join("Cargo.toml")).unwrap();
+        fs::copy(manifest.join("build.rs"), rb.join("build.rs")).unwrap();
+        copy_dir_recursive(&manifest.join("src"), &rb.join("src"));
+        copy_dir_recursive(&manifest.join("lemmas"), &rb.join("lemmas"));
+
+        let app = root.join("app");
+        fs::create_dir_all(app.join("verified")).unwrap();
+        fs::create_dir_all(app.join("src")).unwrap();
+        fs::write(
+            app.join("Cargo.toml"),
+            "[package]\\nname = \\"app\\"\\nversion = \\"0.1.0\\"\\nedition = \\"2021\\"\\n\\n[workspace]\\n\\n[build-dependencies]\\nrusty-bends-build = { path = \\"../rb\\" }\\n",
+        )
+        .unwrap();
+        fs::write(
+            app.join("build.rs"),
+            "fn main() {\\n    rusty_bends_build::write_nat_lemmas(\\"verified\\").unwrap();\\n    rusty_bends_build::verify_and_emit(\\"verified\\");\\n}\\n",
+        )
+        .unwrap();
+        fs::write(
+            app.join("verified/ledger.bend"),
+            r#"import Base
+import nat_lemmas.bend as L
+
+# Items held after two deliveries arrive.
+def total_items(+a: Nat, +b: Nat) -> Nat:
+  Nat.add(a, b)
+
+# promise: the total never drops below the first delivery
+law total_covers_first:
+  for +a: Nat
+  for +b: Nat
+  {Nat.is_le(a, total_items(a, b)) == True{} : Bool}
+
+def total_covers_first(a, b):
+  L.nat_add_le_r(a, b)
+"#,
+        )
+        .unwrap();
+        fs::write(
+            app.join("src/main.rs"),
+            "mod verified {\\n    include!(concat!(env!(\\"OUT_DIR\\"), \\"/verified.rs\\"));\\n}\\n\\nfn main() {\\n    println!(\\"{}\\", verified::total_items(2, 3));\\n}\\n",
+        )
+        .unwrap();
+
+        let cargo_bin = env::var("CARGO").unwrap_or_else(|_| "cargo".to_string());
+        let real_bend = resolve_bend_bin(
+            env::var("BEND_BIN").ok(),
+            env::var_os("PATH"),
+            env::var_os("HOME").map(PathBuf::from),
+        );
+        let run_cargo = || {
+            let out = Command::new(&cargo_bin)
+                .current_dir(&app)
+                .args(["check", "--offline"])
+                .env("CARGO_TARGET_DIR", app.join("target"))
+                .env_remove("RUSTY_BENDS_NO_CACHE")
+                .env_remove("RUSTY_BENDS_UPDATE_LAWS")
+                .env_remove("RUSTY_BENDS_MUTATE")
+                .env("BEND_VERDICT", "off")
+                .env("BEND_BIN", &real_bend)
+                .output()
+                .expect("failed to invoke cargo check");
+            assert!(
+                out.status.success(),
+                "cargo check --offline failed:\\nstdout:\\n{}\\nstderr:\\n{}",
+                String::from_utf8_lossy(&out.stdout),
+                String::from_utf8_lossy(&out.stderr)
+            );
+        };
+
+        run_cargo();
+        let build_out_dir = app.join("target/debug/build");
+        let verified_path = find_app_out_file(&build_out_dir, "verified.rs");
+        let cache_path = find_app_out_file(&build_out_dir, "rusty-bends.cache");
+        let before_rs = fs::read_to_string(&verified_path).unwrap();
+        let before_first_line = before_rs.lines().next().unwrap_or("");
+        assert!(
+            before_first_line.starts_with("// @generated by rusty-bends-build v1")
+                && !before_first_line.contains("NEW-EMITTER"),
+            "unexpected initial header: {before_first_line}"
+        );
+        let cache_before = fs::read_to_string(&cache_path).unwrap();
+
+        // Update only \`rb/src/emit.rs\`; the app's \`.bend\` files stay untouched.
+        let emit_path = rb.join("src/emit.rs");
+        let emit_src = fs::read_to_string(&emit_path).unwrap();
+        let patched_emit = emit_src.replacen(
+            "// @generated by rusty-bends-build v1 (Verified Core -> Pure Rust)",
+            "// @generated by rusty-bends-build v1 (Verified Core -> Pure Rust) NEW-EMITTER",
+            1,
+        );
+        assert_ne!(patched_emit, emit_src, "expected header literal in emit.rs");
+        fs::write(&emit_path, patched_emit).unwrap();
+
+        run_cargo();
+        let after_rs = fs::read_to_string(&verified_path).unwrap();
+        let after_first_line = after_rs.lines().next().unwrap_or("");
+        assert!(
+            after_first_line.contains("NEW-EMITTER"),
+            "expected regenerated verified.rs after rb change, still got: {after_first_line}"
+        );
+        let cache_after = fs::read_to_string(&cache_path).unwrap();
+        assert_ne!(
+            cache_after, cache_before,
+            "cache stamp must update with new builder hash"
+        );
+
+        let _ = fs::remove_dir_all(&root);
     }
 }
 `;
@@ -12654,6 +12990,8 @@ fn compute_cone_hash_fast(
     buf.extend_from_slice(b"rb-mutate-");
     buf.extend_from_slice(MUTATE_CACHE_VERSION.as_bytes());
     buf.push(0);
+    buf.extend_from_slice(crate::BUILDER_HASH.as_bytes());
+    buf.push(0);
     buf.extend_from_slice(law.name.as_bytes());
     buf.push(0);
     for v in &law.vars {
@@ -16824,6 +17162,12 @@ def nat_align_down_le(a: Nat, bp: Nat) -> {Nat.is_le(Nat.mul(Nat.div(a, 1n+bp), 
       language: 'toml',
       summary: 'Zero-dependency v1.0.0 build crate manifest ([build-dependencies] only).',
       content: buildCrateCargo,
+    },
+    {
+      path: 'rusty-bends-build/build.rs',
+      language: 'rust',
+      summary: 'Computes a compile-time source hash of rusty-bends-build so updates invalidate downstream build caches.',
+      content: buildCrateBuildRs,
     },
     {
       path: 'rusty-bends-build/src/lib.rs',

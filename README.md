@@ -136,7 +136,7 @@ Import it in any file under `verified/` with `import nat_lemmas.bend as L`. Ever
 | `RUSTY_BENDS_LIST_LAWS` | `1`: prints each law as `name: promise` during builds so reviewers can read plain-English guarantees without reading Bend 2 syntax (also available via `cargo run -p rusty-bends-build --bin rusty-bends-laws -- [dir]`). Laws with an `# unchecked:` marker show `[unchecked: <why>]`. |
 | `RUSTY_BENDS_LIST_PANICS` | `1`: prints every checked-growth `Nat` panic site in the emitted Rust as `RustyBends panic [function]: op at file:line`, plus a total. |
 | `RUSTY_BENDS_LIST_COVERAGE` | `1`: prints each emitted function's direct and transitive law coverage, functions reached by no law, and laws naming only functions never mentioned in `src/`/`tests/`/`benches/` (also via `rusty-bends-laws --coverage [dir]`). |
-| `RUSTY_BENDS_NO_CACHE` | `1`: bypasses the incremental `OUT_DIR/rusty-bends.cache` check for that build (the cache is also keyed by verdict status, CLI flags, and Bend binary/version). |
+| `RUSTY_BENDS_NO_CACHE` | `1`: bypasses the incremental `OUT_DIR/rusty-bends.cache` check for that build (the cache is also keyed by the `rusty-bends-build` source hash, verdict status, CLI flags, and Bend binary/version). |
 
 ## Repository layout
 
