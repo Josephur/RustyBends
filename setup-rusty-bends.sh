@@ -6039,7 +6039,7 @@ pub(crate) fn split_top_level_once(s: &str, delim: char) -> Option<(&str, &str)>
     None
 }
 
-fn split_last_additive(s: &str) -> Option<(char, &str, &str)> {
+pub(crate) fn split_last_additive(s: &str) -> Option<(char, &str, &str)> {
     let mut depth = 0i32;
     let mut found = None;
     let bytes = s.as_bytes();
@@ -9351,8 +9351,8 @@ cat << 'RUSTY_BENDS_EOF' > "rusty-bends-build/src/mutate.rs"
 
 use crate::emit::{
     collect_law_source_slices, emit_items_to_rust, leading_indent, parse_book_items,
-    split_case_arm, split_top_level, split_top_level_once, CtorInfo, Def, Quantity, TypeDef,
-    TypeEnv,
+    split_case_arm, split_last_additive, split_top_level, split_top_level_once, CtorInfo, Def,
+    Quantity, TypeDef, TypeEnv,
 };
 use crate::law_test::{
     create_temp_eval_dir, emit_eval_law_checker, emit_pool_runtime_helpers, parse_laws, ParsedLaw,
@@ -9374,10 +9374,13 @@ const MAX_BOUND_MUTANTS_PER_LAW: usize = 48;
 /// Separate budget for the return-replacement and literal families (Issue #15), so adding
 /// them never changes which bound-pushing mutants are selected.
 const MAX_RETURN_LIT_MUTANTS_PER_LAW: usize = 32;
+/// Separate budget for `Nat.add` <-> `Nat.max` / `Nat.min` swaps (Issue #20), so adding
+/// them never shifts any existing operator family's selection.
+const MAX_ADD_MAX_MIN_MUTANTS_PER_LAW: usize = 32;
 /// At most this many `Nat` literal sites per function are mutated by `NatLit`.
 const MAX_NAT_LIT_SITES_PER_DEF: usize = 8;
 /// Version tag baked into mutation cone hashes so cache keys invalidate when mutators change.
-const MUTATE_CACHE_VERSION: &str = "v2";
+const MUTATE_CACHE_VERSION: &str = "v3";
 /// Maximum mutants packed into one compiled multi-law harness binary.
 const BATCH_MAX_MUTANTS: usize = 160;
 /// Maximum distinct laws packed into one compiled multi-law harness binary.
@@ -10603,6 +10606,23 @@ pub(crate) fn generate_mutants_for_cone_with_stats(
         &mut mutants,
     );
 
+    // `Nat.add` <-> `Nat.max` / `Nat.min` (Issue #20), with its own budget.
+    let mut families: Vec<(&str, Vec<Candidate<'_>>)> = vec![("NatAddMaxMin", Vec::new())];
+    for def in cone_defs {
+        let protected = compute_protected_ranges(&def.body);
+        for (body, desc) in mutate_nat_add_max_min(&def.body, &protected) {
+            families[0].1.push((def, body, desc));
+        }
+    }
+    pick_round_robin_with_stats(
+        &families,
+        MAX_ADD_MAX_MIN_MUTANTS_PER_LAW,
+        &mut seen,
+        &mut dropped_seen,
+        &mut dropped_by_budget,
+        &mut mutants,
+    );
+
     let generated_total = mutants.len() + dropped_by_budget + dropped_by_site_cap;
     GeneratedMutants {
         mutants,
@@ -10670,6 +10690,90 @@ fn pick_round_robin_with_stats(
             record_dropped(def, body, seen, dropped_seen, dropped_by_budget);
         }
     }
+}
+
+/// NatAddMaxMin: swaps `Nat.add` with `Nat.max` / `Nat.min` (including parenthesized infix
+/// `(lhs + rhs : Nat)`), and swaps `Nat.max` / `Nat.min` with `Nat.add`, so bound laws that
+/// would hold if a sum were replaced by a maximum are exposed as survivors unless a lower-bound
+/// law distinguishes them (Issue #20).
+fn mutate_nat_add_max_min(body: &str, protected: &[(usize, usize)]) -> Vec<(String, String)> {
+    let fn_swaps: &[(&str, &[&str])] = &[
+        ("Nat.add", &["Nat.max", "Nat.min"]),
+        ("Nat.max", &["Nat.add"]),
+        ("Nat.min", &["Nat.add"]),
+    ];
+    let mut out = Vec::new();
+    let bytes = body.as_bytes();
+    let mut i = 0usize;
+    while i < bytes.len() {
+        if in_protected(i, protected) {
+            i += 1;
+            continue;
+        }
+        let prev_ident = i > 0
+            && (bytes[i - 1].is_ascii_alphanumeric()
+                || bytes[i - 1] == b'_'
+                || bytes[i - 1] == b'.');
+        if !prev_ident {
+            let mut matched = false;
+            for &(from, tos) in fn_swaps {
+                if body[i..].starts_with(from) {
+                    let end = i + from.len();
+                    let next_ok = end == bytes.len()
+                        || (!bytes[end].is_ascii_alphanumeric()
+                            && bytes[end] != b'_'
+                            && bytes[end] != b'.');
+                    if next_ok {
+                        for &to in tos {
+                            out.push((replace_span(body, i, end, to), format!("{from} -> {to}")));
+                        }
+                        i = end;
+                        matched = true;
+                        break;
+                    }
+                }
+            }
+            if matched {
+                continue;
+            }
+        }
+        if bytes[i] == b'(' {
+            if let Some(close_rel) = find_matching_paren(&body[i..]) {
+                let close_abs = i + close_rel;
+                let inner = body[i + 1..close_abs].trim();
+                if split_top_level(inner, ',').len() == 1 {
+                    if let Some((term_part, ty_part)) = split_top_level_once(inner, ':') {
+                        if ty_part.trim() == "Nat" {
+                            if let Some(('+', lhs, rhs)) = split_last_additive(term_part.trim()) {
+                                if !lhs.is_empty() && !rhs.is_empty() {
+                                    out.push((
+                                        replace_span(
+                                            body,
+                                            i,
+                                            close_abs + 1,
+                                            &format!("Nat.max({lhs}, {rhs})"),
+                                        ),
+                                        "(+ : Nat) -> Nat.max".to_string(),
+                                    ));
+                                    out.push((
+                                        replace_span(
+                                            body,
+                                            i,
+                                            close_abs + 1,
+                                            &format!("Nat.min({lhs}, {rhs})"),
+                                        ),
+                                        "(+ : Nat) -> Nat.min".to_string(),
+                                    ));
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+        }
+        i += 1;
+    }
+    out
 }
 
 /// Re-indents `body` by four spaces under `let __rb_r =` and returns `<wrap>` applied to the
@@ -12754,7 +12858,10 @@ law count_above_limit_refused:
         }
         assert!(
             mutants.len()
-                <= MAX_MUTANTS_PER_LAW + MAX_BOUND_MUTANTS_PER_LAW + MAX_RETURN_LIT_MUTANTS_PER_LAW
+                <= MAX_MUTANTS_PER_LAW
+                    + MAX_BOUND_MUTANTS_PER_LAW
+                    + MAX_RETURN_LIT_MUTANTS_PER_LAW
+                    + MAX_ADD_MAX_MIN_MUTANTS_PER_LAW
         );
         assert!(mutants.iter().any(|m| m.operator == "NatLit"));
     }
@@ -13300,6 +13407,197 @@ law one_nonzero:
             .unwrap();
         assert!(matches!(res[0], EvaluatedLawResult::Complete { .. }));
         assert!(matches!(res[1], EvaluatedLawResult::BuildFailed { .. }));
+
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn nat_add_max_min_exposes_max_replacement_survivor_on_bound_laws_and_catches_sum_bound() {
+        let dir = tmp_dir("issue20_add_max_min");
+        let core = dir.join("ledger.bend");
+        let lock_file = dir.join("rusty-bends.lock");
+        let out_dir = dir.join("out");
+
+        let bound_only_src = r#"import Base
+
+def total_items(+a: Nat, +b: Nat) -> Nat:
+  Nat.add(a, b)
+
+# promise: the total never drops below the first delivery
+law total_covers_first:
+  for +a: Nat
+  for +b: Nat
+  {Nat.is_le(a, total_items(a, b)) == True{} : Bool}
+
+# promise: the total never drops below the second delivery
+law total_covers_second:
+  for +a: Nat
+  for +b: Nat
+  {Nat.is_le(b, total_items(a, b)) == True{} : Bool}
+"#;
+        fs::write(&core, bound_only_src).unwrap();
+        let report = lock::check_law_lock(&lock_file, std::slice::from_ref(&core), false).unwrap();
+        let rep = run_mutation_checks(bound_only_src, &report, MutateMode::Report, &out_dir)
+            .expect("bound laws catch other mutants while exposing Nat.add -> Nat.max");
+
+        for law_name in ["total_covers_first", "total_covers_second"] {
+            let r = rep.reports.iter().find(|r| r.law_name == law_name).unwrap();
+            assert!(
+                r.mutant_outcomes.iter().any(|o| {
+                    o.description == "total_items: Nat.add -> Nat.max [NatAddMaxMin]"
+                        && matches!(o.status, MutantStatus::Survived)
+                }),
+                "{law_name} must report Nat.add -> Nat.max as survived: {:?}",
+                r.mutant_outcomes
+            );
+            assert!(
+                r.mutant_outcomes.iter().any(|o| {
+                    o.description == "total_items: Nat.add -> Nat.min [NatAddMaxMin]"
+                        && matches!(o.status, MutantStatus::Caught(_))
+                }),
+                "{law_name} must catch Nat.add -> Nat.min: {:?}",
+                r.mutant_outcomes
+            );
+        }
+
+        // Adding a law requiring at least the sum catches `Nat.add -> Nat.max`.
+        let with_sum_law = format!(
+            "{bound_only_src}\n# promise: the total is at least the sum of both deliveries\nlaw total_at_least_sum:\n  for +a: Nat\n  for +b: Nat\n  {{Nat.is_le(Nat.add(a, b), total_items(a, b)) == True{{}} : Bool}}\n"
+        );
+        fs::write(&core, &with_sum_law).unwrap();
+        let report2 = lock::check_law_lock(&lock_file, std::slice::from_ref(&core), false).unwrap();
+        let rep2 = run_mutation_checks(&with_sum_law, &report2, MutateMode::Report, &out_dir)
+            .expect("sum bound law passes");
+        let sum_rep = rep2
+            .reports
+            .iter()
+            .find(|r| r.law_name == "total_at_least_sum")
+            .unwrap();
+        assert!(
+            sum_rep.mutant_outcomes.iter().any(|o| {
+                o.description == "total_items: Nat.add -> Nat.max [NatAddMaxMin]"
+                    && matches!(o.status, MutantStatus::Caught(_))
+            }),
+            "total_at_least_sum must catch Nat.add -> Nat.max: {:?}",
+            sum_rep.mutant_outcomes
+        );
+
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn nat_add_max_min_covers_max_min_to_add_infix_nat_and_keyword_names() {
+        let dir = tmp_dir("issue20_variants");
+        let core = dir.join("variants.bend");
+        let lock_file = dir.join("rusty-bends.lock");
+        let out_dir = dir.join("out");
+
+        let src = r#"import Base
+
+def loop(+as: Nat, +in: Nat) -> Nat:
+  ((as + in : Nat) + 1n : Nat)
+
+def pick_hi(+a: Nat, +b: Nat) -> Nat:
+  Nat.max(a, b)
+
+def pick_lo(+a: Nat, +b: Nat) -> Nat:
+  Nat.min(a, b)
+
+def wrap_u32(+a: U32, +b: U32) -> U32:
+  (a + b : U32)
+
+# promise: loop adds one past the sum
+law loop_exact:
+  for +as: Nat
+  for +in: Nat
+  {loop(as, in) == Nat.add(Nat.add(as, in), 1n) : Nat}
+
+# promise: pick_hi matches Nat.max
+law pick_hi_eq:
+  for +a: Nat
+  for +b: Nat
+  {pick_hi(a, b) == Nat.max(a, b) : Nat}
+
+# promise: pick_lo matches Nat.min
+law pick_lo_eq:
+  for +a: Nat
+  for +b: Nat
+  {pick_lo(a, b) == Nat.min(a, b) : Nat}
+
+# promise: wrap_u32 wraps on addition
+law wrap_u32_eq:
+  for +a: U32
+  for +b: U32
+  {wrap_u32(a, b) == (a + b : U32) : U32}
+"#;
+        fs::write(&core, src).unwrap();
+        let report = lock::check_law_lock(&lock_file, std::slice::from_ref(&core), false).unwrap();
+        let summary = run_mutation_checks(src, &report, MutateMode::Report, &out_dir)
+            .expect("NatAddMaxMin variants compile and evaluate cleanly");
+
+        let loop_rep = summary
+            .reports
+            .iter()
+            .find(|r| r.law_name == "loop_exact")
+            .unwrap();
+        assert!(
+            loop_rep.mutant_outcomes.iter().any(|o| {
+                o.description == "loop: (+ : Nat) -> Nat.max [NatAddMaxMin]"
+                    && matches!(o.status, MutantStatus::Caught(_))
+            }),
+            "{:?}",
+            loop_rep.mutant_outcomes
+        );
+        assert!(
+            loop_rep.mutant_outcomes.iter().any(|o| {
+                o.description == "loop: (+ : Nat) -> Nat.min [NatAddMaxMin]"
+                    && matches!(o.status, MutantStatus::Caught(_))
+            }),
+            "{:?}",
+            loop_rep.mutant_outcomes
+        );
+
+        let hi_rep = summary
+            .reports
+            .iter()
+            .find(|r| r.law_name == "pick_hi_eq")
+            .unwrap();
+        assert!(
+            hi_rep.mutant_outcomes.iter().any(|o| {
+                o.description == "pick_hi: Nat.max -> Nat.add [NatAddMaxMin]"
+                    && matches!(o.status, MutantStatus::Caught(_))
+            }),
+            "{:?}",
+            hi_rep.mutant_outcomes
+        );
+
+        let lo_rep = summary
+            .reports
+            .iter()
+            .find(|r| r.law_name == "pick_lo_eq")
+            .unwrap();
+        assert!(
+            lo_rep.mutant_outcomes.iter().any(|o| {
+                o.description == "pick_lo: Nat.min -> Nat.add [NatAddMaxMin]"
+                    && matches!(o.status, MutantStatus::Caught(_))
+            }),
+            "{:?}",
+            lo_rep.mutant_outcomes
+        );
+
+        let u32_rep = summary
+            .reports
+            .iter()
+            .find(|r| r.law_name == "wrap_u32_eq")
+            .unwrap();
+        assert!(
+            !u32_rep
+                .mutant_outcomes
+                .iter()
+                .any(|o| o.operator == "NatAddMaxMin"),
+            "U32 infix + must not produce NatAddMaxMin mutants: {:?}",
+            u32_rep.mutant_outcomes
+        );
 
         let _ = fs::remove_dir_all(&dir);
     }
@@ -14870,7 +15168,7 @@ def cancel_idempotent(s):
   - **Division, modulo & alignment (`b = 1n+bp > 0`):** `nat_mod_lt(a, bp)` (`a % (1n+bp) < 1n+bp`), `nat_div_mod(a, bp)` (`a % (1n+bp) + (a / (1n+bp)) * (1n+bp) == a`), `nat_div_mod_r(a, bp)` (`(a / (1n+bp)) * (1n+bp) + a % (1n+bp) == a`), `nat_div_lt_of_lt_mul(a, n, bp, h)` (`a < n * (1n+bp) -> a / (1n+bp) < n`), `nat_div_lt_of_lt_mul_l(a, n, bp, h)` (`a < (1n+bp) * n -> a / (1n+bp) < n`), `nat_split_unique_q(q1, r1, q2, r2, bp, h1, h2, e)` (`q1 * b + r1 == q2 * b + r2` with `r1, r2 < b` gives `q1 == q2`), `nat_split_unique_r(q1, r1, q2, r2, bp, h1, h2, e)` (`r1 == r2`), `nat_div_split(q, r, bp, h)` (`(q * b + r) / b == q`), `nat_mod_split(q, r, bp, h)` (`(q * b + r) % b == r`), `nat_div_small(a, bp, h)` (`a < b -> a / b == 0`), `nat_mod_small(a, bp, h)` (`a < b -> a % b == a`), `nat_eq_of_div_mod(a, c, bp, hq, hr)` (equal quotient and remainder give `a == c`), `nat_split_lt(q, r, n, bp, hq, hr)` (`q < n, r < b -> q * b + r < n * b`), `nat_mod_mul(q, bp)` (`(q * b) % b == 0`), `nat_div_mul(q, bp)` (`(q * b) / b == q`), and `nat_align_down_le(a, bp)` (`(a / b) * b <= a`).
 - **Generated per-law Rust tests:** every `law` also emits a `#[cfg(test)]` Rust test into `OUT_DIR/verified.rs` (run automatically by `cargo test`) that checks the emitted functions across small values, `u64::MAX - 1`, `u64::MAX`, ADT constructors, and deterministic PRNG samples (skipping only checked `Nat` overflow panics).
 - **Counterexample vs proof-failure diagnosis:** when `bend --check-only` fails on a law, `rusty-bends-build` evaluates the emitted Rust on concrete inputs first and reports `[E_LAW_FALSE]` with aligned `lhs`/`rhs` values if the law is false, or notes `"no counterexample up to ...: the law may be true; the proof is what failed"` if no counterexample exists.
-- **Mutation checking before sealing (`E_LAW_VACUOUS`):** every unlocked/new law is checked against small mutants of the live functions in its dependency cone (`True{}`/`False{}` swap, `Nat.is_le`/`Nat.is_lt` swap, `Nat.add`/`Nat.sub` swap, `Bool.and`/`Bool.or` operand drop, returning a constructor argument unchanged, swapping match arms) and fails with `[E_LAW_VACUOUS]` if it catches none. Bound and safety laws are covered too: `NatBound` pushes a `Nat` result past a bound (`+ 1n`, `- 1n`, `0n`), `SiblingCtor` replaces a returned constructor with its sibling constructors, `BoolConst` replaces a `Bool` variable with `True{}` / `False{}`, and `FlipCmp` loosens comparisons (`Nat.is_le` <-> `Nat.is_ge`, `Nat.is_lt` <-> `Nat.is_gt`). `ReturnCtor` replaces a returned variable or function call (e.g. a fallthrough `case st _: st`) with each constructor of the return type, and `NatLit` changes `Nat` literals (`k` -> `0n`, `k + 1`, `k - 1`, at most 8 sites per function). Each reported mutant ends with its operator, e.g. `caught by f: result -> Nat.add(result, 1n) [NatBound]`. Run `RUSTY_BENDS_MUTATE=all cargo check` to report one summary line for every law (new and locked) without failing on locked laws, or `RUSTY_BENDS_MUTATE=report cargo check` to evaluate every generated mutant of every law, print per-mutant `caught`/`survived` lines (noting any budget/site-cap drops), and write the report to `OUT_DIR/rusty-bends-mutants.txt`.
+- **Mutation checking before sealing (`E_LAW_VACUOUS`):** every unlocked/new law is checked against small mutants of the live functions in its dependency cone (`True{}`/`False{}` swap, `Nat.is_le`/`Nat.is_lt` swap, `Nat.add`/`Nat.sub` swap, `Bool.and`/`Bool.or` operand drop, returning a constructor argument unchanged, swapping match arms) and fails with `[E_LAW_VACUOUS]` if it catches none. Bound and safety laws are covered too: `NatBound` pushes a `Nat` result past a bound (`+ 1n`, `- 1n`, `0n`), `SiblingCtor` replaces a returned constructor with its sibling constructors, `BoolConst` replaces a `Bool` variable with `True{}` / `False{}`, and `FlipCmp` loosens comparisons (`Nat.is_le` <-> `Nat.is_ge`, `Nat.is_lt` <-> `Nat.is_gt`). `ReturnCtor` replaces a returned variable or function call (e.g. a fallthrough `case st _: st`) with each constructor of the return type, `NatLit` changes `Nat` literals (`k` -> `0n`, `k + 1`, `k - 1`, at most 8 sites per function), and `NatAddMaxMin` swaps `Nat.add` (or `(a + b : Nat)`) with `Nat.max` / `Nat.min` and vice versa. Each reported mutant ends with its operator, e.g. `caught by f: result -> Nat.add(result, 1n) [NatBound]`. Run `RUSTY_BENDS_MUTATE=all cargo check` to report one summary line for every law (new and locked) without failing on locked laws, or `RUSTY_BENDS_MUTATE=report cargo check` to evaluate every generated mutant of every law, print per-mutant `caught`/`survived` lines (noting any budget/site-cap drops), and write the report to `OUT_DIR/rusty-bends-mutants.txt`.
 - **Unevaluable new laws (`E_LAW_UNCHECKED`):** a new law the checker cannot evaluate (`exs`, a `where` refinement, an unparsable clause, or a goal without `==`) fails the build, naming the reason and the supported forms. If it truly cannot be sampled, add `# unchecked: <why>` in the comment block directly above `law <name>:`; the marker is stored in `rusty-bends.lock` and shown as `[unchecked: <why>]` by the law listing. Locked laws only warn.
 - **Mutants that do not compile (`E_MUTANT_BUILD`):** a mutant the generated Rust cannot build was never tested, so it never counts as a survivor. The build stops with `[E_MUTANT_BUILD]`, naming the mutant and the first rustc error; that is a RustyBends bug to report, not a weak law.
 - **Names that are Rust keywords:** any Bend name may be used, including ones Rust reserves (`as`, `in`, `fn`, `ref`, `mut`, `dyn`, `loop`, `move`, `self`, `crate`, `super`, ...). The emitted Rust spells them `r#as`, `r#in`, ... and, where Rust allows no raw form, `__rb_self`, `__rb_crate`, `__rb_super`, `__rb_Self`. Call them from Rust by those names, e.g. `verified::r#loop(2, 3)`.

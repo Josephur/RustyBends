@@ -30,7 +30,7 @@ On each build, for every `.bend` file in the verified directory:
    mutates the live functions the law depends on and checks that concrete evaluation catches at
    least one broken mutant (`E_LAW_VACUOUS` otherwise). The mutants include bound-pushing
    operators (`NatBound`, `SiblingCtor`, `BoolConst`, `FlipCmp`), returned-value replacement
-   (`ReturnCtor`) and literal changes (`NatLit`), so bound and safety laws are
+   (`ReturnCtor`), literal changes (`NatLit`), and `Nat.add` / `Nat.max` / `Nat.min` swaps (`NatAddMaxMin`), so bound and safety laws are
    checked as well as exact formulas. A new law the checker cannot evaluate (`exs`, a goal
    without `==`, ...) fails with `E_LAW_UNCHECKED` unless an `# unchecked: <why>` comment sits
    above it; the marker is recorded in the lock and shown in the law listing. Building with `RUSTY_BENDS_UPDATE_LAWS=<name>[,<name>...]`

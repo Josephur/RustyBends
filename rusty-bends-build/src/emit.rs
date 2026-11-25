@@ -2803,7 +2803,7 @@ pub(crate) fn split_top_level_once(s: &str, delim: char) -> Option<(&str, &str)>
     None
 }
 
-fn split_last_additive(s: &str) -> Option<(char, &str, &str)> {
+pub(crate) fn split_last_additive(s: &str) -> Option<(char, &str, &str)> {
     let mut depth = 0i32;
     let mut found = None;
     let bytes = s.as_bytes();
