@@ -1461,6 +1461,173 @@ def chunk_in_bounds(t, chunks, per, h):
 
         let _ = fs::remove_dir_all(&root);
     }
+
+    #[test]
+    fn euclidean_division_lemmas_verify_with_verdict_and_run_rust_tests() {
+        let root = temp_workspace("issue22_euclidean");
+        let _ = write_nat_lemmas(root.join("verified"))
+            .expect("write_nat_lemmas should populate verified/");
+        let grid_file = root.join("verified/grid.bend");
+        fs::write(
+            &grid_file,
+            r#"import Base
+import nat_lemmas.bend as L
+
+def slot_of(+i: Nat) -> Nat:
+  Nat.mod(i, 4n)
+
+def row_of(+i: Nat) -> Nat:
+  Nat.div(i, 4n)
+
+def make_index(+q: Nat, +r: Nat) -> Nat:
+  Nat.add(Nat.mul(q, 4n), r)
+
+# promise: the slot of row q and slot r (r < 4) is r
+law slot_of_split:
+  for +q: Nat
+  for +r: Nat
+  for h: {Nat.is_lt(r, 4n) == True{} : Bool}
+  {slot_of(make_index(q, r)) == r : Nat}
+
+def slot_of_split(q, r, h):
+  L.nat_mod_split(q, r, 3n, h)
+
+# promise: the row of row q and slot r (r < 4) is q
+law row_of_split:
+  for q: Nat
+  for r: Nat
+  for h: {Nat.is_lt(r, 4n) == True{} : Bool}
+  {row_of(make_index(q, r)) == q : Nat}
+
+def row_of_split(q, r, h):
+  L.nat_div_split(q, r, 3n, h)
+
+# promise: an index below four keeps its value as its slot
+law slot_of_small:
+  for a: Nat
+  for h: {Nat.is_lt(a, 4n) == True{} : Bool}
+  {slot_of(a) == a : Nat}
+
+def slot_of_small(a, h):
+  L.nat_mod_small(a, 3n, h)
+
+# promise: an index below four has row zero
+law row_of_small:
+  for a: Nat
+  for h: {Nat.is_lt(a, 4n) == True{} : Bool}
+  {row_of(a) == 0n : Nat}
+
+def row_of_small(a, h):
+  L.nat_div_small(a, 3n, h)
+
+# promise: two indices with the same row and slot are equal
+law eq_of_row_and_slot:
+  for a: Nat
+  for c: Nat
+  for hq: {row_of(a) == row_of(c) : Nat}
+  for hr: {slot_of(a) == slot_of(c) : Nat}
+  {a == c : Nat}
+
+def eq_of_row_and_slot(a, c, hq, hr):
+  L.nat_eq_of_div_mod(a, c, 3n, hq, hr)
+
+# promise: row q below n with slot r below 4 stays below n * 4
+law split_in_bounds:
+  for q: Nat
+  for r: Nat
+  for n: Nat
+  for hq: {Nat.is_lt(q, n) == True{} : Bool}
+  for hr: {Nat.is_lt(r, 4n) == True{} : Bool}
+  {Nat.is_lt(make_index(q, r), Nat.mul(n, 4n)) == True{} : Bool}
+
+def split_in_bounds(q, r, n, hq, hr):
+  L.nat_split_lt(q, r, n, 3n, hq, hr)
+
+# promise: multiples of four have slot zero
+law aligned_slot_zero:
+  for q: Nat
+  {slot_of(Nat.mul(q, 4n)) == 0n : Nat}
+
+def aligned_slot_zero(q):
+  L.nat_mod_mul(q, 3n)
+
+# promise: dividing a multiple of four recovers the row
+law aligned_row:
+  for q: Nat
+  {row_of(Nat.mul(q, 4n)) == q : Nat}
+
+def aligned_row(q):
+  L.nat_div_mul(q, 3n)
+
+# promise: the aligned-down index never exceeds the original index
+law align_down_le:
+  for a: Nat
+  {Nat.is_le(Nat.mul(row_of(a), 4n), a) == True{} : Bool}
+
+def align_down_le(a):
+  L.nat_align_down_le(a, 3n)
+"#,
+        )
+        .unwrap();
+
+        let mut cfg = make_cfg(&root);
+        cfg.bend_bin = resolve_bend_bin(
+            env::var("BEND_BIN").ok(),
+            env::var_os("PATH"),
+            env::var_os("HOME").map(PathBuf::from),
+        );
+        cfg.verdict_mode = if has_verdict_runtime() {
+            VerdictMode::Require
+        } else {
+            VerdictMode::Off
+        };
+
+        let out_rs = run(&cfg)
+            .expect("Euclidean division laws must pass bend, verdict, mutation check, and emit")
+            .expect("expected emitted verified.rs");
+        let emitted = fs::read_to_string(&out_rs).unwrap();
+        assert!(emitted.contains("pub fn slot_of("), "got:\n{emitted}");
+        assert!(emitted.contains("pub fn row_of("), "got:\n{emitted}");
+        assert!(emitted.contains("pub fn make_index("), "got:\n{emitted}");
+        for leaked in [
+            "nat_mod_split",
+            "nat_div_split",
+            "nat_split_unique_q",
+            "nat_split_unique_r",
+            "nat_eq_of_div_mod",
+            "nat_align_down_le",
+        ] {
+            assert!(
+                !emitted.contains(leaked),
+                "emitted leaked proof helper {leaked}:\n{emitted}"
+            );
+        }
+
+        let bin_path = root.join("out/test_bin");
+        let rustc = env::var("RUSTC").unwrap_or_else(|_| "rustc".to_string());
+        let compile = Command::new(&rustc)
+            .args(["--edition", "2021", "--test", "-D", "warnings", "-o"])
+            .arg(&bin_path)
+            .arg(&out_rs)
+            .output()
+            .expect("rustc --test must execute");
+        assert!(
+            compile.status.success(),
+            "rustc --test failed:\n{}",
+            String::from_utf8_lossy(&compile.stderr)
+        );
+        let run_tests = Command::new(&bin_path)
+            .output()
+            .expect("generated law test binary must run");
+        assert!(
+            run_tests.status.success(),
+            "generated law tests failed:\n{}{}",
+            String::from_utf8_lossy(&run_tests.stdout),
+            String::from_utf8_lossy(&run_tests.stderr)
+        );
+
+        let _ = fs::remove_dir_all(&root);
+    }
 }
 RUSTY_BENDS_EOF
 
@@ -11129,6 +11296,10 @@ def nat_lt_subst_r(-x: Nat, -y: Nat, -z: Nat, eq_yz: {y == z : Nat}, h: {Nat.is_
   %eq_yz : {Nat.is_lt(x, _) == True{} : Bool}
   h
 
+def nat_lt_subst_l(-a: Nat, -b: Nat, -c: Nat, eq_ab: {a == b : Nat}, h: {Nat.is_lt(a, c) == True{} : Bool}) -> {Nat.is_lt(b, c) == True{} : Bool}:
+  %eq_ab : {Nat.is_lt(_, c) == True{} : Bool}
+  h
+
 def nat_le_trans(
   a: Nat,
   b: Nat,
@@ -11566,6 +11737,74 @@ def nat_sub_add_cancel(
   +b2 = {b : Nat}
   nat_sub_add_cancel.go(a2, b2, h)
 
+def nat_le_add_add(b: Nat, x: Nat, y: Nat) -> {Nat.is_le(b, Nat.add(Nat.add(b, x), y)) == True{} : Bool}:
+  +b2 = {b : Nat}
+  +x2 = {x : Nat}
+  +y2 = {y : Nat}
+  nat_le_trans(b2, Nat.add(b2, x2), Nat.add(Nat.add(b2, x2), y2), nat_add_le_r(b2, x2), nat_add_le_r(Nat.add(b2, x2), y2))
+
+def nat_add_not_lt_l(b: Nat, x: Nat, h: {Nat.is_lt(Nat.add(b, x), b) == True{} : Bool}) -> Empty:
+  +b2 = {b : Nat}
+  +x2 = {x : Nat}
+  nat_lt_not_le(Nat.add(b2, x2), b2, h, nat_add_le_r(b2, x2))
+
+def nat_add_lt_l.go(
+  k: Nat,
+  +a: Nat,
+  +b: Nat,
+  h: {Nat.is_lt(a, b) == True{} : Bool}
+) -> {Nat.is_lt(Nat.add(k, a), Nat.add(k, b)) == True{} : Bool}:
+  match k:
+    case 0n:
+      h
+    case 1n+kp:
+      nat_add_lt_l.go(kp, a, b, h)
+
+def nat_add_lt_l(
+  k: Nat,
+  a: Nat,
+  b: Nat,
+  h: {Nat.is_lt(a, b) == True{} : Bool}
+) -> {Nat.is_lt(Nat.add(k, a), Nat.add(k, b)) == True{} : Bool}:
+  +a2 = {a : Nat}
+  +b2 = {b : Nat}
+  nat_add_lt_l.go(k, a2, b2, h)
+
+def nat_add_cancel_l(k: Nat, x: Nat, y: Nat, e: {Nat.add(k, x) == Nat.add(k, y) : Nat}) -> {x == y : Nat}:
+  +k2 = {k : Nat}
+  +x2 = {x : Nat}
+  +y2 = {y : Nat}
+  %nat_add_sub_cancel_l(k2, x2) : {_ == y2 : Nat}
+  %Equal.sym(Nat, Nat.add(k2, x2), Nat.add(k2, y2), e) : {Nat.sub(_, k2) == y2 : Nat}
+  nat_add_sub_cancel_l(k2, y2)
+
+def nat_sub_lt.go(
+  +j: Nat,
+  +k: Nat,
+  +n: Nat,
+  hn: {Nat.is_lt(0n, n) == True{} : Bool},
+  h: {Nat.is_lt(j, Nat.add(k, n)) == True{} : Bool}
+) -> {Nat.is_lt(Nat.sub(j, k), n) == True{} : Bool}:
+  match j k:
+    case 0n _:
+      hn
+    case 1n+jp 0n:
+      h
+    case 1n+jp 1n+kp:
+      nat_sub_lt.go(jp, kp, n, hn, h)
+
+def nat_sub_lt(
+  j: Nat,
+  k: Nat,
+  n: Nat,
+  hn: {Nat.is_lt(0n, n) == True{} : Bool},
+  h: {Nat.is_lt(j, Nat.add(k, n)) == True{} : Bool}
+) -> {Nat.is_lt(Nat.sub(j, k), n) == True{} : Bool}:
+  +j2 = {j : Nat}
+  +k2 = {k : Nat}
+  +n2 = {n : Nat}
+  nat_sub_lt.go(j2, k2, n2, hn, h)
+
 # ==============================================================================
 # Multiplication
 # ==============================================================================
@@ -11851,6 +12090,320 @@ def nat_div_lt_of_lt_mul_l(
     bp2,
     nat_lt_subst_r(a2, Nat.mul(1n+bp2, n2), Nat.mul(n2, 1n+bp2), nat_mul_comm(1n+bp2, n2), h)
   )
+
+# ==============================================================================
+# Euclidean division & alignment (b = 1n+bp > 0, r < b)
+# ==============================================================================
+
+def nat_split_low_refuted(
+  +bp: Nat,
+  +m: Nat,
+  +r1: Nat,
+  +r2: Nat,
+  h1: {Nat.is_lt(r1, 1n+bp) == True{} : Bool},
+  e: {r1 == Nat.add(Nat.add(1n+bp, m), r2) : Nat}
+) -> Empty:
+  nat_lt_not_le(
+    Nat.add(Nat.add(1n+bp, m), r2),
+    1n+bp,
+    nat_lt_subst_l(r1, Nat.add(Nat.add(1n+bp, m), r2), 1n+bp, e, h1),
+    nat_le_add_add(1n+bp, m, r2)
+  )
+
+def nat_split_unique_q.go(
+  +q1: Nat,
+  +r1: Nat,
+  +q2: Nat,
+  +r2: Nat,
+  +bp: Nat,
+  h1: {Nat.is_lt(r1, 1n+bp) == True{} : Bool},
+  h2: {Nat.is_lt(r2, 1n+bp) == True{} : Bool},
+  e: {Nat.add(Nat.mul(q1, 1n+bp), r1) == Nat.add(Nat.mul(q2, 1n+bp), r2) : Nat}
+) -> {q1 == q2 : Nat}:
+  match q1 q2:
+    case 0n 0n:
+      {==}
+    case 0n 1n+p2:
+      Empty.absurd({0n == 1n+p2 : Nat}, nat_split_low_refuted(bp, Nat.mul(p2, 1n+bp), r1, r2, h1, e))
+    case 1n+p1 0n:
+      Empty.absurd(
+        {1n+p1 == 0n : Nat},
+        nat_split_low_refuted(
+          bp,
+          Nat.mul(p1, 1n+bp),
+          r2,
+          r1,
+          h2,
+          Equal.sym(Nat, Nat.add(Nat.add(1n+bp, Nat.mul(p1, 1n+bp)), r1), r2, e)
+        )
+      )
+    case 1n+p1 1n+p2:
+      e1 = Equal.trans(
+        Nat,
+        Nat.add(1n+bp, Nat.add(Nat.mul(p1, 1n+bp), r1)),
+        Nat.add(Nat.add(1n+bp, Nat.mul(p1, 1n+bp)), r1),
+        Nat.add(Nat.add(1n+bp, Nat.mul(p2, 1n+bp)), r2),
+        Equal.sym(
+          Nat,
+          Nat.add(Nat.add(1n+bp, Nat.mul(p1, 1n+bp)), r1),
+          Nat.add(1n+bp, Nat.add(Nat.mul(p1, 1n+bp), r1)),
+          nat_add_assoc(1n+bp, Nat.mul(p1, 1n+bp), r1)
+        ),
+        e
+      )
+      e2 = Equal.trans(
+        Nat,
+        Nat.add(1n+bp, Nat.add(Nat.mul(p1, 1n+bp), r1)),
+        Nat.add(Nat.add(1n+bp, Nat.mul(p2, 1n+bp)), r2),
+        Nat.add(1n+bp, Nat.add(Nat.mul(p2, 1n+bp), r2)),
+        e1,
+        nat_add_assoc(1n+bp, Nat.mul(p2, 1n+bp), r2)
+      )
+      %nat_split_unique_q.go(
+        p1,
+        r1,
+        p2,
+        r2,
+        bp,
+        h1,
+        h2,
+        nat_add_cancel_l(1n+bp, Nat.add(Nat.mul(p1, 1n+bp), r1), Nat.add(Nat.mul(p2, 1n+bp), r2), e2)
+      ) : {1n+p1 == 1n+_ : Nat}
+      {==}
+
+def nat_split_unique_q(
+  q1: Nat,
+  r1: Nat,
+  q2: Nat,
+  r2: Nat,
+  bp: Nat,
+  h1: {Nat.is_lt(r1, 1n+bp) == True{} : Bool},
+  h2: {Nat.is_lt(r2, 1n+bp) == True{} : Bool},
+  e: {Nat.add(Nat.mul(q1, 1n+bp), r1) == Nat.add(Nat.mul(q2, 1n+bp), r2) : Nat}
+) -> {q1 == q2 : Nat}:
+  +q1_2 = {q1 : Nat}
+  +r1_2 = {r1 : Nat}
+  +q2_2 = {q2 : Nat}
+  +r2_2 = {r2 : Nat}
+  +bp2 = {bp : Nat}
+  nat_split_unique_q.go(q1_2, r1_2, q2_2, r2_2, bp2, h1, h2, e)
+
+def nat_split_unique_r.go(
+  +q1: Nat,
+  +r1: Nat,
+  +q2: Nat,
+  +r2: Nat,
+  +bp: Nat,
+  h1: {Nat.is_lt(r1, 1n+bp) == True{} : Bool},
+  h2: {Nat.is_lt(r2, 1n+bp) == True{} : Bool},
+  e: {Nat.add(Nat.mul(q1, 1n+bp), r1) == Nat.add(Nat.mul(q2, 1n+bp), r2) : Nat}
+) -> {r1 == r2 : Nat}:
+  match q1 q2:
+    case 0n 0n:
+      e
+    case 0n 1n+p2:
+      Empty.absurd({r1 == r2 : Nat}, nat_split_low_refuted(bp, Nat.mul(p2, 1n+bp), r1, r2, h1, e))
+    case 1n+p1 0n:
+      Empty.absurd(
+        {r1 == r2 : Nat},
+        nat_split_low_refuted(
+          bp,
+          Nat.mul(p1, 1n+bp),
+          r2,
+          r1,
+          h2,
+          Equal.sym(Nat, Nat.add(Nat.add(1n+bp, Nat.mul(p1, 1n+bp)), r1), r2, e)
+        )
+      )
+    case 1n+p1 1n+p2:
+      e1 = Equal.trans(
+        Nat,
+        Nat.add(1n+bp, Nat.add(Nat.mul(p1, 1n+bp), r1)),
+        Nat.add(Nat.add(1n+bp, Nat.mul(p1, 1n+bp)), r1),
+        Nat.add(Nat.add(1n+bp, Nat.mul(p2, 1n+bp)), r2),
+        Equal.sym(
+          Nat,
+          Nat.add(Nat.add(1n+bp, Nat.mul(p1, 1n+bp)), r1),
+          Nat.add(1n+bp, Nat.add(Nat.mul(p1, 1n+bp), r1)),
+          nat_add_assoc(1n+bp, Nat.mul(p1, 1n+bp), r1)
+        ),
+        e
+      )
+      e2 = Equal.trans(
+        Nat,
+        Nat.add(1n+bp, Nat.add(Nat.mul(p1, 1n+bp), r1)),
+        Nat.add(Nat.add(1n+bp, Nat.mul(p2, 1n+bp)), r2),
+        Nat.add(1n+bp, Nat.add(Nat.mul(p2, 1n+bp), r2)),
+        e1,
+        nat_add_assoc(1n+bp, Nat.mul(p2, 1n+bp), r2)
+      )
+      nat_split_unique_r.go(
+        p1,
+        r1,
+        p2,
+        r2,
+        bp,
+        h1,
+        h2,
+        nat_add_cancel_l(1n+bp, Nat.add(Nat.mul(p1, 1n+bp), r1), Nat.add(Nat.mul(p2, 1n+bp), r2), e2)
+      )
+
+def nat_split_unique_r(
+  q1: Nat,
+  r1: Nat,
+  q2: Nat,
+  r2: Nat,
+  bp: Nat,
+  h1: {Nat.is_lt(r1, 1n+bp) == True{} : Bool},
+  h2: {Nat.is_lt(r2, 1n+bp) == True{} : Bool},
+  e: {Nat.add(Nat.mul(q1, 1n+bp), r1) == Nat.add(Nat.mul(q2, 1n+bp), r2) : Nat}
+) -> {r1 == r2 : Nat}:
+  +q1_2 = {q1 : Nat}
+  +r1_2 = {r1 : Nat}
+  +q2_2 = {q2 : Nat}
+  +r2_2 = {r2 : Nat}
+  +bp2 = {bp : Nat}
+  nat_split_unique_r.go(q1_2, r1_2, q2_2, r2_2, bp2, h1, h2, e)
+
+# For b > 0, written as 1n+bp, and r < 1n+bp: (q * (1n+bp) + r) / (1n+bp) == q
+def nat_div_split(
+  q: Nat,
+  r: Nat,
+  bp: Nat,
+  h: {Nat.is_lt(r, 1n+bp) == True{} : Bool}
+) -> {Nat.div(Nat.add(Nat.mul(q, 1n+bp), r), 1n+bp) == q : Nat}:
+  +q2 = {q : Nat}
+  +r2 = {r : Nat}
+  +bp2 = {bp : Nat}
+  nat_split_unique_q(
+    Nat.div(Nat.add(Nat.mul(q2, 1n+bp2), r2), 1n+bp2),
+    Nat.mod(Nat.add(Nat.mul(q2, 1n+bp2), r2), 1n+bp2),
+    q2,
+    r2,
+    bp2,
+    nat_mod_lt(Nat.add(Nat.mul(q2, 1n+bp2), r2), bp2),
+    h,
+    nat_div_mod_r(Nat.add(Nat.mul(q2, 1n+bp2), r2), bp2)
+  )
+
+# For b > 0, written as 1n+bp, and r < 1n+bp: (q * (1n+bp) + r) % (1n+bp) == r
+def nat_mod_split(
+  q: Nat,
+  r: Nat,
+  bp: Nat,
+  h: {Nat.is_lt(r, 1n+bp) == True{} : Bool}
+) -> {Nat.mod(Nat.add(Nat.mul(q, 1n+bp), r), 1n+bp) == r : Nat}:
+  +q2 = {q : Nat}
+  +r2 = {r : Nat}
+  +bp2 = {bp : Nat}
+  nat_split_unique_r(
+    Nat.div(Nat.add(Nat.mul(q2, 1n+bp2), r2), 1n+bp2),
+    Nat.mod(Nat.add(Nat.mul(q2, 1n+bp2), r2), 1n+bp2),
+    q2,
+    r2,
+    bp2,
+    nat_mod_lt(Nat.add(Nat.mul(q2, 1n+bp2), r2), bp2),
+    h,
+    nat_div_mod_r(Nat.add(Nat.mul(q2, 1n+bp2), r2), bp2)
+  )
+
+# For b > 0, written as 1n+bp, and a < 1n+bp: a % (1n+bp) == a
+def nat_mod_small(
+  a: Nat,
+  bp: Nat,
+  h: {Nat.is_lt(a, 1n+bp) == True{} : Bool}
+) -> {Nat.mod(a, 1n+bp) == a : Nat}:
+  nat_mod_split(0n, a, bp, h)
+
+# For b > 0, written as 1n+bp, and a < 1n+bp: a / (1n+bp) == 0n
+def nat_div_small(
+  a: Nat,
+  bp: Nat,
+  h: {Nat.is_lt(a, 1n+bp) == True{} : Bool}
+) -> {Nat.div(a, 1n+bp) == 0n : Nat}:
+  nat_div_split(0n, a, bp, h)
+
+# Two numbers with the same quotient and remainder modulo 1n+bp are equal.
+def nat_eq_of_div_mod(
+  a: Nat,
+  c: Nat,
+  bp: Nat,
+  hq: {Nat.div(a, 1n+bp) == Nat.div(c, 1n+bp) : Nat},
+  hr: {Nat.mod(a, 1n+bp) == Nat.mod(c, 1n+bp) : Nat}
+) -> {a == c : Nat}:
+  +a2 = {a : Nat}
+  +c2 = {c : Nat}
+  +bp2 = {bp : Nat}
+  %nat_div_mod_r(a2, bp2) : {_ == c2 : Nat}
+  %nat_div_mod_r(c2, bp2) : {Nat.add(Nat.mul(Nat.div(a2, 1n+bp2), 1n+bp2), Nat.mod(a2, 1n+bp2)) == _ : Nat}
+  %hq : {Nat.add(Nat.mul(Nat.div(a2, 1n+bp2), 1n+bp2), Nat.mod(a2, 1n+bp2)) == Nat.add(Nat.mul(_, 1n+bp2), Nat.mod(c2, 1n+bp2)) : Nat}
+  %hr : {Nat.add(Nat.mul(Nat.div(a2, 1n+bp2), 1n+bp2), Nat.mod(a2, 1n+bp2)) == Nat.add(Nat.mul(Nat.div(a2, 1n+bp2), 1n+bp2), _) : Nat}
+  {==}
+
+def nat_split_lt.go(
+  +q: Nat,
+  +r: Nat,
+  +n: Nat,
+  +bp: Nat,
+  hq: {Nat.is_lt(q, n) == True{} : Bool},
+  hr: {Nat.is_lt(r, 1n+bp) == True{} : Bool}
+) -> {Nat.is_lt(Nat.add(Nat.mul(q, 1n+bp), r), Nat.mul(n, 1n+bp)) == True{} : Bool}:
+  match q n:
+    case 0n 0n:
+      bool_absurd({Nat.is_lt(r, 0n) == True{} : Bool}, hq)
+    case 0n 1n+np:
+      nat_lt_le_trans(r, 1n+bp, Nat.add(1n+bp, Nat.mul(np, 1n+bp)), hr, nat_add_le_r(1n+bp, Nat.mul(np, 1n+bp)))
+    case 1n+qp 0n:
+      bool_absurd({Nat.is_lt(Nat.add(Nat.add(1n+bp, Nat.mul(qp, 1n+bp)), r), 0n) == True{} : Bool}, hq)
+    case 1n+qp 1n+np:
+      %Equal.sym(
+        Nat,
+        Nat.add(Nat.add(1n+bp, Nat.mul(qp, 1n+bp)), r),
+        Nat.add(1n+bp, Nat.add(Nat.mul(qp, 1n+bp), r)),
+        nat_add_assoc(1n+bp, Nat.mul(qp, 1n+bp), r)
+      ) : {Nat.is_lt(_, Nat.add(1n+bp, Nat.mul(np, 1n+bp))) == True{} : Bool}
+      nat_add_lt_l(
+        1n+bp,
+        Nat.add(Nat.mul(qp, 1n+bp), r),
+        Nat.mul(np, 1n+bp),
+        nat_split_lt.go(qp, r, np, bp, hq, hr)
+      )
+
+# q < n, r < 1n+bp -> q * (1n+bp) + r < n * (1n+bp)
+def nat_split_lt(
+  q: Nat,
+  r: Nat,
+  n: Nat,
+  bp: Nat,
+  hq: {Nat.is_lt(q, n) == True{} : Bool},
+  hr: {Nat.is_lt(r, 1n+bp) == True{} : Bool}
+) -> {Nat.is_lt(Nat.add(Nat.mul(q, 1n+bp), r), Nat.mul(n, 1n+bp)) == True{} : Bool}:
+  +q2 = {q : Nat}
+  +r2 = {r : Nat}
+  +n2 = {n : Nat}
+  +bp2 = {bp : Nat}
+  nat_split_lt.go(q2, r2, n2, bp2, hq, hr)
+
+# (q * (1n+bp)) % (1n+bp) == 0n
+def nat_mod_mul(q: Nat, bp: Nat) -> {Nat.mod(Nat.mul(q, 1n+bp), 1n+bp) == 0n : Nat}:
+  +q2 = {q : Nat}
+  +bp2 = {bp : Nat}
+  %nat_add_zero_r(Nat.mul(q2, 1n+bp2)) : {Nat.mod(_, 1n+bp2) == 0n : Nat}
+  nat_mod_split(q2, 0n, bp2, {==})
+
+# (q * (1n+bp)) / (1n+bp) == q
+def nat_div_mul(q: Nat, bp: Nat) -> {Nat.div(Nat.mul(q, 1n+bp), 1n+bp) == q : Nat}:
+  +q2 = {q : Nat}
+  +bp2 = {bp : Nat}
+  %nat_add_zero_r(Nat.mul(q2, 1n+bp2)) : {Nat.div(_, 1n+bp2) == q2 : Nat}
+  nat_div_split(q2, 0n, bp2, {==})
+
+# (a / (1n+bp)) * (1n+bp) <= a
+def nat_align_down_le(a: Nat, bp: Nat) -> {Nat.is_le(Nat.mul(Nat.div(a, 1n+bp), 1n+bp), a) == True{} : Bool}:
+  +a2 = {a : Nat}
+  +bp2 = {bp : Nat}
+  %nat_div_mod_r(a2, bp2) : {Nat.is_le(Nat.mul(Nat.div(a2, 1n+bp2), 1n+bp2), _) == True{} : Bool}
+  nat_add_le_r(Nat.mul(Nat.div(a2, 1n+bp2), 1n+bp2), Nat.mod(a2, 1n+bp2))
 RUSTY_BENDS_EOF
 
 cat << 'RUSTY_BENDS_EOF' > "example-app/Cargo.toml"
@@ -12138,10 +12691,10 @@ def cancel_idempotent(s):
 - **Cross-file sibling imports (`import sibling.bend as X`):** files under `verified/` can import sibling `.bend` files (`import base_rules.bend as B`) to share functions, types, laws, and helper lemmas (`B.fn_name(...)`, `B.TypeName`, `B.Ctor{}`). Keep top-level names unique across `verified/*.bend`; the emitter resolves each file's import aliases into the single emitted `verified.rs` module, and `rusty-bends.lock` normalizes aliases so renaming `as B` does not trip `E_LAW_LOCK_TAMPERED`.
 - **Bundled `Nat` arithmetic lemma library (`nat_lemmas.bend`):** `rusty-bends-build` ships `rusty_bends_build::lemmas/nat_lemmas.bend` via `rusty_bends_build::NAT_LEMMAS_BEND` and `rusty_bends_build::write_nat_lemmas("verified")` (called in `build.rs` before `verify_and_emit("verified")`, or copied into `verified/`). Import it with `import nat_lemmas.bend as L`. All definitions in `nat_lemmas.bend` are `q=0` proof/type helpers and are erased completely before Rust codegen, covering:
   - **Ex falso / Bool refutation:** `bool_pick_type`, `bool_false_ne_true`, `bool_true_ne_false`, `bool_absurd`, `bool_absurd_tf`.
-  - **Order & min/max:** `nat_le_refl`, `nat_le_zero`, `nat_le_succ_r`, `nat_lt_succ_self`, `nat_lt_succ_eq_le`, `nat_lt_imp_le`, `nat_not_lt_imp_le`, `nat_le_subst_r`, `nat_lt_subst_r`, `nat_le_trans`, `nat_lt_trans`, `nat_lt_le_trans`, `nat_le_lt_trans`, `nat_lt_not_le`, `nat_lt_le_false`, `nat_le_lt_false`, `nat_le_antisym`, `nat_min_le_l`, `nat_min_le_r`, `nat_max_ge_l`, `nat_max_ge_r`, `nat_min_comm`, `nat_max_comm`.
-  - **Addition & subtraction:** `nat_add_zero_r`, `nat_add_succ_r`, `nat_add_comm`, `nat_add_assoc`, `nat_add_le_l`, `nat_add_le_r`, `nat_add_le_mono`, `nat_add_lt_le_mono`, `nat_sub_zero_r`, `nat_sub_self`, `nat_add_sub_cancel_l`, `nat_add_sub_cancel_r`, `nat_sub_add_cancel`.
+  - **Order & min/max:** `nat_le_refl`, `nat_le_zero`, `nat_le_succ_r`, `nat_lt_succ_self`, `nat_lt_succ_eq_le`, `nat_lt_imp_le`, `nat_not_lt_imp_le`, `nat_le_subst_r`, `nat_lt_subst_r`, `nat_lt_subst_l`, `nat_le_trans`, `nat_lt_trans`, `nat_lt_le_trans`, `nat_le_lt_trans`, `nat_lt_not_le`, `nat_lt_le_false`, `nat_le_lt_false`, `nat_le_antisym`, `nat_le_add_add`, `nat_add_not_lt_l`, `nat_min_le_l`, `nat_min_le_r`, `nat_max_ge_l`, `nat_max_ge_r`, `nat_min_comm`, `nat_max_comm`.
+  - **Addition & subtraction:** `nat_add_zero_r`, `nat_add_succ_r`, `nat_add_comm`, `nat_add_assoc`, `nat_add_le_l`, `nat_add_le_r`, `nat_add_lt_l`, `nat_add_le_mono`, `nat_add_lt_le_mono`, `nat_sub_zero_r`, `nat_sub_self`, `nat_add_sub_cancel_l`, `nat_add_sub_cancel_r`, `nat_add_cancel_l`, `nat_sub_add_cancel`, `nat_sub_lt`.
   - **Multiplication:** `nat_mul_zero_r`, `nat_mul_one_r`, `nat_mul_succ_r`, `nat_mul_comm`, `nat_mul_add_dist_r`, `nat_mul_add_dist_l`, `nat_mul_assoc`, `nat_mul_le_mono_r`, `nat_mul_le_mono_l`, `nat_mul_le_mono`.
-  - **Division & modulo (`b = 1n+bp > 0`):** `nat_mod_lt(a, bp)` (`a % (1n+bp) < 1n+bp`), `nat_div_mod(a, bp)` (`a % (1n+bp) + (a / (1n+bp)) * (1n+bp) == a`), `nat_div_mod_r(a, bp)` (`(a / (1n+bp)) * (1n+bp) + a % (1n+bp) == a`), `nat_div_lt_of_lt_mul(a, n, bp, h)` (`a < n * (1n+bp) -> a / (1n+bp) < n`), and `nat_div_lt_of_lt_mul_l(a, n, bp, h)` (`a < (1n+bp) * n -> a / (1n+bp) < n`).
+  - **Division, modulo & alignment (`b = 1n+bp > 0`):** `nat_mod_lt(a, bp)` (`a % (1n+bp) < 1n+bp`), `nat_div_mod(a, bp)` (`a % (1n+bp) + (a / (1n+bp)) * (1n+bp) == a`), `nat_div_mod_r(a, bp)` (`(a / (1n+bp)) * (1n+bp) + a % (1n+bp) == a`), `nat_div_lt_of_lt_mul(a, n, bp, h)` (`a < n * (1n+bp) -> a / (1n+bp) < n`), `nat_div_lt_of_lt_mul_l(a, n, bp, h)` (`a < (1n+bp) * n -> a / (1n+bp) < n`), `nat_split_unique_q(q1, r1, q2, r2, bp, h1, h2, e)` (`q1 * b + r1 == q2 * b + r2` with `r1, r2 < b` gives `q1 == q2`), `nat_split_unique_r(q1, r1, q2, r2, bp, h1, h2, e)` (`r1 == r2`), `nat_div_split(q, r, bp, h)` (`(q * b + r) / b == q`), `nat_mod_split(q, r, bp, h)` (`(q * b + r) % b == r`), `nat_div_small(a, bp, h)` (`a < b -> a / b == 0`), `nat_mod_small(a, bp, h)` (`a < b -> a % b == a`), `nat_eq_of_div_mod(a, c, bp, hq, hr)` (equal quotient and remainder give `a == c`), `nat_split_lt(q, r, n, bp, hq, hr)` (`q < n, r < b -> q * b + r < n * b`), `nat_mod_mul(q, bp)` (`(q * b) % b == 0`), `nat_div_mul(q, bp)` (`(q * b) / b == q`), and `nat_align_down_le(a, bp)` (`(a / b) * b <= a`).
 - **Generated per-law Rust tests:** every `law` also emits a `#[cfg(test)]` Rust test into `OUT_DIR/verified.rs` (run automatically by `cargo test`) that checks the emitted functions across small values, `u64::MAX - 1`, `u64::MAX`, ADT constructors, and deterministic PRNG samples (skipping only checked `Nat` overflow panics).
 - **Counterexample vs proof-failure diagnosis:** when `bend --check-only` fails on a law, `rusty-bends-build` evaluates the emitted Rust on concrete inputs first and reports `[E_LAW_FALSE]` with aligned `lhs`/`rhs` values if the law is false, or notes `"no counterexample up to ...: the law may be true; the proof is what failed"` if no counterexample exists.
 - **Mutation checking before sealing (`E_LAW_VACUOUS`):** every unlocked/new law is checked against small mutants of the live functions in its dependency cone (`True{}`/`False{}` swap, `Nat.is_le`/`Nat.is_lt` swap, `Nat.add`/`Nat.sub` swap, `Bool.and`/`Bool.or` operand drop, returning a constructor argument unchanged, swapping match arms) and fails with `[E_LAW_VACUOUS]` if it catches none. Bound and safety laws are covered too: `NatBound` pushes a `Nat` result past a bound (`+ 1n`, `- 1n`, `0n`), `SiblingCtor` replaces a returned constructor with its sibling constructors, `BoolConst` replaces a `Bool` variable with `True{}` / `False{}`, and `FlipCmp` loosens comparisons (`Nat.is_le` <-> `Nat.is_ge`, `Nat.is_lt` <-> `Nat.is_gt`). `ReturnCtor` replaces a returned variable or function call (e.g. a fallthrough `case st _: st`) with each constructor of the return type, and `NatLit` changes `Nat` literals (`k` -> `0n`, `k + 1`, `k - 1`, at most 8 sites per function). Each reported mutant ends with its operator, e.g. `caught by f: result -> Nat.add(result, 1n) [NatBound]`. Run `RUSTY_BENDS_MUTATE=all cargo check` to report caught/survived status for already-locked laws without failing.

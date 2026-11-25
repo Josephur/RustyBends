@@ -110,10 +110,10 @@ Import it in any file under `verified/` with `import nat_lemmas.bend as L`. Ever
 `q=0` and completely erased before Rust emission, and provides:
 
 - **Ex falso / Bool refutation:** `bool_pick_type`, `bool_false_ne_true`, `bool_true_ne_false`, `bool_absurd`, `bool_absurd_tf`.
-- **Order & `min`/`max`:** `nat_le_refl`, `nat_le_zero`, `nat_le_succ_r`, `nat_lt_succ_self`, `nat_lt_succ_eq_le`, `nat_lt_imp_le`, `nat_not_lt_imp_le`, `nat_le_subst_r`, `nat_lt_subst_r`, `nat_le_trans`, `nat_lt_trans`, `nat_lt_le_trans`, `nat_le_lt_trans`, `nat_lt_not_le`, `nat_lt_le_false`, `nat_le_lt_false`, `nat_le_antisym`, `nat_min_le_l`, `nat_min_le_r`, `nat_max_ge_l`, `nat_max_ge_r`, `nat_min_comm`, `nat_max_comm`.
-- **Addition & subtraction:** `nat_add_zero_r`, `nat_add_succ_r`, `nat_add_comm`, `nat_add_assoc`, `nat_add_le_l`, `nat_add_le_r`, `nat_add_le_mono`, `nat_add_lt_le_mono`, `nat_sub_zero_r`, `nat_sub_self`, `nat_add_sub_cancel_l`, `nat_add_sub_cancel_r`, `nat_sub_add_cancel`.
+- **Order & `min`/`max`:** `nat_le_refl`, `nat_le_zero`, `nat_le_succ_r`, `nat_lt_succ_self`, `nat_lt_succ_eq_le`, `nat_lt_imp_le`, `nat_not_lt_imp_le`, `nat_le_subst_r`, `nat_lt_subst_r`, `nat_lt_subst_l`, `nat_le_trans`, `nat_lt_trans`, `nat_lt_le_trans`, `nat_le_lt_trans`, `nat_lt_not_le`, `nat_lt_le_false`, `nat_le_lt_false`, `nat_le_antisym`, `nat_le_add_add`, `nat_add_not_lt_l`, `nat_min_le_l`, `nat_min_le_r`, `nat_max_ge_l`, `nat_max_ge_r`, `nat_min_comm`, `nat_max_comm`.
+- **Addition & subtraction:** `nat_add_zero_r`, `nat_add_succ_r`, `nat_add_comm`, `nat_add_assoc`, `nat_add_le_l`, `nat_add_le_r`, `nat_add_lt_l`, `nat_add_le_mono`, `nat_add_lt_le_mono`, `nat_sub_zero_r`, `nat_sub_self`, `nat_add_sub_cancel_l`, `nat_add_sub_cancel_r`, `nat_add_cancel_l`, `nat_sub_add_cancel`, `nat_sub_lt`.
 - **Multiplication:** `nat_mul_zero_r`, `nat_mul_one_r`, `nat_mul_succ_r`, `nat_mul_comm`, `nat_mul_add_dist_r`, `nat_mul_add_dist_l`, `nat_mul_assoc`, `nat_mul_le_mono_r`, `nat_mul_le_mono_l`, `nat_mul_le_mono`.
-- **Division & modulo (`1n+bp > 0`):** `nat_mod_lt`, `nat_div_mod`, `nat_div_mod_r`, `nat_div_lt_of_lt_mul`, and `nat_div_lt_of_lt_mul_l`.
+- **Division, modulo & alignment (`1n+bp > 0`):** `nat_mod_lt`, `nat_div_mod`, `nat_div_mod_r`, `nat_div_lt_of_lt_mul`, `nat_div_lt_of_lt_mul_l`, `nat_split_unique_q`, `nat_split_unique_r`, `nat_div_split`, `nat_mod_split`, `nat_div_small`, `nat_mod_small`, `nat_eq_of_div_mod`, `nat_split_lt`, `nat_mod_mul`, `nat_div_mul`, and `nat_align_down_le`.
 
 ## Requirements
 

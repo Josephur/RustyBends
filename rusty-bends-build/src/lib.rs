@@ -1435,4 +1435,171 @@ def chunk_in_bounds(t, chunks, per, h):
 
         let _ = fs::remove_dir_all(&root);
     }
+
+    #[test]
+    fn euclidean_division_lemmas_verify_with_verdict_and_run_rust_tests() {
+        let root = temp_workspace("issue22_euclidean");
+        let _ = write_nat_lemmas(root.join("verified"))
+            .expect("write_nat_lemmas should populate verified/");
+        let grid_file = root.join("verified/grid.bend");
+        fs::write(
+            &grid_file,
+            r#"import Base
+import nat_lemmas.bend as L
+
+def slot_of(+i: Nat) -> Nat:
+  Nat.mod(i, 4n)
+
+def row_of(+i: Nat) -> Nat:
+  Nat.div(i, 4n)
+
+def make_index(+q: Nat, +r: Nat) -> Nat:
+  Nat.add(Nat.mul(q, 4n), r)
+
+# promise: the slot of row q and slot r (r < 4) is r
+law slot_of_split:
+  for +q: Nat
+  for +r: Nat
+  for h: {Nat.is_lt(r, 4n) == True{} : Bool}
+  {slot_of(make_index(q, r)) == r : Nat}
+
+def slot_of_split(q, r, h):
+  L.nat_mod_split(q, r, 3n, h)
+
+# promise: the row of row q and slot r (r < 4) is q
+law row_of_split:
+  for q: Nat
+  for r: Nat
+  for h: {Nat.is_lt(r, 4n) == True{} : Bool}
+  {row_of(make_index(q, r)) == q : Nat}
+
+def row_of_split(q, r, h):
+  L.nat_div_split(q, r, 3n, h)
+
+# promise: an index below four keeps its value as its slot
+law slot_of_small:
+  for a: Nat
+  for h: {Nat.is_lt(a, 4n) == True{} : Bool}
+  {slot_of(a) == a : Nat}
+
+def slot_of_small(a, h):
+  L.nat_mod_small(a, 3n, h)
+
+# promise: an index below four has row zero
+law row_of_small:
+  for a: Nat
+  for h: {Nat.is_lt(a, 4n) == True{} : Bool}
+  {row_of(a) == 0n : Nat}
+
+def row_of_small(a, h):
+  L.nat_div_small(a, 3n, h)
+
+# promise: two indices with the same row and slot are equal
+law eq_of_row_and_slot:
+  for a: Nat
+  for c: Nat
+  for hq: {row_of(a) == row_of(c) : Nat}
+  for hr: {slot_of(a) == slot_of(c) : Nat}
+  {a == c : Nat}
+
+def eq_of_row_and_slot(a, c, hq, hr):
+  L.nat_eq_of_div_mod(a, c, 3n, hq, hr)
+
+# promise: row q below n with slot r below 4 stays below n * 4
+law split_in_bounds:
+  for q: Nat
+  for r: Nat
+  for n: Nat
+  for hq: {Nat.is_lt(q, n) == True{} : Bool}
+  for hr: {Nat.is_lt(r, 4n) == True{} : Bool}
+  {Nat.is_lt(make_index(q, r), Nat.mul(n, 4n)) == True{} : Bool}
+
+def split_in_bounds(q, r, n, hq, hr):
+  L.nat_split_lt(q, r, n, 3n, hq, hr)
+
+# promise: multiples of four have slot zero
+law aligned_slot_zero:
+  for q: Nat
+  {slot_of(Nat.mul(q, 4n)) == 0n : Nat}
+
+def aligned_slot_zero(q):
+  L.nat_mod_mul(q, 3n)
+
+# promise: dividing a multiple of four recovers the row
+law aligned_row:
+  for q: Nat
+  {row_of(Nat.mul(q, 4n)) == q : Nat}
+
+def aligned_row(q):
+  L.nat_div_mul(q, 3n)
+
+# promise: the aligned-down index never exceeds the original index
+law align_down_le:
+  for a: Nat
+  {Nat.is_le(Nat.mul(row_of(a), 4n), a) == True{} : Bool}
+
+def align_down_le(a):
+  L.nat_align_down_le(a, 3n)
+"#,
+        )
+        .unwrap();
+
+        let mut cfg = make_cfg(&root);
+        cfg.bend_bin = resolve_bend_bin(
+            env::var("BEND_BIN").ok(),
+            env::var_os("PATH"),
+            env::var_os("HOME").map(PathBuf::from),
+        );
+        cfg.verdict_mode = if has_verdict_runtime() {
+            VerdictMode::Require
+        } else {
+            VerdictMode::Off
+        };
+
+        let out_rs = run(&cfg)
+            .expect("Euclidean division laws must pass bend, verdict, mutation check, and emit")
+            .expect("expected emitted verified.rs");
+        let emitted = fs::read_to_string(&out_rs).unwrap();
+        assert!(emitted.contains("pub fn slot_of("), "got:\n{emitted}");
+        assert!(emitted.contains("pub fn row_of("), "got:\n{emitted}");
+        assert!(emitted.contains("pub fn make_index("), "got:\n{emitted}");
+        for leaked in [
+            "nat_mod_split",
+            "nat_div_split",
+            "nat_split_unique_q",
+            "nat_split_unique_r",
+            "nat_eq_of_div_mod",
+            "nat_align_down_le",
+        ] {
+            assert!(
+                !emitted.contains(leaked),
+                "emitted leaked proof helper {leaked}:\n{emitted}"
+            );
+        }
+
+        let bin_path = root.join("out/test_bin");
+        let rustc = env::var("RUSTC").unwrap_or_else(|_| "rustc".to_string());
+        let compile = Command::new(&rustc)
+            .args(["--edition", "2021", "--test", "-D", "warnings", "-o"])
+            .arg(&bin_path)
+            .arg(&out_rs)
+            .output()
+            .expect("rustc --test must execute");
+        assert!(
+            compile.status.success(),
+            "rustc --test failed:\n{}",
+            String::from_utf8_lossy(&compile.stderr)
+        );
+        let run_tests = Command::new(&bin_path)
+            .output()
+            .expect("generated law test binary must run");
+        assert!(
+            run_tests.status.success(),
+            "generated law tests failed:\n{}{}",
+            String::from_utf8_lossy(&run_tests.stdout),
+            String::from_utf8_lossy(&run_tests.stderr)
+        );
+
+        let _ = fs::remove_dir_all(&root);
+    }
 }
