@@ -33,9 +33,10 @@ On each build, for every `.bend` file in the verified directory:
    (`ReturnCtor`) and literal changes (`NatLit`), so bound and safety laws are
    checked as well as exact formulas. A new law the checker cannot evaluate (`exs`, a goal
    without `==`, ...) fails with `E_LAW_UNCHECKED` unless an `# unchecked: <why>` comment sits
-   above it; the marker is recorded in the lock and shown in the law listing. Building with `RUSTY_BENDS_UPDATE_LAWS=1`
-   rewrites the whole lock from the current sources once proofs and mutation checks pass:
-   build once without it first, and review the lock's diff (it should only add lines).
+   above it; the marker is recorded in the lock and shown in the law listing. Building with `RUSTY_BENDS_UPDATE_LAWS=<name>[,<name>...]`
+   seals or re-accepts only the named laws (leaving other new laws unsealed and keeping tampered checks active for all other laws), `RUSTY_BENDS_UPDATE_LAWS=comments` refreshes `# promise` / `# harm` / `# unchecked` lines without sealing new laws, and `RUSTY_BENDS_UPDATE_LAWS=1`
+   rewrites the whole lock from current sources once proofs and mutation checks pass; every update reports what was sealed, re-accepted, removed, or reworded.
+   Build once without it first, and review the lock's diff.
 4. **Erasure, emission, and per-law tests.** It drops laws, proof `def`s, equality lemmas and
    other `q=0` terms from the runtime output, resolves sibling file import aliases
    (`import sibling.bend as X`), writes the remaining functions and ADTs
@@ -130,7 +131,7 @@ Import it in any file under `verified/` with `import nat_lemmas.bend as L`. Ever
 | `BEND_PIN_VERSION` | Required Bend version prefix (overrides `bend.pin`). |
 | `BEND_CHECK_FLAG`, `BEND_VERDICT_FLAG` | Override the `--check-only` / `--verdict` flags. |
 | `BENDTT` | When set, `--verdict` counts as available even if `lean` is not in `~/.elan/bin` or on `PATH`. |
-| `RUSTY_BENDS_UPDATE_LAWS` | `1` rewrites `rusty-bends.lock` from the current laws (once proofs & mutation checks pass), skipping the tamper check. Review the lock's diff before committing. |
+| `RUSTY_BENDS_UPDATE_LAWS` | `<name>[,<name>...]`: seal, re-accept, or remove only the named laws (leaving other new laws unsealed and failing on tampering elsewhere). `comments`: update `# promise` / `# harm` / `# unchecked` comment lines of locked laws without sealing new laws. `1`: rewrite the entire `rusty-bends.lock` from current sources. Every update reports sealed, re-accepted, removed, and comment-updated laws. |
 | `RUSTY_BENDS_MUTATE` | `all`: also runs the mutation check over locked laws and prints caught/survived diagnostics without failing the build. |
 | `RUSTY_BENDS_LIST_LAWS` | `1`: prints each law as `name: promise` during builds so reviewers can read plain-English guarantees without reading Bend 2 syntax (also available via `cargo run -p rusty-bends-build --bin rusty-bends-laws -- [dir]`). Laws with an `# unchecked:` marker show `[unchecked: <why>]`. |
 | `RUSTY_BENDS_LIST_PANICS` | `1`: prints every checked-growth `Nat` panic site in the emitted Rust as `RustyBends panic [function]: op at file:line`, plus a total. |

@@ -14,6 +14,7 @@ pub mod law_test;
 pub mod lock;
 pub mod mutate;
 
+pub use lock::LockUpdateMode;
 pub use mutate::MutateMode;
 
 use std::env;
@@ -53,6 +54,7 @@ pub struct Config {
     pub pinned_version: Option<String>,
     pub out_dir: PathBuf,
     pub allow_lock_update: bool,
+    pub lock_update: LockUpdateMode,
     pub emit_rust: bool,
     pub mutate_mode: MutateMode,
     pub list_laws: bool,
@@ -85,6 +87,10 @@ impl Default for Config {
         let list_laws = env_flag("RUSTY_BENDS_LIST_LAWS");
         let list_panics = env_flag("RUSTY_BENDS_LIST_PANICS");
         let no_cache = env_flag("RUSTY_BENDS_NO_CACHE");
+        let lock_update = env::var("RUSTY_BENDS_UPDATE_LAWS")
+            .map(|v| LockUpdateMode::parse(&v))
+            .unwrap_or(LockUpdateMode::None);
+        let allow_lock_update = lock_update == LockUpdateMode::All;
         Self {
             verified_dir: PathBuf::from("verified"),
             bend_bin: resolve_bend_bin(
@@ -101,12 +107,23 @@ impl Default for Config {
                 .ok()
                 .filter(|v| !v.trim().is_empty()),
             out_dir: PathBuf::from(env::var("OUT_DIR").unwrap_or_else(|_| "target".to_string())),
-            allow_lock_update: env::var("RUSTY_BENDS_UPDATE_LAWS").ok().as_deref() == Some("1"),
+            allow_lock_update,
+            lock_update,
             emit_rust: true,
             mutate_mode,
             list_laws,
             list_panics,
             no_cache,
+        }
+    }
+}
+
+impl Config {
+    fn effective_lock_update(&self) -> LockUpdateMode {
+        if self.allow_lock_update && self.lock_update == LockUpdateMode::None {
+            LockUpdateMode::All
+        } else {
+            self.lock_update.clone()
         }
     }
 }
@@ -393,11 +410,16 @@ where
     let pre_locked_laws = lock::read_locked_law_names(&cfg.lock_file);
 
     // 1. Check AST/token-canonical LAWS lock (defer writing until Bend & mutation checks pass)
-    let lock_report = lock::check_law_lock(&cfg.lock_file, &bend_files, cfg.allow_lock_update)?;
+    let effective_lock_mode = cfg.effective_lock_update();
+    let lock_report =
+        lock::check_law_lock_with_mode(&cfg.lock_file, &bend_files, &effective_lock_mode)?;
     let law_count = lock_report.current.len();
 
     for w in &lock_report.warnings {
         println!("cargo:warning={w}");
+    }
+    if effective_lock_mode != LockUpdateMode::None && !lock_report.needs_write {
+        println!("cargo:warning=RustyBends lock: no lock changes to write");
     }
     if cfg.list_laws {
         let listing = lock::format_law_list(&lock_report.current);
@@ -511,6 +533,9 @@ where
     // 5. Persist rusty-bends.lock only after Bend proofs and mutation checks succeed
     if lock_report.needs_write {
         lock::write_law_lock(&cfg.lock_file, &lock_report)?;
+        for note in lock::format_lock_update_notes(&lock_report.update_summary) {
+            println!("cargo:warning={note}");
+        }
     }
 
     // 6. Erase q=0 parts and emit pure Rust (ADTs + match + defs) into OUT_DIR/verified.rs
@@ -823,6 +848,7 @@ mod tests {
             pinned_version: None,
             out_dir: root.join("out"),
             allow_lock_update: false,
+            lock_update: LockUpdateMode::None,
             emit_rust: true,
             mutate_mode: MutateMode::NewOnly,
             list_laws: false,
@@ -1876,6 +1902,50 @@ def bump_changes(m):
         })
         .unwrap();
         assert_eq!(calls, 14);
+
+        let _ = fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn selective_lock_update_blocks_vacuous_named_law_without_touching_lock() {
+        let root = temp_workspace("issue17_e2e");
+        let core = root.join("verified/core.bend");
+        fs::write(
+            &core,
+            "import Base\n\ndef inc(+n: Nat) -> Nat:\n  Nat.add(n, 1n)\n\n# promise: zero increments to one\nlaw inc_zero:\n  {inc(0n) == 1n : Nat}\n",
+        )
+        .unwrap();
+
+        let cfg = make_cfg(&root);
+        run_with_checker(&cfg, |_, _| Ok(())).expect("initial lock creation");
+        let original_lock = fs::read_to_string(&cfg.lock_file).unwrap();
+
+        fs::write(
+            &core,
+            "import Base\n\ndef inc(+n: Nat) -> Nat:\n  Nat.add(n, 1n)\n\n# promise: zero increments to one\nlaw inc_zero:\n  {inc(0n) == 1n : Nat}\n\n# promise: vacuous identity\nlaw inc_refl:\n  for +n: Nat\n  {inc(n) == inc(n) : Nat}\n",
+        )
+        .unwrap();
+
+        let mut seal_vacuous = make_cfg(&root);
+        seal_vacuous.lock_update = LockUpdateMode::parse("inc_refl");
+        let err = run_with_checker(&seal_vacuous, |_, _| Ok(()))
+            .expect_err("vacuous named law must fail before lock write");
+        assert!(err.contains("E_LAW_VACUOUS"), "{err}");
+        assert_eq!(fs::read_to_string(&cfg.lock_file).unwrap(), original_lock);
+
+        // Replace vacuous law with two valid new laws and seal only one by name.
+        fs::write(
+            &core,
+            "import Base\n\ndef inc(+n: Nat) -> Nat:\n  Nat.add(n, 1n)\n\n# promise: zero increments to one\nlaw inc_zero:\n  {inc(0n) == 1n : Nat}\n\n# promise: one increments to two\nlaw inc_one:\n  {inc(1n) == 2n : Nat}\n\n# promise: two increments to three\nlaw inc_two:\n  {inc(2n) == 3n : Nat}\n",
+        )
+        .unwrap();
+        let mut seal_one = make_cfg(&root);
+        seal_one.lock_update = LockUpdateMode::parse("inc_one");
+        run_with_checker(&seal_one, |_, _| Ok(())).expect("named seal of inc_one succeeds");
+        let lock_after = fs::read_to_string(&cfg.lock_file).unwrap();
+        assert!(lock_after.contains("inc_zero"));
+        assert!(lock_after.contains("inc_one"));
+        assert!(!lock_after.contains("inc_two"));
 
         let _ = fs::remove_dir_all(&root);
     }
