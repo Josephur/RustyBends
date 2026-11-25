@@ -323,16 +323,25 @@ pub fn verify_dir(dir: impl AsRef<Path>) {
     run_or_fail(&cfg);
 }
 
+/// Contents written to `OUT_DIR/verified.rs` when verification fails, so the
+/// crate that includes it stops at compile time.
+const BLOCKED_VERIFIED_RS: &str =
+    "compile_error!(\"RustyBends verification failed — fix Bend 2 proofs or lock violations.\");\n";
+
+/// Marks a failed build: drops the build cache stamp (so reverting to a passing
+/// state re-verifies instead of serving the blocked file) and, when emitting Rust,
+/// replaces `verified.rs` with a `compile_error!`.
+fn block_failed_build(cfg: &Config) {
+    let _ = fs::remove_file(cfg.out_dir.join("rusty-bends.cache"));
+    if cfg.emit_rust {
+        let _ = fs::create_dir_all(&cfg.out_dir);
+        let _ = fs::write(cfg.out_dir.join("verified.rs"), BLOCKED_VERIFIED_RS);
+    }
+}
+
 fn run_or_fail(cfg: &Config) {
     if let Err(err) = run(cfg) {
-        if cfg.emit_rust {
-            let _ = fs::create_dir_all(&cfg.out_dir);
-            let blocked = cfg.out_dir.join("verified.rs");
-            let _ = fs::write(
-                blocked,
-                "compile_error!(\"RustyBends verification failed — fix Bend 2 proofs or lock violations.\");\n",
-            );
-        }
+        block_failed_build(cfg);
         for line in err.lines() {
             println!("cargo:error={line}");
         }
@@ -371,10 +380,7 @@ pub fn run(cfg: &Config) -> Result<Option<PathBuf>, String> {
         cfg,
         bend_version.as_deref(),
         has_verdict_runtime(),
-        |file, has_laws| {
-            println!("cargo:rerun-if-changed={}", file.display());
-            verify_with_bend_cli(cfg, file, has_laws)
-        },
+        |file, has_laws| verify_with_bend_cli(cfg, file, has_laws),
     )
 }
 
@@ -610,6 +616,11 @@ where
         ));
     }
 
+    // Every .bend file and directory under verified/ is a build input, on cache hits too.
+    for line in rerun_if_changed_lines(&cfg.verified_dir, &bend_files) {
+        println!("{line}");
+    }
+
     // Record which laws were already locked before this build for failure diagnostics.
     let pre_locked_laws = lock::read_locked_law_names(&cfg.lock_file);
 
@@ -646,7 +657,7 @@ where
                 .unwrap_or(false)
         });
     if cache_hit
-        && (!cfg.emit_rust || verified_rs.exists())
+        && (!cfg.emit_rust || verified_rs_is_usable(&verified_rs))
         && !lock_report.needs_write
         && lock_report.new_names.is_empty()
         && cfg.mutate_mode == MutateMode::NewOnly
@@ -735,11 +746,12 @@ where
         };
 
     // 4. Mutation-check every unlocked/new law before sealing (and report all locked laws under RUSTY_BENDS_MUTATE=all)
-    let mut_summary = mutate::run_mutation_checks(
+    let mut_summary = mutate::run_mutation_checks_with_cache(
         &combined_source,
         &lock_report,
         cfg.mutate_mode,
         &cfg.out_dir,
+        !cfg.no_cache,
     )?;
     for w in &mut_summary.warnings {
         emit_cargo_warning(w);
@@ -1199,6 +1211,39 @@ pub fn collect_bend_files(dir: &Path, out: &mut Vec<PathBuf>) -> Result<(), Stri
     Ok(())
 }
 
+/// `cargo:rerun-if-changed` lines for `verified_dir`, each subdirectory under it
+/// (so added or removed files are noticed), and every collected `.bend` file.
+fn rerun_if_changed_lines(verified_dir: &Path, bend_files: &[PathBuf]) -> Vec<String> {
+    let mut dirs = std::collections::BTreeSet::new();
+    for file in bend_files {
+        let mut dir = file.parent();
+        while let Some(d) = dir {
+            if !d.starts_with(verified_dir) || d == verified_dir {
+                break;
+            }
+            dirs.insert(d.to_path_buf());
+            dir = d.parent();
+        }
+    }
+    let mut lines = vec![format!("cargo:rerun-if-changed={}", verified_dir.display())];
+    lines.extend(
+        dirs.iter()
+            .map(|d| format!("cargo:rerun-if-changed={}", d.display())),
+    );
+    lines.extend(
+        bend_files
+            .iter()
+            .map(|f| format!("cargo:rerun-if-changed={}", f.display())),
+    );
+    lines
+}
+
+/// A cached `verified.rs` is reusable only if it exists and is not the blocked
+/// `compile_error!` file a failed build leaves behind.
+fn verified_rs_is_usable(path: &Path) -> bool {
+    fs::read_to_string(path).is_ok_and(|text| text != BLOCKED_VERIFIED_RS)
+}
+
 fn hash_files(files: &[PathBuf]) -> Result<String, String> {
     let mut buf = b"rb-cache-v2\0".to_vec();
     for f in files {
@@ -1340,6 +1385,67 @@ mod tests {
         assert!(verify_bend_version_str("0.2.38", "bend 0.2.38 (commit abc123)").is_ok());
         let err = verify_bend_version_str("0.2.38", "bend 0.3.0").unwrap_err();
         assert!(err.contains("E_BEND_VERSION_MISMATCH"));
+    }
+
+    #[test]
+    fn rerun_directives_cover_every_bend_file_and_subdirectory() {
+        let root = Path::new("/w/verified");
+        let files = vec![
+            root.join("core.bend"),
+            root.join("rules/a.bend"),
+            root.join("rules/deep/b.bend"),
+        ];
+        assert_eq!(
+            rerun_if_changed_lines(root, &files),
+            vec![
+                "cargo:rerun-if-changed=/w/verified",
+                "cargo:rerun-if-changed=/w/verified/rules",
+                "cargo:rerun-if-changed=/w/verified/rules/deep",
+                "cargo:rerun-if-changed=/w/verified/core.bend",
+                "cargo:rerun-if-changed=/w/verified/rules/a.bend",
+                "cargo:rerun-if-changed=/w/verified/rules/deep/b.bend",
+            ]
+        );
+    }
+
+    #[test]
+    fn failed_build_never_leaves_a_cached_compile_error() {
+        let root = temp_workspace("poisoned_cache");
+        fs::write(
+            root.join("verified/core.bend"),
+            "import Base\n\ndef inc(n: Nat) -> Nat:\n  Nat.add(n, 1n)\n",
+        )
+        .unwrap();
+        let cfg = make_cfg(&root);
+        let verified_rs = run_with_checker(&cfg, |_, _| Ok(())).unwrap().unwrap();
+        let good = fs::read_to_string(&verified_rs).unwrap();
+        let cache_file = cfg.out_dir.join("rusty-bends.cache");
+        let stamp = fs::read_to_string(&cache_file).unwrap();
+
+        // A failing build blocks verified.rs and drops the cache stamp.
+        block_failed_build(&cfg);
+        assert_eq!(
+            fs::read_to_string(&verified_rs).unwrap(),
+            BLOCKED_VERIFIED_RS
+        );
+        assert!(!cache_file.exists());
+
+        // Reverting to the passing state re-verifies and restores verified.rs.
+        let mut checked = 0;
+        run_with_checker(&cfg, |_, _| {
+            checked += 1;
+            Ok(())
+        })
+        .unwrap();
+        assert_eq!(checked, 1, "no cache stamp: must re-verify");
+        assert_eq!(fs::read_to_string(&verified_rs).unwrap(), good);
+
+        // Even with a stale matching stamp, a blocked verified.rs is never served.
+        fs::write(&cache_file, &stamp).unwrap();
+        fs::write(&verified_rs, BLOCKED_VERIFIED_RS).unwrap();
+        run_with_checker(&cfg, |_, _| Ok(())).unwrap();
+        assert_eq!(fs::read_to_string(&verified_rs).unwrap(), good);
+        let _ = fs::remove_dir_all(&root);
     }
 
     #[test]
@@ -10258,7 +10364,7 @@ const MAX_ADD_MAX_MIN_MUTANTS_PER_LAW: usize = 32;
 /// At most this many `Nat` literal sites per function are mutated by `NatLit`.
 const MAX_NAT_LIT_SITES_PER_DEF: usize = 8;
 /// Version tag baked into mutation cone hashes so cache keys invalidate when mutators change.
-const MUTATE_CACHE_VERSION: &str = "v4";
+const MUTATE_CACHE_VERSION: &str = "v5";
 /// Maximum mutants packed into one compiled multi-law harness binary.
 const BATCH_MAX_MUTANTS: usize = 160;
 /// Maximum distinct laws packed into one compiled multi-law harness binary.
@@ -10399,6 +10505,19 @@ pub fn run_mutation_checks(
     mode: MutateMode,
     out_dir: &Path,
 ) -> Result<MutationRunSummary, String> {
+    run_mutation_checks_with_cache(combined_source, lock_report, mode, out_dir, true)
+}
+
+/// Same as [`run_mutation_checks`]; with `use_cache = false` (`RUSTY_BENDS_NO_CACHE=1`)
+/// it ignores `OUT_DIR/rusty-bends-mutate.cache` and re-evaluates every mutant, then
+/// rewrites the cache with the fresh results.
+pub fn run_mutation_checks_with_cache(
+    combined_source: &str,
+    lock_report: &LockCheckReport,
+    mode: MutateMode,
+    out_dir: &Path,
+    use_cache: bool,
+) -> Result<MutationRunSummary, String> {
     let all_laws = parse_laws(combined_source);
     if all_laws.is_empty() {
         return Ok(MutationRunSummary {
@@ -10438,8 +10557,12 @@ pub fn run_mutation_checks(
 
     fs::create_dir_all(out_dir).map_err(|e| e.to_string())?;
     let cache_path = out_dir.join("rusty-bends-mutate.cache");
-    let mut cache = load_mutate_cache(&cache_path);
-    let mut cache_dirty = false;
+    let mut cache = if use_cache {
+        load_mutate_cache(&cache_path)
+    } else {
+        BTreeMap::new()
+    };
+    let mut cache_dirty = !use_cache;
     let full_report = mode == MutateMode::Report;
 
     let mut prepared: Vec<PreparedLaw<'_>> = Vec::with_capacity(check_targets.len());
@@ -13220,14 +13343,25 @@ fn compute_cone_hash_fast(
         buf.extend_from_slice(v.name.as_bytes());
         buf.push(b':');
         buf.extend_from_slice(v.ty.as_bytes());
+        buf.push(u8::from(v.is_type_param));
         buf.push(0);
     }
     for h in &law.hypotheses {
         buf.extend_from_slice(h.lhs.as_bytes());
         buf.extend_from_slice(b"==");
         buf.extend_from_slice(h.rhs.as_bytes());
+        buf.push(b':');
+        buf.extend_from_slice(h.ty.as_bytes());
         buf.push(0);
     }
+    match &law.unsupported_reason {
+        Some(reason) => {
+            buf.push(1);
+            buf.extend_from_slice(reason.as_bytes());
+        }
+        None => buf.push(0),
+    }
+    buf.push(0);
     buf.extend_from_slice(law.lhs.as_bytes());
     buf.extend_from_slice(b"==");
     buf.extend_from_slice(law.rhs.as_bytes());
@@ -13426,6 +13560,7 @@ fn load_mutate_cache(path: &Path) -> BTreeMap<String, MutateCacheEntry> {
                 let status = match parts[3] {
                     "CAUGHT" => MutantStatus::Caught(parts[4].to_string()),
                     "SURVIVED" => MutantStatus::Survived,
+                    "BUILD_ERROR" => MutantStatus::BuildError(parts[4].to_string()),
                     _ => continue,
                 };
                 if let Some(MutateCacheEntry::Full { outcomes, .. }) = map.get_mut(key) {
@@ -13595,7 +13730,7 @@ fn save_mutate_cache(path: &Path, map: &BTreeMap<String, MutateCacheEntry>) -> R
                         let (kind, extra) = match &o.status {
                             MutantStatus::Caught(ce) => ("CAUGHT", sanitize_cache_field(ce)),
                             MutantStatus::Survived => ("SURVIVED", String::new()),
-                            MutantStatus::BuildError(_) => continue,
+                            MutantStatus::BuildError(e) => ("BUILD_ERROR", sanitize_cache_field(e)),
                         };
                         lines.push(format!(
                             "\tM\t{}\t{}\t{}\t{kind}\t{extra}",
@@ -13769,7 +13904,90 @@ def take_conserves_capacity(alloc, free, req):
             .expect("cached mutation check succeeds");
         assert!(summary2.reports[0].from_cache);
 
+        // RUSTY_BENDS_NO_CACHE=1 bypasses the mutation cache too.
+        let summary3 =
+            run_mutation_checks_with_cache(src, &report, MutateMode::NewOnly, &out_dir, false)
+                .expect("uncached mutation check succeeds");
+        assert!(!summary3.reports[0].from_cache);
+
         let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn full_cache_entries_keep_build_error_outcomes() {
+        let dir = tmp_dir("cache_build_error");
+        let path = dir.join("rusty-bends-mutate.cache");
+        let outcomes = vec![
+            MutantOutcome {
+                def_name: "inc".into(),
+                operator: "NatAddSub".into(),
+                description: "Nat.add -> Nat.sub".into(),
+                status: MutantStatus::Caught("n = 0".into()),
+            },
+            MutantOutcome {
+                def_name: "inc".into(),
+                operator: "BoolFlip".into(),
+                description: "True -> False".into(),
+                status: MutantStatus::BuildError("error[E0308]: mismatched types".into()),
+            },
+            MutantOutcome {
+                def_name: "inc".into(),
+                operator: "NatLit".into(),
+                description: "1n -> 2n".into(),
+                status: MutantStatus::Survived,
+            },
+        ];
+        let mut map = BTreeMap::new();
+        map.insert(
+            "k1".to_string(),
+            MutateCacheEntry::Full {
+                total_mutants: 3,
+                generated_mutants: 3,
+                dropped_by_budget: 0,
+                dropped_by_site_cap: 0,
+                outcomes: outcomes.clone(),
+                skipped_reason: None,
+            },
+        );
+        save_mutate_cache(&path, &map).unwrap();
+        let loaded = load_mutate_cache(&path);
+        match loaded.get("k1") {
+            Some(MutateCacheEntry::Full { outcomes: got, .. }) => assert_eq!(got, &outcomes),
+            other => panic!("expected a Full entry, got {other:?}"),
+        }
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn cone_hash_covers_every_law_field_that_changes_mutant_results() {
+        let law = ParsedLaw {
+            name: "keeps".into(),
+            vars: vec![crate::law_test::LawVar {
+                name: "n".into(),
+                ty: "Nat".into(),
+                is_type_param: false,
+            }],
+            hypotheses: vec![crate::law_test::LawHypothesis {
+                lhs: "f(n)".into(),
+                rhs: "True{}".into(),
+                ty: "Bool".into(),
+            }],
+            lhs: "g(n)".into(),
+            rhs: "n".into(),
+            eq_ty: "Nat".into(),
+            unsupported_reason: None,
+        };
+        let hashes = HashMap::new();
+        let base = compute_cone_hash_fast(&law, &[], "t", &hashes);
+        let mut unsupported = law.clone();
+        unsupported.unsupported_reason = Some("uses 'exs'".into());
+        let mut hyp_ty = law.clone();
+        hyp_ty.hypotheses[0].ty = "U32".into();
+        let mut type_param = law.clone();
+        type_param.vars[0].is_type_param = true;
+        for changed in [unsupported, hyp_ty, type_param] {
+            assert_ne!(compute_cone_hash_fast(&changed, &[], "t", &hashes), base);
+        }
     }
 
     #[test]
@@ -17529,7 +17747,7 @@ def cancel_idempotent(s):
 4. **NEVER delete, comment out, or weaken laws in `verified/`.**
    `rusty-bends.lock` uses an AST/token canonicalizer (safe across whitespace/comment edits, strict on law changes) and fails with `E_LAW_LOCK_TAMPERED`. Use `RUSTY_BENDS_UPDATE_LAWS=<name>[,<name>...]` to seal specific reviewed laws, `=comments` to refresh comment lines alone without sealing, or `=1` to rewrite the whole lock; every lock write prints what was sealed, re-accepted, removed, or reworded.
 5. **Every new law MUST have a plain-English `# promise:` comment directly above `law <name>:`** (`# harm:` is optional). Missing promises on new laws fail with `E_LAW_NO_PROMISE` (locked laws warn if missing). Promises are stored in `rusty-bends.lock` outside the law hash, so improving `# promise:` wording is reported in build output without tripping `E_LAW_LOCK_TAMPERED`. Run `RUSTY_BENDS_LIST_LAWS=1 cargo check` or `cargo run -p rusty-bends-build --bin rusty-bends-laws -- verified` to print every law as `name: promise`, and `RUSTY_BENDS_LIST_COVERAGE=1 cargo check` (or `rusty-bends-laws --coverage verified`) to check which emitted functions no law reaches and which laws name only functions never called by Rust sources.
-6. **Lean `--verdict` kernel cross-check**: `rusty-bends-build` always runs `bend <file> --check-only` (which checks all laws and proofs). By default (`BEND_VERDICT=auto`), it also runs `--verdict` whenever Lean (`~/.elan/bin/lean`) or `$BENDTT` is installed, and skips `--verdict` with a warning otherwise. Set `BEND_VERDICT=require` in CI to enforce Lean cross-checking, or `BEND_VERDICT=off` to disable it. The incremental build cache records the `rusty-bends-build` source hash, verdict status (`ran`/`skipped`/`off`), CLI flags, and Bend binary/version, so updating `rusty-bends-build` or switching from `off` or `skipped` to `require` re-runs verification; set `RUSTY_BENDS_NO_CACHE=1` to bypass the cache unconditionally.
+6. **Lean `--verdict` kernel cross-check**: `rusty-bends-build` always runs `bend <file> --check-only` (which checks all laws and proofs). By default (`BEND_VERDICT=auto`), it also runs `--verdict` whenever Lean (`~/.elan/bin/lean`) or `$BENDTT` is installed, and skips `--verdict` with a warning otherwise. Set `BEND_VERDICT=require` in CI to enforce Lean cross-checking, or `BEND_VERDICT=off` to disable it. The incremental build cache records the `rusty-bends-build` source hash, verdict status (`ran`/`skipped`/`off`), CLI flags, and Bend binary/version, so updating `rusty-bends-build` or switching from `off` or `skipped` to `require` re-runs verification; set `RUSTY_BENDS_NO_CACHE=1` to bypass the build and mutation caches unconditionally. A failed build drops the cache stamp, so reverting a bad edit re-verifies instead of reusing the blocked `verified.rs`.
 7. **Pin Bend 2 if upstream drifts**: uncomment the version prefix (e.g. `2.0.`) in `bend.pin` or set `BEND_PIN_VERSION`.
 RUSTY_BENDS_EOF
 

@@ -44,7 +44,7 @@ const MAX_ADD_MAX_MIN_MUTANTS_PER_LAW: usize = 32;
 /// At most this many `Nat` literal sites per function are mutated by `NatLit`.
 const MAX_NAT_LIT_SITES_PER_DEF: usize = 8;
 /// Version tag baked into mutation cone hashes so cache keys invalidate when mutators change.
-const MUTATE_CACHE_VERSION: &str = "v4";
+const MUTATE_CACHE_VERSION: &str = "v5";
 /// Maximum mutants packed into one compiled multi-law harness binary.
 const BATCH_MAX_MUTANTS: usize = 160;
 /// Maximum distinct laws packed into one compiled multi-law harness binary.
@@ -185,6 +185,19 @@ pub fn run_mutation_checks(
     mode: MutateMode,
     out_dir: &Path,
 ) -> Result<MutationRunSummary, String> {
+    run_mutation_checks_with_cache(combined_source, lock_report, mode, out_dir, true)
+}
+
+/// Same as [`run_mutation_checks`]; with `use_cache = false` (`RUSTY_BENDS_NO_CACHE=1`)
+/// it ignores `OUT_DIR/rusty-bends-mutate.cache` and re-evaluates every mutant, then
+/// rewrites the cache with the fresh results.
+pub fn run_mutation_checks_with_cache(
+    combined_source: &str,
+    lock_report: &LockCheckReport,
+    mode: MutateMode,
+    out_dir: &Path,
+    use_cache: bool,
+) -> Result<MutationRunSummary, String> {
     let all_laws = parse_laws(combined_source);
     if all_laws.is_empty() {
         return Ok(MutationRunSummary {
@@ -224,8 +237,12 @@ pub fn run_mutation_checks(
 
     fs::create_dir_all(out_dir).map_err(|e| e.to_string())?;
     let cache_path = out_dir.join("rusty-bends-mutate.cache");
-    let mut cache = load_mutate_cache(&cache_path);
-    let mut cache_dirty = false;
+    let mut cache = if use_cache {
+        load_mutate_cache(&cache_path)
+    } else {
+        BTreeMap::new()
+    };
+    let mut cache_dirty = !use_cache;
     let full_report = mode == MutateMode::Report;
 
     let mut prepared: Vec<PreparedLaw<'_>> = Vec::with_capacity(check_targets.len());
@@ -3006,14 +3023,25 @@ fn compute_cone_hash_fast(
         buf.extend_from_slice(v.name.as_bytes());
         buf.push(b':');
         buf.extend_from_slice(v.ty.as_bytes());
+        buf.push(u8::from(v.is_type_param));
         buf.push(0);
     }
     for h in &law.hypotheses {
         buf.extend_from_slice(h.lhs.as_bytes());
         buf.extend_from_slice(b"==");
         buf.extend_from_slice(h.rhs.as_bytes());
+        buf.push(b':');
+        buf.extend_from_slice(h.ty.as_bytes());
         buf.push(0);
     }
+    match &law.unsupported_reason {
+        Some(reason) => {
+            buf.push(1);
+            buf.extend_from_slice(reason.as_bytes());
+        }
+        None => buf.push(0),
+    }
+    buf.push(0);
     buf.extend_from_slice(law.lhs.as_bytes());
     buf.extend_from_slice(b"==");
     buf.extend_from_slice(law.rhs.as_bytes());
@@ -3212,6 +3240,7 @@ fn load_mutate_cache(path: &Path) -> BTreeMap<String, MutateCacheEntry> {
                 let status = match parts[3] {
                     "CAUGHT" => MutantStatus::Caught(parts[4].to_string()),
                     "SURVIVED" => MutantStatus::Survived,
+                    "BUILD_ERROR" => MutantStatus::BuildError(parts[4].to_string()),
                     _ => continue,
                 };
                 if let Some(MutateCacheEntry::Full { outcomes, .. }) = map.get_mut(key) {
@@ -3381,7 +3410,7 @@ fn save_mutate_cache(path: &Path, map: &BTreeMap<String, MutateCacheEntry>) -> R
                         let (kind, extra) = match &o.status {
                             MutantStatus::Caught(ce) => ("CAUGHT", sanitize_cache_field(ce)),
                             MutantStatus::Survived => ("SURVIVED", String::new()),
-                            MutantStatus::BuildError(_) => continue,
+                            MutantStatus::BuildError(e) => ("BUILD_ERROR", sanitize_cache_field(e)),
                         };
                         lines.push(format!(
                             "\tM\t{}\t{}\t{}\t{kind}\t{extra}",
@@ -3555,7 +3584,90 @@ def take_conserves_capacity(alloc, free, req):
             .expect("cached mutation check succeeds");
         assert!(summary2.reports[0].from_cache);
 
+        // RUSTY_BENDS_NO_CACHE=1 bypasses the mutation cache too.
+        let summary3 =
+            run_mutation_checks_with_cache(src, &report, MutateMode::NewOnly, &out_dir, false)
+                .expect("uncached mutation check succeeds");
+        assert!(!summary3.reports[0].from_cache);
+
         let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn full_cache_entries_keep_build_error_outcomes() {
+        let dir = tmp_dir("cache_build_error");
+        let path = dir.join("rusty-bends-mutate.cache");
+        let outcomes = vec![
+            MutantOutcome {
+                def_name: "inc".into(),
+                operator: "NatAddSub".into(),
+                description: "Nat.add -> Nat.sub".into(),
+                status: MutantStatus::Caught("n = 0".into()),
+            },
+            MutantOutcome {
+                def_name: "inc".into(),
+                operator: "BoolFlip".into(),
+                description: "True -> False".into(),
+                status: MutantStatus::BuildError("error[E0308]: mismatched types".into()),
+            },
+            MutantOutcome {
+                def_name: "inc".into(),
+                operator: "NatLit".into(),
+                description: "1n -> 2n".into(),
+                status: MutantStatus::Survived,
+            },
+        ];
+        let mut map = BTreeMap::new();
+        map.insert(
+            "k1".to_string(),
+            MutateCacheEntry::Full {
+                total_mutants: 3,
+                generated_mutants: 3,
+                dropped_by_budget: 0,
+                dropped_by_site_cap: 0,
+                outcomes: outcomes.clone(),
+                skipped_reason: None,
+            },
+        );
+        save_mutate_cache(&path, &map).unwrap();
+        let loaded = load_mutate_cache(&path);
+        match loaded.get("k1") {
+            Some(MutateCacheEntry::Full { outcomes: got, .. }) => assert_eq!(got, &outcomes),
+            other => panic!("expected a Full entry, got {other:?}"),
+        }
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn cone_hash_covers_every_law_field_that_changes_mutant_results() {
+        let law = ParsedLaw {
+            name: "keeps".into(),
+            vars: vec![crate::law_test::LawVar {
+                name: "n".into(),
+                ty: "Nat".into(),
+                is_type_param: false,
+            }],
+            hypotheses: vec![crate::law_test::LawHypothesis {
+                lhs: "f(n)".into(),
+                rhs: "True{}".into(),
+                ty: "Bool".into(),
+            }],
+            lhs: "g(n)".into(),
+            rhs: "n".into(),
+            eq_ty: "Nat".into(),
+            unsupported_reason: None,
+        };
+        let hashes = HashMap::new();
+        let base = compute_cone_hash_fast(&law, &[], "t", &hashes);
+        let mut unsupported = law.clone();
+        unsupported.unsupported_reason = Some("uses 'exs'".into());
+        let mut hyp_ty = law.clone();
+        hyp_ty.hypotheses[0].ty = "U32".into();
+        let mut type_param = law.clone();
+        type_param.vars[0].is_type_param = true;
+        for changed in [unsupported, hyp_ty, type_param] {
+            assert_ne!(compute_cone_hash_fast(&changed, &[], "t", &hashes), base);
+        }
     }
 
     #[test]

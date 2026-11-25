@@ -196,16 +196,25 @@ pub fn verify_dir(dir: impl AsRef<Path>) {
     run_or_fail(&cfg);
 }
 
+/// Contents written to `OUT_DIR/verified.rs` when verification fails, so the
+/// crate that includes it stops at compile time.
+const BLOCKED_VERIFIED_RS: &str =
+    "compile_error!(\"RustyBends verification failed — fix Bend 2 proofs or lock violations.\");\n";
+
+/// Marks a failed build: drops the build cache stamp (so reverting to a passing
+/// state re-verifies instead of serving the blocked file) and, when emitting Rust,
+/// replaces `verified.rs` with a `compile_error!`.
+fn block_failed_build(cfg: &Config) {
+    let _ = fs::remove_file(cfg.out_dir.join("rusty-bends.cache"));
+    if cfg.emit_rust {
+        let _ = fs::create_dir_all(&cfg.out_dir);
+        let _ = fs::write(cfg.out_dir.join("verified.rs"), BLOCKED_VERIFIED_RS);
+    }
+}
+
 fn run_or_fail(cfg: &Config) {
     if let Err(err) = run(cfg) {
-        if cfg.emit_rust {
-            let _ = fs::create_dir_all(&cfg.out_dir);
-            let blocked = cfg.out_dir.join("verified.rs");
-            let _ = fs::write(
-                blocked,
-                "compile_error!(\"RustyBends verification failed — fix Bend 2 proofs or lock violations.\");\n",
-            );
-        }
+        block_failed_build(cfg);
         for line in err.lines() {
             println!("cargo:error={line}");
         }
@@ -244,10 +253,7 @@ pub fn run(cfg: &Config) -> Result<Option<PathBuf>, String> {
         cfg,
         bend_version.as_deref(),
         has_verdict_runtime(),
-        |file, has_laws| {
-            println!("cargo:rerun-if-changed={}", file.display());
-            verify_with_bend_cli(cfg, file, has_laws)
-        },
+        |file, has_laws| verify_with_bend_cli(cfg, file, has_laws),
     )
 }
 
@@ -483,6 +489,11 @@ where
         ));
     }
 
+    // Every .bend file and directory under verified/ is a build input, on cache hits too.
+    for line in rerun_if_changed_lines(&cfg.verified_dir, &bend_files) {
+        println!("{line}");
+    }
+
     // Record which laws were already locked before this build for failure diagnostics.
     let pre_locked_laws = lock::read_locked_law_names(&cfg.lock_file);
 
@@ -519,7 +530,7 @@ where
                 .unwrap_or(false)
         });
     if cache_hit
-        && (!cfg.emit_rust || verified_rs.exists())
+        && (!cfg.emit_rust || verified_rs_is_usable(&verified_rs))
         && !lock_report.needs_write
         && lock_report.new_names.is_empty()
         && cfg.mutate_mode == MutateMode::NewOnly
@@ -608,11 +619,12 @@ where
         };
 
     // 4. Mutation-check every unlocked/new law before sealing (and report all locked laws under RUSTY_BENDS_MUTATE=all)
-    let mut_summary = mutate::run_mutation_checks(
+    let mut_summary = mutate::run_mutation_checks_with_cache(
         &combined_source,
         &lock_report,
         cfg.mutate_mode,
         &cfg.out_dir,
+        !cfg.no_cache,
     )?;
     for w in &mut_summary.warnings {
         emit_cargo_warning(w);
@@ -1072,6 +1084,39 @@ pub fn collect_bend_files(dir: &Path, out: &mut Vec<PathBuf>) -> Result<(), Stri
     Ok(())
 }
 
+/// `cargo:rerun-if-changed` lines for `verified_dir`, each subdirectory under it
+/// (so added or removed files are noticed), and every collected `.bend` file.
+fn rerun_if_changed_lines(verified_dir: &Path, bend_files: &[PathBuf]) -> Vec<String> {
+    let mut dirs = std::collections::BTreeSet::new();
+    for file in bend_files {
+        let mut dir = file.parent();
+        while let Some(d) = dir {
+            if !d.starts_with(verified_dir) || d == verified_dir {
+                break;
+            }
+            dirs.insert(d.to_path_buf());
+            dir = d.parent();
+        }
+    }
+    let mut lines = vec![format!("cargo:rerun-if-changed={}", verified_dir.display())];
+    lines.extend(
+        dirs.iter()
+            .map(|d| format!("cargo:rerun-if-changed={}", d.display())),
+    );
+    lines.extend(
+        bend_files
+            .iter()
+            .map(|f| format!("cargo:rerun-if-changed={}", f.display())),
+    );
+    lines
+}
+
+/// A cached `verified.rs` is reusable only if it exists and is not the blocked
+/// `compile_error!` file a failed build leaves behind.
+fn verified_rs_is_usable(path: &Path) -> bool {
+    fs::read_to_string(path).is_ok_and(|text| text != BLOCKED_VERIFIED_RS)
+}
+
 fn hash_files(files: &[PathBuf]) -> Result<String, String> {
     let mut buf = b"rb-cache-v2\0".to_vec();
     for f in files {
@@ -1213,6 +1258,67 @@ mod tests {
         assert!(verify_bend_version_str("0.2.38", "bend 0.2.38 (commit abc123)").is_ok());
         let err = verify_bend_version_str("0.2.38", "bend 0.3.0").unwrap_err();
         assert!(err.contains("E_BEND_VERSION_MISMATCH"));
+    }
+
+    #[test]
+    fn rerun_directives_cover_every_bend_file_and_subdirectory() {
+        let root = Path::new("/w/verified");
+        let files = vec![
+            root.join("core.bend"),
+            root.join("rules/a.bend"),
+            root.join("rules/deep/b.bend"),
+        ];
+        assert_eq!(
+            rerun_if_changed_lines(root, &files),
+            vec![
+                "cargo:rerun-if-changed=/w/verified",
+                "cargo:rerun-if-changed=/w/verified/rules",
+                "cargo:rerun-if-changed=/w/verified/rules/deep",
+                "cargo:rerun-if-changed=/w/verified/core.bend",
+                "cargo:rerun-if-changed=/w/verified/rules/a.bend",
+                "cargo:rerun-if-changed=/w/verified/rules/deep/b.bend",
+            ]
+        );
+    }
+
+    #[test]
+    fn failed_build_never_leaves_a_cached_compile_error() {
+        let root = temp_workspace("poisoned_cache");
+        fs::write(
+            root.join("verified/core.bend"),
+            "import Base\n\ndef inc(n: Nat) -> Nat:\n  Nat.add(n, 1n)\n",
+        )
+        .unwrap();
+        let cfg = make_cfg(&root);
+        let verified_rs = run_with_checker(&cfg, |_, _| Ok(())).unwrap().unwrap();
+        let good = fs::read_to_string(&verified_rs).unwrap();
+        let cache_file = cfg.out_dir.join("rusty-bends.cache");
+        let stamp = fs::read_to_string(&cache_file).unwrap();
+
+        // A failing build blocks verified.rs and drops the cache stamp.
+        block_failed_build(&cfg);
+        assert_eq!(
+            fs::read_to_string(&verified_rs).unwrap(),
+            BLOCKED_VERIFIED_RS
+        );
+        assert!(!cache_file.exists());
+
+        // Reverting to the passing state re-verifies and restores verified.rs.
+        let mut checked = 0;
+        run_with_checker(&cfg, |_, _| {
+            checked += 1;
+            Ok(())
+        })
+        .unwrap();
+        assert_eq!(checked, 1, "no cache stamp: must re-verify");
+        assert_eq!(fs::read_to_string(&verified_rs).unwrap(), good);
+
+        // Even with a stale matching stamp, a blocked verified.rs is never served.
+        fs::write(&cache_file, &stamp).unwrap();
+        fs::write(&verified_rs, BLOCKED_VERIFIED_RS).unwrap();
+        run_with_checker(&cfg, |_, _| Ok(())).unwrap();
+        assert_eq!(fs::read_to_string(&verified_rs).unwrap(), good);
+        let _ = fs::remove_dir_all(&root);
     }
 
     #[test]
