@@ -685,10 +685,12 @@ fn emit_adt_pool_fn(
 ) -> String {
     let mut s = format!(
         "    fn __rb_pool_adt_{}(rng: &mut u64, depth: usize, recursive: bool) -> Vec<{}> {{\n",
-        td.name, td.name
+        td.name,
+        rust_ident(&td.name)
     );
     s.push_str("        let mut out = Vec::new();\n");
     for v in &td.variants {
+        let ctor_rs = format!("{}::{}", rust_ident(&td.name), rust_ident(&v.name));
         let has_adt_field = v
             .field_types
             .iter()
@@ -716,7 +718,7 @@ fn emit_adt_pool_fn(
                 td.name, v.name
             ));
         } else if v.field_types.is_empty() {
-            s.push_str(&format!("{indent}out.push({}::{});\n", td.name, v.name));
+            s.push_str(&format!("{indent}out.push({ctor_rs});\n"));
         } else if v.field_types.len() == 1 {
             let expr = emit_pool_expr(
                 &v.field_types[0],
@@ -727,10 +729,7 @@ fn emit_adt_pool_fn(
             );
             let pushed = wrap_ctor_pool_arg("f0".to_string(), field_is_boxed(0));
             s.push_str(&format!("{indent}for f0 in {expr} {{\n"));
-            s.push_str(&format!(
-                "{indent}    out.push({}::{}({pushed}));\n",
-                td.name, v.name
-            ));
+            s.push_str(&format!("{indent}    out.push({ctor_rs}({pushed}));\n"));
             s.push_str(&format!("{indent}}}\n"));
         } else {
             for (fi, ft) in v.field_types.iter().enumerate() {
@@ -756,10 +755,7 @@ fn emit_adt_pool_fn(
                 .map(|fi| wrap_ctor_pool_arg(format!("__s{fi}.clone()"), field_is_boxed(fi)))
                 .collect::<Vec<_>>()
                 .join(", ");
-            s.push_str(&format!(
-                "{loop_ind}out.push({}::{}({small_args}));\n",
-                td.name, v.name
-            ));
+            s.push_str(&format!("{loop_ind}out.push({ctor_rs}({small_args}));\n"));
             for _ in 0..v.field_types.len() {
                 loop_ind.truncate(loop_ind.len() - 4);
                 s.push_str(&format!("{loop_ind}}}\n"));
@@ -781,8 +777,7 @@ fn emit_adt_pool_fn(
                 .collect::<Vec<_>>()
                 .join(", ");
             s.push_str(&format!(
-                "{inner_indent}    out.push({}::{}({args_sweep}));\n",
-                td.name, v.name
+                "{inner_indent}    out.push({ctor_rs}({args_sweep}));\n"
             ));
             s.push_str(&format!("{inner_indent}}}\n"));
             let edge_args = (0..v.field_types.len())
@@ -795,8 +790,7 @@ fn emit_adt_pool_fn(
                 .collect::<Vec<_>>()
                 .join(", ");
             s.push_str(&format!(
-                "{inner_indent}out.push({}::{}({edge_args}));\n",
-                td.name, v.name
+                "{inner_indent}out.push({ctor_rs}({edge_args}));\n"
             ));
             if !eval_mode {
                 s.push_str(&format!("{inner_indent}for _ in 0..4 {{\n"));
@@ -812,8 +806,7 @@ fn emit_adt_pool_fn(
                     .collect::<Vec<_>>()
                     .join(", ");
                 s.push_str(&format!(
-                    "{inner_indent}    out.push({}::{}({args_rng}));\n",
-                    td.name, v.name
+                    "{inner_indent}    out.push({ctor_rs}({args_rng}));\n"
                 ));
                 s.push_str(&format!("{inner_indent}}}\n"));
             }

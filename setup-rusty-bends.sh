@@ -5060,12 +5060,33 @@ pub(crate) fn emit_items_to_rust(
         );
     }
 
+    // Types holding an F32 (directly or through another type) cannot derive Eq.
+    let mut float_types: HashSet<&str> = HashSet::new();
+    loop {
+        let before = float_types.len();
+        for td in types {
+            let holds_float = td.variants.iter().any(|v| {
+                v.field_types.iter().any(|ft| {
+                    crate::lock::tokenize_bend(ft)
+                        .iter()
+                        .any(|t| t == "F32" || float_types.contains(t.as_str()))
+                })
+            });
+            if holds_float {
+                float_types.insert(td.name.as_str());
+            }
+        }
+        if float_types.len() == before {
+            break;
+        }
+    }
+
     if emit_types {
         for td in types {
             let mut variants_rs = Vec::new();
             for v in &td.variants {
                 if v.field_types.is_empty() {
-                    variants_rs.push(format!("    {},", v.name));
+                    variants_rs.push(format!("    {},", rust_ident(&v.name)));
                 } else {
                     let info = type_env.ctor_map.get(&format!("{}.{}", td.name, v.name));
                     let mapped: Vec<String> = v
@@ -5084,17 +5105,35 @@ pub(crate) fn emit_items_to_rust(
                             }
                         })
                         .collect();
-                    variants_rs.push(format!("    {}({}),", v.name, mapped.join(", ")));
+                    variants_rs.push(format!(
+                        "    {}({}),",
+                        rust_ident(&v.name),
+                        mapped.join(", ")
+                    ));
                 }
             }
-            let derive_line = if type_env.non_copy_types.contains(&td.name) {
-                "#[derive(Debug, Clone, PartialEq, Eq)]"
+            let eq = if float_types.contains(td.name.as_str()) {
+                ""
             } else {
-                "#[derive(Debug, Clone, Copy, PartialEq, Eq)]"
+                ", Eq"
+            };
+            let derive_line = if type_env.non_copy_types.contains(&td.name) {
+                format!("#[derive(Debug, Clone, PartialEq{eq})]")
+            } else {
+                format!("#[derive(Debug, Clone, Copy, PartialEq{eq})]")
+            };
+            // Bend allows lowercase type and constructor names; keep them as written.
+            let is_camel =
+                |n: &str| n.starts_with(|c: char| c.is_ascii_uppercase()) && !n.contains('_');
+            let lint_allow = if is_camel(&td.name) && td.variants.iter().all(|v| is_camel(&v.name))
+            {
+                ""
+            } else {
+                "#[allow(non_camel_case_types)]\n"
             };
             blocks.push(format!(
-                "{derive_line}\npub enum {} {{\n{}\n}}",
-                td.name,
+                "{derive_line}\n{lint_allow}pub enum {} {{\n{}\n}}",
+                rust_ident(&td.name),
                 variants_rs.join("\n")
             ));
         }
@@ -5124,7 +5163,14 @@ pub(crate) fn emit_items_to_rust(
         let generics = if !has_generics {
             String::new()
         } else {
-            format!("<{}>", type_params.join(", "))
+            format!(
+                "<{}>",
+                type_params
+                    .iter()
+                    .map(|t| rust_ident(t))
+                    .collect::<Vec<_>>()
+                    .join(", ")
+            )
         };
 
         let rust_params = live_params
@@ -5165,9 +5211,11 @@ pub(crate) fn emit_items_to_rust(
         if !def.total && total_cone.contains(&def.name) {
             variants.push((rust_ident(&total_fn_name(def)), true, false));
         }
+        let param_locals: HashSet<String> = def.params.iter().map(|p| p.name.clone()).collect();
         for (fn_name, total, public) in variants {
             let ops = RefCell::new(Vec::new());
             let ctx = EmitCtx {
+                locals: &param_locals,
                 defs: &def_map,
                 type_env,
                 clone_vars: &clone_vars,
@@ -5535,6 +5583,21 @@ pub fn parse_book_items(source: &str) -> Result<(Vec<TypeDef>, Vec<Def>), String
         i += 1;
     }
 
+    let mut ctor_owner: HashMap<&str, &str> = HashMap::new();
+    for td in &types {
+        for v in &td.variants {
+            if !is_valid_rust_ident_or_wildcard(&v.name) || v.name == "_" {
+                continue;
+            }
+            if let Some(other) = ctor_owner.insert(v.name.as_str(), td.name.as_str()) {
+                return Err(format!(
+                    "[E_NAME_COLLISION] Constructor '{}' is declared by both '{other}' and '{}'.\nHint: RustyBends emits all of verified/ into one Rust module, where bare constructor names must be unique; rename one of them.",
+                    v.name, td.name
+                ));
+            }
+        }
+    }
+
     Ok((types, defs))
 }
 
@@ -5819,12 +5882,15 @@ fn parse_def_header(header: &str, body: String) -> Result<Def, String> {
 pub(crate) enum ArithMode {
     NatChecked,
     Wrapping,
+    /// `F32`: IEEE arithmetic, plain Rust operators on `f32`.
+    Float,
 }
 
 pub(crate) fn arith_mode_for_type(ty: &str, fallback: ArithMode) -> ArithMode {
     match ty.trim() {
         "U32" | "U64" | "I32" | "I64" => ArithMode::Wrapping,
         "Nat" => ArithMode::NatChecked,
+        "F32" => ArithMode::Float,
         _ => fallback,
     }
 }
@@ -5862,8 +5928,10 @@ pub(crate) fn bend_type_to_rust(ty: &str, type_params: &HashSet<String>) -> Stri
         "I32" => "i32".to_string(),
         "I64" => "i64".to_string(),
         "Bool" => "bool".to_string(),
+        "F32" => "f32".to_string(),
         "Unit" | "()" => "()".to_string(),
-        _ if type_params.contains(t) => t.to_string(),
+        _ if type_params.contains(t) => rust_ident(t),
+        _ if t.split('.').all(is_valid_rust_ident_or_wildcard) => rust_path(t),
         _ => t.to_string(),
     }
 }
@@ -6056,27 +6124,29 @@ fn emit_pattern_guard(
     if p == "_" || p == "Unit{}" || p == "()" {
         return Ok("true".to_string());
     }
+    // Guard targets are references (boxed fields, sub-bindings of a borrowed match):
+    // dereference before matching a literal so every Rust edition and version accepts it.
     if p == "true" || p == "True{}" {
-        return Ok(format!("matches!({target}, true)"));
+        return Ok(format!("matches!(*({target}), true)"));
     }
     if p == "false" || p == "False{}" {
-        return Ok(format!("matches!({target}, false)"));
+        return Ok(format!("matches!(*({target}), false)"));
     }
     if p == "[]" {
         return Ok(format!("matches!({target}, List::Nil)"));
     }
     if let Some(nat_pat) = parse_nat_succ_pattern(p)? {
         return Ok(match nat_pat {
-            NatPattern::Const(total) => format!("matches!({target}, {total}_u64)"),
+            NatPattern::Const(total) => format!("matches!(*({target}), {total}_u64)"),
             NatPattern::Succ { offset: 0, .. } => "true".to_string(),
             NatPattern::Succ { offset, .. } => {
-                format!("matches!({target}, {offset}_u64..=u64::MAX)")
+                format!("matches!(*({target}), {offset}_u64..=u64::MAX)")
             }
         });
     }
     if let Some(digits) = p.strip_suffix('n') {
         if !digits.is_empty() && digits.chars().all(|c| c.is_ascii_digit()) {
-            return Ok(format!("matches!({target}, {digits}_u64)"));
+            return Ok(format!("matches!(*({target}), {digits}_u64)"));
         }
     }
     if is_wrapped_in_parens(p) {
@@ -6353,9 +6423,18 @@ fn emit_match_pattern(
 
 fn resolve_ctor_path(name: &str, ctors: &HashMap<String, CtorInfo>) -> String {
     if let Some(info) = ctors.get(name) {
-        return format!("{}::{}", info.type_name, info.variant_name);
+        return ctor_rust_path(info);
     }
-    name.replace('.', "::")
+    rust_path(name)
+}
+
+/// Keyword-safe Rust path `Type::Variant` of a constructor.
+fn ctor_rust_path(info: &CtorInfo) -> String {
+    format!(
+        "{}::{}",
+        rust_ident(&info.type_name),
+        rust_ident(&info.variant_name)
+    )
 }
 
 pub(crate) fn leading_indent(line: &str) -> usize {
@@ -6602,6 +6681,9 @@ pub(crate) struct EmitCtx<'a> {
     pub(crate) total_cone: &'a HashSet<String>,
     /// Records each panicking checked-growth op emitted (ignored in total mode).
     pub(crate) panic_ops: &'a RefCell<Vec<String>>,
+    /// Names bound in scope (parameters, pattern binders, `let`s): a bare name in this
+    /// set is the local, never a nullary constructor of the same name.
+    pub(crate) locals: &'a HashSet<String>,
 }
 
 const OVERFLOW_EXPECT: &str = ".expect(\"rusty-bends: Nat overflow\")";
@@ -6635,6 +6717,7 @@ pub(crate) fn emit_expr_with_mode(
     mode: ArithMode,
 ) -> Result<String, String> {
     let no_cone = HashSet::new();
+    let no_locals = HashSet::new();
     let ops = RefCell::new(Vec::new());
     let ctx = EmitCtx {
         defs,
@@ -6644,6 +6727,7 @@ pub(crate) fn emit_expr_with_mode(
         total: false,
         total_cone: &no_cone,
         panic_ops: &ops,
+        locals: &no_locals,
     };
     emit_expr_with_ctx(expr, &ctx, mode)
 }
@@ -6696,8 +6780,11 @@ fn emit_expr_with_ctx(expr: &str, ctx: &EmitCtx<'_>, mode: ArithMode) -> Result<
                         }
                     }
                 }
+                let mut body_locals = ctx.locals.clone();
+                body_locals.extend(extract_let_bound_names(lhs_raw));
                 let body_ctx = EmitCtx {
                     clone_vars: &body_clone_vars,
+                    locals: &body_locals,
                     ..*ctx
                 };
                 return Ok(format!(
@@ -6746,18 +6833,22 @@ fn emit_expr_with_ctx(expr: &str, ctx: &EmitCtx<'_>, mode: ArithMode) -> Result<
                 }
                 if !ctx.has_generics {
                     for (var, field_ty) in &pat_state.bound_vars {
+                        // Binders of unknown type (tuple scrutinees, wildcards) may hold a
+                        // non-Copy value: clone on reuse, which is a no-op cost for Copy.
                         let maybe_non_copy = match field_ty.as_deref() {
-                            Some("_") => !ctx.type_env.non_copy_types.is_empty(),
+                            Some("_") | None => !ctx.type_env.non_copy_types.is_empty(),
                             Some(ty) => type_contains_non_copy(ty, &ctx.type_env.non_copy_types),
-                            None => false,
                         };
                         if maybe_non_copy && count_ident_uses(&arm_body, var) > 1 {
                             arm_clone_vars.insert(var.clone());
                         }
                     }
                 }
+                let mut arm_locals = ctx.locals.clone();
+                arm_locals.extend(pat_state.bound_vars.iter().map(|(v, _)| v.clone()));
                 let arm_ctx = EmitCtx {
                     clone_vars: &arm_clone_vars,
+                    locals: &arm_locals,
                     ..*ctx
                 };
                 let emitted_body = emit_expr_with_ctx(&arm_body, &arm_ctx, mode)?;
@@ -6805,6 +6896,15 @@ fn emit_expr_with_ctx(expr: &str, ctx: &EmitCtx<'_>, mode: ArithMode) -> Result<
     }
     if s == "Unit{}" || s == "()" {
         return Ok("()".to_string());
+    }
+
+    // String literal: Bend's String maps to an owned Rust String.
+    if is_string_literal(s) {
+        return Ok(format!("String::from({s})"));
+    }
+    // F32 literal (`1.5`), or an integer literal in F32 context.
+    if is_float_literal(s) || (mode == ArithMode::Float && is_int_literal(s)) {
+        return Ok(format!("{s}_f32"));
     }
 
     // Handle conditionals: if cond: then_branch else: else_branch
@@ -6873,8 +6973,11 @@ fn emit_expr_with_ctx(expr: &str, ctx: &EmitCtx<'_>, mode: ArithMode) -> Result<
                         }
                     }
                 }
+                let mut body_locals = ctx.locals.clone();
+                body_locals.extend(extract_let_bound_names(name));
                 let body_ctx = EmitCtx {
                     clone_vars: &body_clone_vars,
+                    locals: &body_locals,
                     ..*ctx
                 };
                 return Ok(format!(
@@ -6898,6 +7001,38 @@ fn emit_expr_with_ctx(expr: &str, ctx: &EmitCtx<'_>, mode: ArithMode) -> Result<
         }
     }
 
+    // String concatenation `a ++ b` (Base String.append).
+    if let Some((_, lhs, rhs)) = split_last_spaced_op(s, &["++"]) {
+        return Ok(format!(
+            "format!(\"{{}}{{}}\", {}, {})",
+            emit_expr_with_ctx(lhs, ctx, mode)?,
+            emit_expr_with_ctx(rhs, ctx, mode)?
+        ));
+    }
+
+    // Bitwise `.|.` < `.^.` < `.&.` < shifts `<<` `>>` (Bend 2 precedence), fixed-width only.
+    for ops in [&[".|."][..], &[".^."], &[".&."], &["<<", ">>"]] {
+        if let Some((op, lhs, rhs)) = split_last_spaced_op(s, ops) {
+            if mode != ArithMode::Wrapping {
+                return Err(format!(
+                    "[E_EMIT_UNSUPPORTED] '{op}' needs a fixed-width type annotation such as '(a {op} b : U32)' in '{s}'"
+                ));
+            }
+            let l = emit_expr_with_ctx(lhs, ctx, mode)?;
+            return Ok(match op {
+                ".|." => format!("({l} | {})", emit_expr_with_ctx(rhs, ctx, mode)?),
+                ".^." => format!("({l} ^ {})", emit_expr_with_ctx(rhs, ctx, mode)?),
+                ".&." => format!("({l} & {})", emit_expr_with_ctx(rhs, ctx, mode)?),
+                // U32.shln / U32.shrn: the shift amount is a Nat; 32 or more gives 0.
+                _ => {
+                    let r = emit_expr_with_ctx(rhs, ctx, ArithMode::NatChecked)?;
+                    let rust_op = if op == "<<" { "<<" } else { ">>" };
+                    format!("{{ let __a = {l}; let __b: u64 = {r}; if __b >= 32 {{ 0 }} else {{ __a {rust_op} __b }} }}")
+                }
+            });
+        }
+    }
+
     // Right-to-left top-level '+' or '-' (checked add / saturating sub for Nat; wrapping for U32/U64/I32/I64)
     if let Some((op, lhs, rhs)) = split_last_additive(s) {
         // `1n+x` (no spaces) is Bend's Nat successor sugar: Nat whatever the context.
@@ -6915,6 +7050,7 @@ fn emit_expr_with_ctx(expr: &str, ctx: &EmitCtx<'_>, mode: ArithMode) -> Result<
             (ArithMode::NatChecked, '-') => format!("({l}).saturating_sub({r})"),
             (ArithMode::Wrapping, '+') => format!("({l}).wrapping_add({r})"),
             (ArithMode::Wrapping, '-') => format!("({l}).wrapping_sub({r})"),
+            (ArithMode::Float, _) => format!("({l} {op} {r})"),
             _ => unreachable!(),
         });
     }
@@ -6940,6 +7076,8 @@ fn emit_expr_with_ctx(expr: &str, ctx: &EmitCtx<'_>, mode: ArithMode) -> Result<
             (ArithMode::Wrapping, '%') => {
                 format!("{{ let __a = {l}; let __b = {r}; if __b == 0 {{ __a }} else {{ __a.wrapping_rem(__b) }} }}")
             }
+            // F32.mod is C fmod, which Rust's '%' on f32 matches.
+            (ArithMode::Float, _) => format!("({l} {op} {r})"),
             _ => unreachable!(),
         });
     }
@@ -7017,9 +7155,8 @@ fn emit_expr_with_ctx(expr: &str, ctx: &EmitCtx<'_>, mode: ArithMode) -> Result<
                     }
                 }
                 return Ok(format!(
-                    "{}::{}({})",
-                    info.type_name,
-                    info.variant_name,
+                    "{}({})",
+                    ctor_rust_path(info),
                     emitted_args.join(", ")
                 ));
             }
@@ -7073,9 +7210,10 @@ fn emit_expr_with_ctx(expr: &str, ctx: &EmitCtx<'_>, mode: ArithMode) -> Result<
     }
 
     // Unit ADT constructor (e.g. OrderState.Draft or Draft)
+    // A bare name is a local before it is a nullary constructor (Bend 2 writes those `C{}`).
     if let Some(info) = ctors.get(s) {
-        if info.arity == 0 {
-            return Ok(format!("{}::{}", info.type_name, info.variant_name));
+        if info.arity == 0 && !ctx.locals.contains(s) {
+            return Ok(ctor_rust_path(info));
         }
     }
 
@@ -7310,23 +7448,86 @@ fn split_keyword<'a>(s: &'a str, needle: &str) -> Option<(&'a str, &'a str)> {
 pub(crate) fn split_top_level_str<'a>(s: &'a str, op: &str) -> Option<(&'a str, &'a str)> {
     let mut depth = 0i32;
     let bytes = s.as_bytes();
-    for i in 0..bytes.len() {
-        match bytes[i] {
+    let mut in_string = false;
+    let mut i = 0usize;
+    while i < bytes.len() {
+        let b = bytes[i];
+        if in_string {
+            if b == b'\\' {
+                i += 1;
+            } else if b == b'"' {
+                in_string = false;
+            }
+            i += 1;
+            continue;
+        }
+        match b {
+            b'"' => in_string = true,
             b'(' | b'{' | b'[' => depth += 1,
             b')' | b'}' | b']' => depth -= 1,
             _ if depth == 0 && i > 0 && s[i..].starts_with(op) => {
-                if (op == "<" || op == ">") && i + 1 < bytes.len() && bytes[i + 1] == b'=' {
-                    continue;
+                let prev = bytes[i - 1];
+                let next = bytes.get(i + op.len()).copied().unwrap_or(b' ');
+                // '<' and '>' alone must not match inside '<=', '>=', '<<', '>>', '->',
+                // '<-', '<>', '<&>', or '=>'.
+                let part_of_longer = match op {
+                    "<" => matches!(next, b'=' | b'<' | b'-' | b'>' | b'&') || prev == b'<',
+                    ">" => {
+                        matches!(next, b'=' | b'>')
+                            || matches!(prev, b'=' | b'-' | b'>' | b'&' | b'<')
+                    }
+                    _ => false,
+                };
+                if !part_of_longer {
+                    return Some((s[..i].trim(), s[i + op.len()..].trim()));
                 }
-                if op == ">" && (bytes[i - 1] == b'=' || bytes[i - 1] == b'-') {
-                    continue;
-                }
-                return Some((s[..i].trim(), s[i + op.len()..].trim()));
             }
             _ => {}
         }
+        i += 1;
     }
     None
+}
+
+/// Splits `s` at the last top-level ` op ` (spaced, as Bend 2 requires for infix
+/// operators) among `ops`, outside brackets and string literals: left-associative.
+fn split_last_spaced_op<'a>(
+    s: &'a str,
+    ops: &[&'static str],
+) -> Option<(&'static str, &'a str, &'a str)> {
+    let bytes = s.as_bytes();
+    let mut depth = 0i32;
+    let mut in_string = false;
+    let mut found = None;
+    let mut i = 0usize;
+    while i < bytes.len() {
+        let b = bytes[i];
+        if in_string {
+            if b == b'\\' {
+                i += 1;
+            } else if b == b'"' {
+                in_string = false;
+            }
+            i += 1;
+            continue;
+        }
+        match b {
+            b'"' => in_string = true,
+            b'(' | b'{' | b'[' => depth += 1,
+            b')' | b'}' | b']' => depth -= 1,
+            b' ' if depth == 0 => {
+                for op in ops {
+                    let end = i + 1 + op.len();
+                    if s[i + 1..].starts_with(op) && bytes.get(end) == Some(&b' ') {
+                        found = Some((*op, s[..i].trim(), s[end + 1..].trim()));
+                    }
+                }
+            }
+            _ => {}
+        }
+        i += 1;
+    }
+    found
 }
 
 fn is_valid_path_ident(s: &str) -> bool {
@@ -7475,6 +7676,35 @@ pub(crate) fn split_top_level_once(s: &str, delim: char) -> Option<(&str, &str)>
     None
 }
 
+/// `"..."` with no unescaped quote inside.
+fn is_string_literal(s: &str) -> bool {
+    if s.len() < 2 || !s.starts_with('"') || !s.ends_with('"') {
+        return false;
+    }
+    let inner = &s[1..s.len() - 1];
+    let mut escaped = false;
+    for ch in inner.chars() {
+        if escaped {
+            escaped = false;
+        } else if ch == '\\' {
+            escaped = true;
+        } else if ch == '"' {
+            return false;
+        }
+    }
+    !escaped
+}
+
+fn is_int_literal(s: &str) -> bool {
+    !s.is_empty() && s.chars().all(|c| c.is_ascii_digit())
+}
+
+/// `1.5`, `0.25`: digits, one dot, digits.
+fn is_float_literal(s: &str) -> bool {
+    s.split_once('.')
+        .is_some_and(|(a, b)| is_int_literal(a) && is_int_literal(b))
+}
+
 /// True when `s` is `lhs+rhs` written as Bend's Nat successor sugar: `lhs` ends in a
 /// Nat literal (`1n`, `1n+1n`) and the `+` touches both operands. Bend requires spaces and
 /// a type annotation around a real infix `+`, so this form is never fixed-width.
@@ -7492,12 +7722,28 @@ pub(crate) fn split_last_additive(s: &str) -> Option<(char, &str, &str)> {
     let mut depth = 0i32;
     let mut found = None;
     let bytes = s.as_bytes();
+    let mut in_string = false;
+    let mut escaped = false;
     for (idx, ch) in s.char_indices() {
+        if in_string {
+            if escaped {
+                escaped = false;
+            } else if ch == '\\' {
+                escaped = true;
+            } else if ch == '"' {
+                in_string = false;
+            }
+            continue;
+        }
         match ch {
+            '"' => in_string = true,
             '(' | '{' | '[' => depth += 1,
             ')' | '}' | ']' => depth -= 1,
             '+' | '-' if depth == 0 && idx > 0 => {
                 if ch == '-' && idx + 1 < bytes.len() && bytes[idx + 1] == b'>' {
+                    continue;
+                }
+                if ch == '+' && (bytes.get(idx + 1) == Some(&b'+') || bytes[idx - 1] == b'+') {
                     continue;
                 }
                 found = Some((ch, s[..idx].trim(), s[idx + 1..].trim()));
@@ -7511,8 +7757,21 @@ pub(crate) fn split_last_additive(s: &str) -> Option<(char, &str, &str)> {
 fn split_last_multiplicative(s: &str) -> Option<(char, &str, &str)> {
     let mut depth = 0i32;
     let mut found = None;
+    let mut in_string = false;
+    let mut escaped = false;
     for (idx, ch) in s.char_indices() {
+        if in_string {
+            if escaped {
+                escaped = false;
+            } else if ch == '\\' {
+                escaped = true;
+            } else if ch == '"' {
+                in_string = false;
+            }
+            continue;
+        }
         match ch {
+            '"' => in_string = true,
             '(' | '{' | '[' => depth += 1,
             ')' | '}' | ']' => depth -= 1,
             '*' | '/' | '%' if depth == 0 && idx > 0 => {
@@ -8657,6 +8916,159 @@ def succ_not_zero(n):
         assert!(out.contains("law_succ_not_zero ... ok"), "{out}");
     }
 
+    const EMITTER_EDGES_SRC: &str = r#"import Base
+
+type Chain is Data:
+  End{}
+  Link{val: Nat, rest: Chain}
+
+type move is Data:
+  ref{}
+  loop{n: Nat}
+
+type Mode is Data:
+  idle{}
+  busy{n: Nat}
+
+type Sample is Data:
+  Reading{at: Nat, value: F32}
+
+def second_is_zero(c: Chain) -> Bool:
+  match c:
+    case Link{_, Link{0n, _}}: True{}
+    case _: False{}
+
+def sh(+a: U32, +b: Nat) -> U32:
+  ((a << b : U32) + (a >> b : U32) : U32)
+
+def bits(+a: U32, +b: U32) -> U32:
+  ((a .&. b : U32) .|. (a .^. b : U32) : U32)
+
+def area(w: F32, h: F32) -> F32:
+  ((w * h : F32) + 1.5 : F32)
+
+def hello(name: String) -> String:
+  ("hi.there " ++ name)
+
+def get(m: move) -> Nat:
+  match m:
+    case ref{}: 0n
+    case loop{n}: n
+
+def keep(idle: Nat) -> Nat:
+  idle
+
+def dup(+a: Chain, +b: Chain) -> Chain & Chain:
+  match a b:
+    case End{} x: (x, x)
+    case _ y: (y, y)
+
+# promise: a chain whose second value is zero is detected
+law second_zero_found:
+  {second_is_zero(Link{1n, Link{0n, End{}}}) == True{} : Bool}
+
+def second_zero_found():
+  {==}
+
+# promise: shifting sums both directions
+law shift_sum:
+  {sh(12, 2n) == 51 : U32}
+
+def shift_sum():
+  {==}
+
+# promise: shifting by 32 or more gives zero
+law shift_far:
+  {sh(1, 40n) == 0 : U32}
+
+def shift_far():
+  {==}
+
+# promise: and-or-xor equals or
+law bits_or:
+  {bits(12, 10) == 14 : U32}
+
+def bits_or():
+  {==}
+
+# promise: greeting prefixes the name
+law greets:
+  {hello("bo") == "hi.there bo" : String}
+
+def greets():
+  {==}
+
+# promise: a keyword-named variant keeps its field
+law loop_get:
+  {get(loop{4n}) == 4n : Nat}
+
+def loop_get():
+  {==}
+
+# promise: a parameter named like a constructor is the parameter
+law keep_param:
+  {keep(7n) == 7n : Nat}
+
+def keep_param():
+  {==}
+
+# promise: dup copies the second chain when the first is empty
+law dup_end:
+  {dup(End{}, Link{1n, End{}}) == (Link{1n, End{}}, Link{1n, End{}}) : Chain & Chain}
+
+def dup_end():
+  {==}
+"#;
+
+    #[test]
+    fn emitter_handles_nested_literals_bit_ops_floats_strings_keyword_types_and_shadowing() {
+        if let Some((ok, text)) = reference_check_only("emitter_edges", EMITTER_EDGES_SRC) {
+            assert!(ok, "reference bend must prove every fixture law:\n{text}");
+        }
+        let summary = emit_verified_rust(EMITTER_EDGES_SRC, 8).unwrap();
+        let src = &summary.rust_source;
+        for expected in [
+            "pub enum r#move",
+            "    r#ref,",
+            "    r#loop(u64),",
+            "pub fn keep(idle: u64) -> u64",
+            "pub fn area(w: f32, h: f32) -> f32",
+            "1.5_f32",
+            "#[derive(Debug, Clone, Copy, PartialEq)]\npub enum Sample",
+            "String::from(\"hi.there \")",
+        ] {
+            assert!(src.contains(expected), "missing {expected:?} in:\n{src}");
+        }
+        let out = compile_and_run("emitter_edges", src, &["--test", "-A", "dead_code"]);
+        for law in [
+            "second_zero_found",
+            "shift_sum",
+            "shift_far",
+            "bits_or",
+            "greets",
+            "loop_get",
+            "keep_param",
+            "dup_end",
+        ] {
+            assert!(out.contains(&format!("law_{law} ... ok")), "{law}:\n{out}");
+        }
+        let runtime_only = src.split("#[cfg(test)]").next().unwrap();
+        let harness = format!(
+            "{runtime_only}\nfn main() {{\n    assert_eq!(area(2.5, 3.0), 9.0);\n    assert_eq!(sh(u32::MAX, 31), 0x8000_0001);\n    assert!(!second_is_zero(Chain::Link(0, Box::new(Chain::End))));\n}}\n"
+        );
+        compile_and_run("emitter_edges_rt", &harness, &["-A", "dead_code"]);
+    }
+
+    #[test]
+    fn constructor_names_shared_by_two_types_are_rejected() {
+        // Bend rejects this within one file; across files it reaches the flat emitter.
+        let a = "import Base\n\ntype Light is Data:\n  Off{}\n  On{level: Nat}\n";
+        let b = "import Base\n\ntype Switch is Data:\n  Off{}\n  Up{}\n";
+        let err = emit_verified_rust(&format!("{a}\n{b}"), 0).unwrap_err();
+        assert!(err.contains("E_NAME_COLLISION"), "{err}");
+        assert!(err.contains("'Off'"), "{err}");
+    }
+
     #[test]
     fn u32_remainder_by_zero_matches_reference_semantics() {
         if let Some((ok, text)) = reference_check_only("u32_div_zero", U32_DIV_ZERO_SRC) {
@@ -9367,10 +9779,12 @@ fn emit_adt_pool_fn(
 ) -> String {
     let mut s = format!(
         "    fn __rb_pool_adt_{}(rng: &mut u64, depth: usize, recursive: bool) -> Vec<{}> {{\n",
-        td.name, td.name
+        td.name,
+        rust_ident(&td.name)
     );
     s.push_str("        let mut out = Vec::new();\n");
     for v in &td.variants {
+        let ctor_rs = format!("{}::{}", rust_ident(&td.name), rust_ident(&v.name));
         let has_adt_field = v
             .field_types
             .iter()
@@ -9398,7 +9812,7 @@ fn emit_adt_pool_fn(
                 td.name, v.name
             ));
         } else if v.field_types.is_empty() {
-            s.push_str(&format!("{indent}out.push({}::{});\n", td.name, v.name));
+            s.push_str(&format!("{indent}out.push({ctor_rs});\n"));
         } else if v.field_types.len() == 1 {
             let expr = emit_pool_expr(
                 &v.field_types[0],
@@ -9409,10 +9823,7 @@ fn emit_adt_pool_fn(
             );
             let pushed = wrap_ctor_pool_arg("f0".to_string(), field_is_boxed(0));
             s.push_str(&format!("{indent}for f0 in {expr} {{\n"));
-            s.push_str(&format!(
-                "{indent}    out.push({}::{}({pushed}));\n",
-                td.name, v.name
-            ));
+            s.push_str(&format!("{indent}    out.push({ctor_rs}({pushed}));\n"));
             s.push_str(&format!("{indent}}}\n"));
         } else {
             for (fi, ft) in v.field_types.iter().enumerate() {
@@ -9438,10 +9849,7 @@ fn emit_adt_pool_fn(
                 .map(|fi| wrap_ctor_pool_arg(format!("__s{fi}.clone()"), field_is_boxed(fi)))
                 .collect::<Vec<_>>()
                 .join(", ");
-            s.push_str(&format!(
-                "{loop_ind}out.push({}::{}({small_args}));\n",
-                td.name, v.name
-            ));
+            s.push_str(&format!("{loop_ind}out.push({ctor_rs}({small_args}));\n"));
             for _ in 0..v.field_types.len() {
                 loop_ind.truncate(loop_ind.len() - 4);
                 s.push_str(&format!("{loop_ind}}}\n"));
@@ -9463,8 +9871,7 @@ fn emit_adt_pool_fn(
                 .collect::<Vec<_>>()
                 .join(", ");
             s.push_str(&format!(
-                "{inner_indent}    out.push({}::{}({args_sweep}));\n",
-                td.name, v.name
+                "{inner_indent}    out.push({ctor_rs}({args_sweep}));\n"
             ));
             s.push_str(&format!("{inner_indent}}}\n"));
             let edge_args = (0..v.field_types.len())
@@ -9477,8 +9884,7 @@ fn emit_adt_pool_fn(
                 .collect::<Vec<_>>()
                 .join(", ");
             s.push_str(&format!(
-                "{inner_indent}out.push({}::{}({edge_args}));\n",
-                td.name, v.name
+                "{inner_indent}out.push({ctor_rs}({edge_args}));\n"
             ));
             if !eval_mode {
                 s.push_str(&format!("{inner_indent}for _ in 0..4 {{\n"));
@@ -9494,8 +9900,7 @@ fn emit_adt_pool_fn(
                     .collect::<Vec<_>>()
                     .join(", ");
                 s.push_str(&format!(
-                    "{inner_indent}    out.push({}::{}({args_rng}));\n",
-                    td.name, v.name
+                    "{inner_indent}    out.push({ctor_rs}({args_rng}));\n"
                 ));
                 s.push_str(&format!("{inner_indent}}}\n"));
             }
@@ -18695,6 +19100,9 @@ def cancel_idempotent(s):
 - **Fixed-width integers vs `Nat`:**
   - `(a + b : Nat)` / `(a * b : Nat)` emit **checked** `u64` ops (panicking on `u64` overflow), while `(a - b : Nat)` emits `saturating_sub`.
   - `(a + b : U32)` / `U64` / `I32` / `I64` emit **wrapping** ops (`wrapping_add`, `wrapping_sub`, `wrapping_mul`) matching Bend 2's fixed-width integer semantics.
+  - `U32` division and remainder by zero follow Bend: `(a / 0 : U32)` is `0` and `(a % 0 : U32)` is `a`. Bitwise `(a .&. b : U32)`, `.|.`, `.^.` and shifts `(a << n : U32)` / `>>` (with a `Nat` shift amount; 32 or more gives `0`) emit plain Rust bit operators.
+  - The successor sugar `1n+x` is always checked `Nat`, even inside a `U32` function.
+  - `F32` maps to `f32` (`1.5` -> `1.5_f32`, IEEE `+ - * / %`; ADTs holding an `F32` derive `PartialEq` without `Eq`). String literals become `String::from("..")` and `a ++ b` concatenates.
 - **Control flow & patterns:** nested `match`, multi-scrutinee `match a b:`, `case 1n+p:` and nested `case 1n+1n+q:` successor patterns, and multi-line `let` bindings are all supported.
 - **Recursive ADTs & built-in `List`:** direct or mutually recursive `type` definitions automatically box cycle-forming fields (`Box<T>`), omit `Copy` (`#[derive(Debug, Clone, PartialEq, Eq)]`) across recursive types and any wrappers containing them, unbox patterns (`*__rb_box` + nested guards), and insert `.clone()` on multi-use non-`Copy` values. Built-in `Base` `List<T>` / `List<&2, T>`, `Nil{}` / `Con{head, tail}`, and list literals `[]` / `[a, b]` emit `pub enum List<T> { Nil, Con(T, Box<List<T>>) }`.
 - **Cross-file sibling imports (`import sibling.bend as X`):** files under `verified/` can import sibling `.bend` files (`import base_rules.bend as B`) to share functions, types, laws, and helper lemmas (`B.fn_name(...)`, `B.TypeName`, `B.Ctor{}`). Keep top-level names unique across `verified/*.bend`; the emitter resolves each file's import aliases into the single emitted `verified.rs` module, and `rusty-bends.lock` normalizes aliases so renaming `as B` does not trip `E_LAW_LOCK_TAMPERED`.
