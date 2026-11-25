@@ -5950,7 +5950,7 @@ fn emit_expr_with_ctx(expr: &str, ctx: &EmitCtx<'_>, mode: ArithMode) -> Result<
                 format!("{{ let __a = {l}; let __b = {r}; if __b == 0_u64 {{ __a }} else {{ __a % __b }} }}")
             }
             (ArithMode::Wrapping, '%') => {
-                format!("{{ let __a = {l}; let __b = {r}; if __b == 0 {{ 0 }} else {{ __a.wrapping_rem(__b) }} }}")
+                format!("{{ let __a = {l}; let __b = {r}; if __b == 0 {{ __a }} else {{ __a.wrapping_rem(__b) }} }}")
             }
             _ => unreachable!(),
         });
@@ -7466,6 +7466,76 @@ law zero_width_refused:
         );
         assert!(out.contains("law_zero_width_refused ... ok"), "{out}");
         assert!(out.contains("test result: ok"), "{out}");
+    }
+
+    /// Runs the reference `bend --check-only` on `source` when the binary is
+    /// installed; returns `None` when it is not.
+    fn reference_check_only(tag: &str, source: &str) -> Option<(bool, String)> {
+        let bend_bin = crate::resolve_bend_bin(
+            std::env::var("BEND_BIN").ok(),
+            std::env::var_os("PATH"),
+            std::env::var_os("HOME").map(std::path::PathBuf::from),
+        );
+        let dir = std::env::temp_dir().join(format!("rb_ref_{tag}_{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let file = dir.join("main.bend");
+        std::fs::write(&file, source).unwrap();
+        let out = std::process::Command::new(&bend_bin)
+            .arg(&file)
+            .arg("--check-only")
+            .output()
+            .ok()?;
+        let _ = std::fs::remove_dir_all(&dir);
+        let text = format!(
+            "{}{}",
+            String::from_utf8_lossy(&out.stdout),
+            String::from_utf8_lossy(&out.stderr)
+        );
+        Some((out.status.success(), text))
+    }
+
+    const U32_DIV_ZERO_SRC: &str = r#"import Base
+
+def rem_u32(a: U32, b: U32) -> U32:
+  (a % b : U32)
+
+def quot_u32(a: U32, b: U32) -> U32:
+  (a / b : U32)
+
+# promise: the remainder by zero is the dividend
+law rem_by_zero_is_dividend:
+  {rem_u32(5, 0) == 5 : U32}
+
+def rem_by_zero_is_dividend():
+  {==}
+
+# promise: the quotient by zero is zero
+law quot_by_zero_is_zero:
+  {quot_u32(5, 0) == 0 : U32}
+
+def quot_by_zero_is_zero():
+  {==}
+"#;
+
+    #[test]
+    fn u32_remainder_by_zero_matches_reference_semantics() {
+        if let Some((ok, text)) = reference_check_only("u32_div_zero", U32_DIV_ZERO_SRC) {
+            assert!(ok, "reference bend must accept U32 % 0 == a:\n{text}");
+        }
+        let summary = emit_verified_rust(U32_DIV_ZERO_SRC, 2).unwrap();
+        let runtime_only = summary.rust_source.split("#[cfg(test)]").next().unwrap();
+        let harness = format!(
+            "{runtime_only}\nfn main() {{\n    assert_eq!(rem_u32(5, 0), 5);\n    assert_eq!(rem_u32(7, 3), 1);\n    assert_eq!(quot_u32(5, 0), 0);\n    assert_eq!(quot_u32(7, 3), 2);\n}}\n"
+        );
+        compile_and_run("u32_div_zero", &harness, &[]);
+        let out = compile_and_run(
+            "u32_div_zero_laws",
+            &summary.rust_source,
+            &["--test", "-A", "dead_code"],
+        );
+        assert!(out.contains("law_rem_by_zero_is_dividend ... ok"), "{out}");
+        assert!(out.contains("law_quot_by_zero_is_zero ... ok"), "{out}");
     }
 }
 RUSTY_BENDS_EOF
