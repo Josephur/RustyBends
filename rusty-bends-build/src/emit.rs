@@ -2141,16 +2141,38 @@ fn emit_expr_with_ctx(expr: &str, ctx: &EmitCtx<'_>, mode: ArithMode) -> Result<
 
     let first_trim = lines[0].trim();
 
-    // Multi-line let bindings:
-    //   let x = expr
-    //   body
-    if lines.len() > 1
-        && first_trim.starts_with("let ")
-        && split_top_level_once(first_trim, ';').is_none()
-    {
+    // Bend 2 binding `x = e` / `+x = e` (no `let`); a dead `-x = e` is erased (q=0).
+    let bend2_binding = if lines.len() > 1 && !first_trim.starts_with("let ") {
+        bend2_binding_lhs(first_trim)
+    } else {
+        None
+    };
+    if let Some((_, true)) = bend2_binding {
         let let_indent = leading_indent(lines[0]);
-        if let Some((lhs_raw, val_first)) =
-            split_top_level_once(first_trim.strip_prefix("let ").unwrap(), '=')
+        let mut rest_idx = 1;
+        while rest_idx < lines.len() && leading_indent(lines[rest_idx]) > let_indent {
+            rest_idx += 1;
+        }
+        if rest_idx < lines.len() {
+            return emit_expr_with_ctx(&lines[rest_idx..].join("\n"), ctx, mode);
+        }
+    }
+
+    // Multi-line let bindings:
+    //   let x = expr        (or Bend 2: x = expr)
+    //   body
+    let let_source = if first_trim.starts_with("let ") {
+        first_trim.strip_prefix("let ")
+    } else if let Some((bind_start, false)) = bend2_binding {
+        Some(&first_trim[bind_start..])
+    } else {
+        None
+    };
+    let let_split = let_source
+        .filter(|_| lines.len() > 1 && split_top_level_once(first_trim, ';').is_none())
+        .and_then(|src| split_top_level_once(src, '='));
+    if let Some((lhs_raw, val_first)) = let_split {
+        let let_indent = leading_indent(lines[0]);
         {
             let mut val_lines = Vec::new();
             if !val_first.trim().is_empty() {
@@ -3073,6 +3095,38 @@ pub(crate) fn split_top_level_once(s: &str, delim: char) -> Option<(&str, &str)>
         }
     }
     None
+}
+
+/// For a Bend 2 binding line `x = e`, `+x = e`, `~x = e`, `(a, b) = e`, or a dead
+/// `-x = e`: the byte offset where the binder starts (after its quantity sigil) and
+/// whether the binding is dead (erased).
+fn bend2_binding_lhs(line: &str) -> Option<(usize, bool)> {
+    let (start, dead) = match line.as_bytes().first()? {
+        b'+' | b'~' => (1, false),
+        b'-' => (1, true),
+        _ => (0, false),
+    };
+    let rest = &line[start..];
+    let lhs_end = if rest.starts_with('(') {
+        let close = rest.find(')')?;
+        let inner = &rest[1..close];
+        if !inner
+            .split(',')
+            .all(|p| is_valid_rust_ident_or_wildcard(p.trim()))
+        {
+            return None;
+        }
+        close + 1
+    } else {
+        rest.find(|c: char| !(c.is_ascii_alphanumeric() || c == '_'))?
+    };
+    let name = &rest[..lhs_end];
+    if name.is_empty() || name.starts_with(|c: char| c.is_ascii_digit()) {
+        return None;
+    }
+    let after = rest[lhs_end..].trim_start();
+    let is_bind = after.starts_with('=') && !after.starts_with("==") && !after.starts_with("=>");
+    is_bind.then_some((start, dead))
 }
 
 /// `"..."` with no unescaped quote inside.

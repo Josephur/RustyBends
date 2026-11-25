@@ -71,8 +71,9 @@ pub fn analyze_coverage(
     for def in &defs {
         let mut callees = Vec::new();
         let mut seen = HashSet::new();
-        for tok in tokenize_bend(&def.body) {
-            if def_names.contains(&tok) && seen.insert(tok.clone()) {
+        let locals = crate::law_test::def_local_names(def);
+        for tok in crate::law_test::referenced_defs(&def.body, |t| def_names.contains(t), &locals) {
+            if seen.insert(tok.clone()) {
                 callees.push(tok);
             }
         }

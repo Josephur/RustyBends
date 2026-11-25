@@ -326,6 +326,71 @@ fn split_last_top_level_colon(s: &str) -> Option<(&str, &str)> {
     last.map(|idx| (s[..idx].trim(), s[idx + 1..].trim()))
 }
 
+/// Names bound inside `def`: its parameters, `case` pattern binders, and `let` /
+/// `x = e` binders. A token equal to one of these refers to the local, not to a def of
+/// the same name, unless it is called (`name(..)`).
+pub(crate) fn def_local_names(def: &Def) -> HashSet<String> {
+    let mut names: HashSet<String> = def.params.iter().map(|p| p.name.clone()).collect();
+    names.extend(body_binder_names(&def.body));
+    names
+}
+
+/// Names bound inside a def body by `case` patterns and `let` / `x = e` bindings.
+pub(crate) fn body_binder_names(body: &str) -> HashSet<String> {
+    let mut names = HashSet::new();
+    for line in body.lines() {
+        let code = strip_comment(line).trim();
+        if let Some(rest) = code.strip_prefix("case ") {
+            let pat = crate::emit::split_top_level_once(rest, ':').map_or(rest, |(p, _)| p);
+            let toks = lock::tokenize_bend(pat);
+            for (i, t) in toks.iter().enumerate() {
+                let is_ctor = toks.get(i + 1).is_some_and(|n| n == "{" || n == "(");
+                if !is_ctor && t.starts_with(|c: char| c.is_ascii_alphabetic() || c == '_') {
+                    names.insert(t.clone());
+                }
+            }
+        }
+        let binder = code.strip_prefix("let ").unwrap_or(code);
+        if let Some((lhs, _)) = binder.split_once('=') {
+            let lhs = lhs.trim().trim_start_matches(['+', '-', '~']).trim();
+            let is_eq_op = binder[lhs.len()..].trim_start().starts_with("==");
+            if !is_eq_op
+                && !lhs.is_empty()
+                && lhs.chars().all(|c| c.is_ascii_alphanumeric() || c == '_')
+            {
+                names.insert(lhs.to_string());
+            }
+        }
+    }
+    names
+}
+
+/// Defs referenced by `expr`: tokens naming a def, except names in `locals` (a
+/// parameter, binder, or law variable that shadows the def) unless they are called.
+pub(crate) fn referenced_defs(
+    expr: &str,
+    is_def: impl Fn(&str) -> bool,
+    locals: &HashSet<String>,
+) -> Vec<String> {
+    let toks = lock::tokenize_bend(expr);
+    let mut out: Vec<String> = Vec::new();
+    for (i, t) in toks.iter().enumerate() {
+        if !is_def(t) || out.contains(t) {
+            continue;
+        }
+        let called = toks.get(i + 1).is_some_and(|n| n == "(");
+        if called || !locals.contains(t) {
+            out.push(t.clone());
+        }
+    }
+    out
+}
+
+/// Law variables (`for x: T`): they shadow defs of the same name in the law's terms.
+pub(crate) fn law_local_names(law: &ParsedLaw) -> HashSet<String> {
+    law.vars.iter().map(|v| v.name.clone()).collect()
+}
+
 /// Computes the transitive live `def` dependency cone referenced by a law.
 pub fn law_dependency_cone(law: &ParsedLaw, defs: &[Def]) -> Vec<String> {
     let def_map: HashMap<&str, &Def> = defs.iter().map(|d| (d.name.as_str(), d)).collect();
@@ -340,8 +405,9 @@ pub fn law_dependency_cone(law: &ParsedLaw, defs: &[Def]) -> Vec<String> {
                 .flat_map(|h| [h.lhs.as_str(), h.rhs.as_str()]),
         )
     {
-        for tok in lock::tokenize_bend(expr) {
-            if def_map.contains_key(tok.as_str()) && visited.insert(tok.clone()) {
+        let locals = law_local_names(law);
+        for tok in referenced_defs(expr, |t| def_map.contains_key(t), &locals) {
+            if visited.insert(tok.clone()) {
                 queue.push_back(tok);
             }
         }
@@ -349,8 +415,9 @@ pub fn law_dependency_cone(law: &ParsedLaw, defs: &[Def]) -> Vec<String> {
 
     while let Some(name) = queue.pop_front() {
         if let Some(def) = def_map.get(name.as_str()) {
-            for tok in lock::tokenize_bend(&def.body) {
-                if def_map.contains_key(tok.as_str()) && visited.insert(tok.clone()) {
+            let locals = def_local_names(def);
+            for tok in referenced_defs(&def.body, |t| def_map.contains_key(t), &locals) {
+                if visited.insert(tok.clone()) {
                     queue.push_back(tok);
                 }
             }
@@ -369,7 +436,8 @@ pub fn cone_is_recursive(cone: &[String], defs: &[Def]) -> bool {
             continue;
         }
         let mut callees = Vec::new();
-        for tok in lock::tokenize_bend(&def.body) {
+        let locals = def_local_names(def);
+        for tok in referenced_defs(&def.body, |t| cone_set.contains(t), &locals) {
             if let Some(&target) = cone_set.get(tok.as_str()) {
                 if !callees.contains(&target) {
                     callees.push(target);

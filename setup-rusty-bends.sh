@@ -6748,16 +6748,38 @@ fn emit_expr_with_ctx(expr: &str, ctx: &EmitCtx<'_>, mode: ArithMode) -> Result<
 
     let first_trim = lines[0].trim();
 
-    // Multi-line let bindings:
-    //   let x = expr
-    //   body
-    if lines.len() > 1
-        && first_trim.starts_with("let ")
-        && split_top_level_once(first_trim, ';').is_none()
-    {
+    // Bend 2 binding `x = e` / `+x = e` (no `let`); a dead `-x = e` is erased (q=0).
+    let bend2_binding = if lines.len() > 1 && !first_trim.starts_with("let ") {
+        bend2_binding_lhs(first_trim)
+    } else {
+        None
+    };
+    if let Some((_, true)) = bend2_binding {
         let let_indent = leading_indent(lines[0]);
-        if let Some((lhs_raw, val_first)) =
-            split_top_level_once(first_trim.strip_prefix("let ").unwrap(), '=')
+        let mut rest_idx = 1;
+        while rest_idx < lines.len() && leading_indent(lines[rest_idx]) > let_indent {
+            rest_idx += 1;
+        }
+        if rest_idx < lines.len() {
+            return emit_expr_with_ctx(&lines[rest_idx..].join("\n"), ctx, mode);
+        }
+    }
+
+    // Multi-line let bindings:
+    //   let x = expr        (or Bend 2: x = expr)
+    //   body
+    let let_source = if first_trim.starts_with("let ") {
+        first_trim.strip_prefix("let ")
+    } else if let Some((bind_start, false)) = bend2_binding {
+        Some(&first_trim[bind_start..])
+    } else {
+        None
+    };
+    let let_split = let_source
+        .filter(|_| lines.len() > 1 && split_top_level_once(first_trim, ';').is_none())
+        .and_then(|src| split_top_level_once(src, '='));
+    if let Some((lhs_raw, val_first)) = let_split {
+        let let_indent = leading_indent(lines[0]);
         {
             let mut val_lines = Vec::new();
             if !val_first.trim().is_empty() {
@@ -7680,6 +7702,38 @@ pub(crate) fn split_top_level_once(s: &str, delim: char) -> Option<(&str, &str)>
         }
     }
     None
+}
+
+/// For a Bend 2 binding line `x = e`, `+x = e`, `~x = e`, `(a, b) = e`, or a dead
+/// `-x = e`: the byte offset where the binder starts (after its quantity sigil) and
+/// whether the binding is dead (erased).
+fn bend2_binding_lhs(line: &str) -> Option<(usize, bool)> {
+    let (start, dead) = match line.as_bytes().first()? {
+        b'+' | b'~' => (1, false),
+        b'-' => (1, true),
+        _ => (0, false),
+    };
+    let rest = &line[start..];
+    let lhs_end = if rest.starts_with('(') {
+        let close = rest.find(')')?;
+        let inner = &rest[1..close];
+        if !inner
+            .split(',')
+            .all(|p| is_valid_rust_ident_or_wildcard(p.trim()))
+        {
+            return None;
+        }
+        close + 1
+    } else {
+        rest.find(|c: char| !(c.is_ascii_alphanumeric() || c == '_'))?
+    };
+    let name = &rest[..lhs_end];
+    if name.is_empty() || name.starts_with(|c: char| c.is_ascii_digit()) {
+        return None;
+    }
+    let after = rest[lhs_end..].trim_start();
+    let is_bind = after.starts_with('=') && !after.starts_with("==") && !after.starts_with("=>");
+    is_bind.then_some((start, dead))
 }
 
 /// `"..."` with no unescaped quote inside.
@@ -9426,6 +9480,71 @@ fn split_last_top_level_colon(s: &str) -> Option<(&str, &str)> {
     last.map(|idx| (s[..idx].trim(), s[idx + 1..].trim()))
 }
 
+/// Names bound inside `def`: its parameters, `case` pattern binders, and `let` /
+/// `x = e` binders. A token equal to one of these refers to the local, not to a def of
+/// the same name, unless it is called (`name(..)`).
+pub(crate) fn def_local_names(def: &Def) -> HashSet<String> {
+    let mut names: HashSet<String> = def.params.iter().map(|p| p.name.clone()).collect();
+    names.extend(body_binder_names(&def.body));
+    names
+}
+
+/// Names bound inside a def body by `case` patterns and `let` / `x = e` bindings.
+pub(crate) fn body_binder_names(body: &str) -> HashSet<String> {
+    let mut names = HashSet::new();
+    for line in body.lines() {
+        let code = strip_comment(line).trim();
+        if let Some(rest) = code.strip_prefix("case ") {
+            let pat = crate::emit::split_top_level_once(rest, ':').map_or(rest, |(p, _)| p);
+            let toks = lock::tokenize_bend(pat);
+            for (i, t) in toks.iter().enumerate() {
+                let is_ctor = toks.get(i + 1).is_some_and(|n| n == "{" || n == "(");
+                if !is_ctor && t.starts_with(|c: char| c.is_ascii_alphabetic() || c == '_') {
+                    names.insert(t.clone());
+                }
+            }
+        }
+        let binder = code.strip_prefix("let ").unwrap_or(code);
+        if let Some((lhs, _)) = binder.split_once('=') {
+            let lhs = lhs.trim().trim_start_matches(['+', '-', '~']).trim();
+            let is_eq_op = binder[lhs.len()..].trim_start().starts_with("==");
+            if !is_eq_op
+                && !lhs.is_empty()
+                && lhs.chars().all(|c| c.is_ascii_alphanumeric() || c == '_')
+            {
+                names.insert(lhs.to_string());
+            }
+        }
+    }
+    names
+}
+
+/// Defs referenced by `expr`: tokens naming a def, except names in `locals` (a
+/// parameter, binder, or law variable that shadows the def) unless they are called.
+pub(crate) fn referenced_defs(
+    expr: &str,
+    is_def: impl Fn(&str) -> bool,
+    locals: &HashSet<String>,
+) -> Vec<String> {
+    let toks = lock::tokenize_bend(expr);
+    let mut out: Vec<String> = Vec::new();
+    for (i, t) in toks.iter().enumerate() {
+        if !is_def(t) || out.contains(t) {
+            continue;
+        }
+        let called = toks.get(i + 1).is_some_and(|n| n == "(");
+        if called || !locals.contains(t) {
+            out.push(t.clone());
+        }
+    }
+    out
+}
+
+/// Law variables (`for x: T`): they shadow defs of the same name in the law's terms.
+pub(crate) fn law_local_names(law: &ParsedLaw) -> HashSet<String> {
+    law.vars.iter().map(|v| v.name.clone()).collect()
+}
+
 /// Computes the transitive live `def` dependency cone referenced by a law.
 pub fn law_dependency_cone(law: &ParsedLaw, defs: &[Def]) -> Vec<String> {
     let def_map: HashMap<&str, &Def> = defs.iter().map(|d| (d.name.as_str(), d)).collect();
@@ -9440,8 +9559,9 @@ pub fn law_dependency_cone(law: &ParsedLaw, defs: &[Def]) -> Vec<String> {
                 .flat_map(|h| [h.lhs.as_str(), h.rhs.as_str()]),
         )
     {
-        for tok in lock::tokenize_bend(expr) {
-            if def_map.contains_key(tok.as_str()) && visited.insert(tok.clone()) {
+        let locals = law_local_names(law);
+        for tok in referenced_defs(expr, |t| def_map.contains_key(t), &locals) {
+            if visited.insert(tok.clone()) {
                 queue.push_back(tok);
             }
         }
@@ -9449,8 +9569,9 @@ pub fn law_dependency_cone(law: &ParsedLaw, defs: &[Def]) -> Vec<String> {
 
     while let Some(name) = queue.pop_front() {
         if let Some(def) = def_map.get(name.as_str()) {
-            for tok in lock::tokenize_bend(&def.body) {
-                if def_map.contains_key(tok.as_str()) && visited.insert(tok.clone()) {
+            let locals = def_local_names(def);
+            for tok in referenced_defs(&def.body, |t| def_map.contains_key(t), &locals) {
+                if visited.insert(tok.clone()) {
                     queue.push_back(tok);
                 }
             }
@@ -9469,7 +9590,8 @@ pub fn cone_is_recursive(cone: &[String], defs: &[Def]) -> bool {
             continue;
         }
         let mut callees = Vec::new();
-        for tok in lock::tokenize_bend(&def.body) {
+        let locals = def_local_names(def);
+        for tok in referenced_defs(&def.body, |t| cone_set.contains(t), &locals) {
             if let Some(&target) = cone_set.get(tok.as_str()) {
                 if !callees.contains(&target) {
                     callees.push(target);
@@ -11521,10 +11643,13 @@ const MAX_RETURN_LIT_MUTANTS_PER_LAW: usize = 32;
 /// Separate budget for `Nat.add` <-> `Nat.max` / `Nat.min` swaps (Issue #20), so adding
 /// them never shifts any existing operator family's selection.
 const MAX_ADD_MAX_MIN_MUTANTS_PER_LAW: usize = 32;
+/// Separate budget for `Bool.and` <-> `Bool.or`, dropped `Bool.not`, and fixed-width
+/// literal mutants (Issue #28), so they never shift older families' selections.
+const MAX_BOOL_INT_MUTANTS_PER_LAW: usize = 32;
 /// At most this many `Nat` literal sites per function are mutated by `NatLit`.
 const MAX_NAT_LIT_SITES_PER_DEF: usize = 8;
 /// Version tag baked into mutation cone hashes so cache keys invalidate when mutators change.
-const MUTATE_CACHE_VERSION: &str = "v6";
+const MUTATE_CACHE_VERSION: &str = "v7";
 /// Maximum mutants packed into one compiled multi-law harness binary.
 const BATCH_MAX_MUTANTS: usize = 160;
 /// Maximum distinct laws packed into one compiled multi-law harness binary.
@@ -12294,6 +12419,7 @@ fn run_single_law_per_mutant_fallback(
 
     let mut outcomes = Vec::with_capacity(item.mutants.len());
     let mut build_failures: Vec<(String, String)> = Vec::new();
+    let mut first_catch: Option<(String, String)> = None;
     for m in item.mutants {
         let single_item = LawWorkItem {
             prepared_idx: item.prepared_idx,
@@ -12320,12 +12446,11 @@ fn run_single_law_per_mutant_fallback(
                     outcomes: mut sub_outcomes,
                 }) = popped
                 {
+                    // Keep going after a catch: a later mutant that fails to compile is a
+                    // RustyBends bug that must still surface as E_MUTANT_BUILD.
                     if !full_report {
-                        if let Some(hit) = caught_by {
-                            return EvaluatedLawResult::Complete {
-                                caught_by: Some(hit),
-                                outcomes: Vec::new(),
-                            };
+                        if first_catch.is_none() {
+                            first_catch = caught_by;
                         }
                     } else if let Some(first) = sub_outcomes.pop() {
                         outcomes.push(first);
@@ -12370,9 +12495,11 @@ fn run_single_law_per_mutant_fallback(
         };
     }
 
-    let caught_by = outcomes.iter().find_map(|o| match &o.status {
-        MutantStatus::Caught(ce) => Some((o.description.clone(), ce.clone())),
-        _ => None,
+    let caught_by = first_catch.or_else(|| {
+        outcomes.iter().find_map(|o| match &o.status {
+            MutantStatus::Caught(ce) => Some((o.description.clone(), ce.clone())),
+            _ => None,
+        })
     });
     EvaluatedLawResult::Complete {
         caught_by,
@@ -12622,6 +12749,33 @@ fn run_batch_harness(
         .output()
         .map_err(|e| format!("failed to run mutant binary: {e}"))?;
     if !run.status.success() {
+        // A lone mutant that crashes the process (stack overflow, abort) after the
+        // unmutated baseline ran fine behaves differently from the original: caught.
+        let stdout = String::from_utf8_lossy(&run.stdout);
+        let baseline_ran = stdout.lines().any(|l| {
+            l.strip_prefix("BASELINE\t0\t").is_some_and(|rest| {
+                let (checked, ce) = rest.split_once('\t').unwrap_or((rest, ""));
+                checked.parse::<usize>().is_ok_and(|c| c > 0) && ce.trim().is_empty()
+            })
+        });
+        if let ([item], true) = (batch, baseline_ran) {
+            if let ([m], [0]) = (item.mutants, per_law_active[0].as_slice()) {
+                let ce = format!("crashed the process ({})", run.status);
+                return Ok(vec![EvaluatedLawResult::Complete {
+                    caught_by: Some((m.description.clone(), ce.clone())),
+                    outcomes: if full_report {
+                        vec![MutantOutcome {
+                            def_name: m.def_name.clone(),
+                            operator: m.operator.clone(),
+                            description: m.description.clone(),
+                            status: MutantStatus::Caught(ce),
+                        }]
+                    } else {
+                        Vec::new()
+                    },
+                }]);
+            }
+        }
         return Err(HarnessError::Run);
     }
 
@@ -12887,6 +13041,29 @@ pub(crate) fn generate_mutants_for_cone_with_stats(
         &mut mutants,
     );
 
+    // Bool connectives and fixed-width (U32) literals, with their own budget.
+    let mut families: Vec<(&str, Vec<Candidate<'_>>)> =
+        vec![("BoolOps", Vec::new()), ("IntLit", Vec::new())];
+    for def in cone_defs {
+        let protected = compute_protected_ranges(&def.body);
+        for (body, desc) in mutate_bool_ops(&def.body, &protected) {
+            families[0].1.push((def, body, desc));
+        }
+        let (lit_mutants, site_dropped) = mutate_int_lit(&def.body, &protected);
+        dropped_by_site_cap += site_dropped;
+        for (body, desc) in lit_mutants {
+            families[1].1.push((def, body, desc));
+        }
+    }
+    pick_round_robin_with_stats(
+        &families,
+        MAX_BOOL_INT_MUTANTS_PER_LAW,
+        &mut seen,
+        &mut dropped_seen,
+        &mut dropped_by_budget,
+        &mut mutants,
+    );
+
     let generated_total = mutants.len() + dropped_by_budget + dropped_by_site_cap;
     GeneratedMutants {
         mutants,
@@ -13078,20 +13255,61 @@ fn mutate_nat_bound(def: &Def) -> Vec<(String, String)> {
 /// Small filler value for a constructor field of type `ty`, used when a sibling constructor's
 /// fields differ from the original's.
 fn filler_value(ty: &str, ctor_map: &HashMap<String, CtorInfo>) -> Option<String> {
-    match ty.trim() {
-        "Nat" => Some("0n".to_string()),
-        "Bool" => Some("False{}".to_string()),
-        other => {
-            let mut nullary: Vec<&CtorInfo> = ctor_map
-                .values()
-                .filter(|c| c.type_name == other && c.arity == 0)
-                .collect();
-            nullary.sort_by(|a, b| a.variant_name.cmp(&b.variant_name));
-            nullary
-                .first()
-                .map(|c| format!("{}.{}{{}}", c.type_name, c.variant_name))
+    filler_value_depth(ty, ctor_map, 3)
+}
+
+fn filler_value_depth(
+    ty: &str,
+    ctor_map: &HashMap<String, CtorInfo>,
+    depth: usize,
+) -> Option<String> {
+    let t = ty.trim();
+    match t {
+        "Nat" => return Some("0n".to_string()),
+        "Bool" => return Some("False{}".to_string()),
+        "U32" | "U64" | "I32" | "I64" => return Some("0".to_string()),
+        "F32" => return Some("0.0".to_string()),
+        "String" => return Some("\"\"".to_string()),
+        "Unit" | "()" => return Some("Unit{}".to_string()),
+        _ => {}
+    }
+    if depth == 0 {
+        return None;
+    }
+    // Tuples `(A, B)` / `A & B`.
+    let inner = t
+        .strip_prefix('(')
+        .and_then(|r| r.strip_suffix(')'))
+        .unwrap_or(t);
+    let parts = crate::emit::split_type_args(inner, if inner.contains('&') { '&' } else { ',' });
+    if parts.len() > 1 {
+        let vals: Option<Vec<String>> = parts
+            .iter()
+            .map(|p| filler_value_depth(p, ctor_map, depth - 1))
+            .collect();
+        return vals.map(|v| format!("({})", v.join(", ")));
+    }
+    // An ADT: its first nullary constructor, else the first constructor whose fields
+    // can all be filled.
+    let mut infos: Vec<&CtorInfo> = ctor_map.values().filter(|c| c.type_name == t).collect();
+    infos.sort_by(|a, b| (a.arity, &a.variant_name).cmp(&(b.arity, &b.variant_name)));
+    infos.dedup_by(|a, b| a.variant_name == b.variant_name);
+    for c in infos {
+        let fields: Option<Vec<String>> = c
+            .field_types
+            .iter()
+            .map(|f| filler_value_depth(f, ctor_map, depth - 1))
+            .collect();
+        if let Some(fields) = fields {
+            return Some(format!(
+                "{}.{}{{{}}}",
+                c.type_name,
+                c.variant_name,
+                fields.join(", ")
+            ));
         }
     }
+    None
 }
 
 fn find_matching_brace(s: &str) -> Option<usize> {
@@ -13713,10 +13931,13 @@ fn mutate_bool_const(
     let mut targets: BTreeSet<(usize, usize)> = BTreeSet::new();
 
     // (a) Every use of a live Bool parameter outside pattern/header positions.
+    // A parameter rebound by a pattern or a let may hold another type after the rebind.
+    let rebound = crate::law_test::body_binder_names(body);
     let bool_params: HashSet<&str> = def
         .params
         .iter()
         .filter(|p| p.q != Quantity::Dead && p.ty.trim() == "Bool")
+        .filter(|p| !rebound.contains(&p.name))
         .map(|p| p.name.as_str())
         .collect();
     if !bool_params.is_empty() {
@@ -13821,23 +14042,18 @@ fn mutate_flip_cmp(body: &str, protected: &[(usize, usize)]) -> Vec<(String, Str
                 continue;
             }
         }
+        // Infix comparisons only when spaced, as Bend 2 writes them (never '<<', '>>').
+        let spaced = |end: usize| i > 0 && bytes[i - 1] == b' ' && bytes.get(end) == Some(&b' ');
         let two = body.get(i..i + 2).unwrap_or("");
-        if two == "<=" || two == ">=" {
+        if (two == "<=" || two == ">=") && spaced(i + 2) {
             let to = if two == "<=" { ">=" } else { "<=" };
             out.push((replace_span(body, i, i + 2, to), format!("{two} -> {to}")));
             i += 2;
             continue;
         }
-        let prev = if i > 0 { bytes[i - 1] } else { b' ' };
-        let next = bytes.get(i + 1).copied().unwrap_or(b' ');
-        if bytes[i] == b'<' && next != b'=' && next != b'-' && prev.is_ascii_whitespace() {
+        if bytes[i] == b'<' && spaced(i + 1) {
             out.push((replace_span(body, i, i + 1, ">"), "< -> >".to_string()));
-        } else if bytes[i] == b'>'
-            && next != b'='
-            && prev != b'-'
-            && prev != b'='
-            && prev.is_ascii_whitespace()
-        {
+        } else if bytes[i] == b'>' && spaced(i + 1) {
             out.push((replace_span(body, i, i + 1, "<"), "> -> <".to_string()));
         }
         i += 1;
@@ -13872,12 +14088,53 @@ fn compute_protected_ranges(body: &str) -> Vec<(usize, usize)> {
                 ranges.push((offset, offset + line.len()));
             }
         } else if trimmed.starts_with("match ") {
-            if let Some((_, _)) = split_top_level_once(trimmed, ':') {
-                if let Some(colon) = line.rfind(':') {
-                    ranges.push((offset, offset + colon + 1));
+            // Protect the scrutinee and, in a single-line match, each inline 'case PAT:',
+            // leaving the arm bodies mutable.
+            if let Some((scrut, rest)) = split_top_level_once(trimmed, ':') {
+                let scrut_end = line_code_start + scrut.len() + 1;
+                ranges.push((offset, scrut_end));
+                let rest_start = scrut_end + (trimmed.len() - scrut.len() - 1 - rest.len());
+                let rb = rest.as_bytes();
+                let mut depth = 0i32;
+                let mut k = 0usize;
+                while k < rb.len() {
+                    match rb[k] {
+                        b'(' | b'{' | b'[' => depth += 1,
+                        b')' | b'}' | b']' => depth -= 1,
+                        b'c' if depth == 0
+                            && rest[k..].starts_with("case ")
+                            && (k == 0 || rb[k - 1] == b' ') =>
+                        {
+                            let mut d = 0i32;
+                            let mut j = k + 5;
+                            while j < rb.len() {
+                                match rb[j] {
+                                    b'(' | b'{' | b'[' => d += 1,
+                                    b')' | b'}' | b']' => d -= 1,
+                                    b':' if d == 0 => break,
+                                    _ => {}
+                                }
+                                j += 1;
+                            }
+                            ranges.push((rest_start + k, rest_start + (j + 1).min(rb.len())));
+                            k = j;
+                        }
+                        _ => {}
+                    }
+                    k += 1;
                 }
             }
-        } else if trimmed.starts_with("let ") {
+        } else if trimmed.starts_with("let ")
+            || trimmed
+                .trim_start_matches(['+', '-', '~'])
+                .split_once('=')
+                .is_some_and(|(lhs, rhs)| {
+                    let lhs = lhs.trim();
+                    !lhs.is_empty()
+                        && lhs.chars().all(|c| c.is_ascii_alphanumeric() || c == '_')
+                        && !rhs.starts_with(['=', '>'])
+                })
+        {
             if let Some(eq) = line.find('=') {
                 ranges.push((offset, offset + eq + 1));
             }
@@ -13993,7 +14250,13 @@ fn mutate_nat_ops(body: &str, protected: &[(usize, usize)]) -> Vec<(String, Stri
         ("Nat.succ", &["Nat.pred"]),
         ("Nat.pred", &["Nat.succ"]),
         ("Nat.div", &["Nat.mod"]),
+        ("Nat.mod", &["Nat.div"]),
     ];
+    // Bend 2 infix operators are always written with a space on each side, which tells
+    // them apart from '<<', '>>', 'List<&2, Nat>', 'f(+x)', '->', and '1n+x'.
+    let spaced = |start: usize, end: usize| {
+        start > 0 && bytes[start - 1] == b' ' && bytes.get(end) == Some(&b' ')
+    };
 
     while i < bytes.len() {
         if in_protected(i, protected) {
@@ -14034,12 +14297,12 @@ fn mutate_nat_ops(body: &str, protected: &[(usize, usize)]) -> Vec<(String, Stri
         } else {
             ""
         };
-        if two == "<=" {
+        if two == "<=" && spaced(i, i + 2) {
             out.push((replace_span(body, i, i + 2, "<"), "<= -> <".to_string()));
             i += 2;
             continue;
         }
-        if two == ">=" {
+        if two == ">=" && spaced(i, i + 2) {
             out.push((replace_span(body, i, i + 2, ">"), ">= -> >".to_string()));
             i += 2;
             continue;
@@ -14058,31 +14321,30 @@ fn mutate_nat_ops(body: &str, protected: &[(usize, usize)]) -> Vec<(String, Stri
             i += 2;
             continue;
         }
-        if bytes[i] == b'<' && (i + 1 >= bytes.len() || bytes[i + 1] != b'=') {
+        if bytes[i] == b'<' && spaced(i, i + 1) {
             out.push((replace_span(body, i, i + 1, "<="), "< -> <=".to_string()));
             i += 1;
             continue;
         }
-        if bytes[i] == b'>'
-            && (i + 1 >= bytes.len() || bytes[i + 1] != b'=')
-            && (i == 0 || (bytes[i - 1] != b'-' && bytes[i - 1] != b'='))
-        {
+        if bytes[i] == b'>' && spaced(i, i + 1) {
             out.push((replace_span(body, i, i + 1, ">="), "> -> >=".to_string()));
             i += 1;
             continue;
         }
-        if bytes[i] == b'+' && i > 0 && bytes[i - 1].is_ascii_whitespace() {
+        if bytes[i] == b'+' && spaced(i, i + 1) {
             out.push((replace_span(body, i, i + 1, "-"), "+ -> -".to_string()));
             i += 1;
             continue;
         }
-        if bytes[i] == b'-'
-            && (i + 1 >= bytes.len() || bytes[i + 1] != b'>')
-            && i > 0
-            && bytes[i - 1].is_ascii_whitespace()
-            && i + 1 < bytes.len()
-            && bytes[i + 1].is_ascii_whitespace()
-        {
+        for (from, to) in [(b'*', "+"), (b'/', "%"), (b'%', "/")] {
+            if bytes[i] == from && spaced(i, i + 1) {
+                out.push((
+                    replace_span(body, i, i + 1, to),
+                    format!("{} -> {to}", from as char),
+                ));
+            }
+        }
+        if bytes[i] == b'-' && spaced(i, i + 1) {
             out.push((replace_span(body, i, i + 1, "+"), "- -> +".to_string()));
             i += 1;
             continue;
@@ -14092,6 +14354,125 @@ fn mutate_nat_ops(body: &str, protected: &[(usize, usize)]) -> Vec<(String, Stri
     }
 
     out
+}
+
+/// BoolOps: `Bool.and` <-> `Bool.or`, `&&` <-> `||`, and `Bool.not(x)` -> `x`.
+fn mutate_bool_ops(body: &str, protected: &[(usize, usize)]) -> Vec<(String, String)> {
+    let mut out = Vec::new();
+    let bytes = body.as_bytes();
+    let boundary_before = |i: usize| {
+        i == 0
+            || !(bytes[i - 1].is_ascii_alphanumeric()
+                || bytes[i - 1] == b'_'
+                || bytes[i - 1] == b'.')
+    };
+    let boundary_after = |end: usize| {
+        end >= bytes.len()
+            || !(bytes[end].is_ascii_alphanumeric() || bytes[end] == b'_' || bytes[end] == b'.')
+    };
+    let mut i = 0usize;
+    while i < bytes.len() {
+        if in_protected(i, protected) || !boundary_before(i) {
+            i += 1;
+            continue;
+        }
+        let rest = &body[i..];
+        for (from, to) in [("Bool.and", "Bool.or"), ("Bool.or", "Bool.and")] {
+            if rest.starts_with(from) && boundary_after(i + from.len()) {
+                out.push((
+                    replace_span(body, i, i + from.len(), to),
+                    format!("{from} -> {to}"),
+                ));
+            }
+        }
+        if rest.starts_with("Bool.not(") {
+            let open = i + "Bool.not".len();
+            if let Some(close_rel) = find_matching_paren(&body[open..]) {
+                let close = open + close_rel;
+                let inner = &body[open + 1..close];
+                out.push((
+                    replace_span(body, i, close + 1, inner.trim()),
+                    "Bool.not dropped".to_string(),
+                ));
+            }
+        }
+        for (from, to) in [("&&", "||"), ("||", "&&")] {
+            if rest.starts_with(from)
+                && i > 0
+                && bytes[i - 1] == b' '
+                && bytes.get(i + 2) == Some(&b' ')
+            {
+                out.push((replace_span(body, i, i + 2, to), format!("{from} -> {to}")));
+            }
+        }
+        i += 1;
+    }
+    out
+}
+
+/// IntLit: bare fixed-width integer literals (`7` in `(a + 7 : U32)`) -> `k + 1` and
+/// `k - 1`. `Nat` literals (`7n`), floats (`1.5`), quantities (`&2`, `*1`), digits
+/// inside names, and string contents are left alone. Returns the mutants and how many
+/// literal sites past the per-function cap were dropped.
+fn mutate_int_lit(body: &str, protected: &[(usize, usize)]) -> (Vec<(String, String)>, usize) {
+    let mut out = Vec::new();
+    let bytes = body.as_bytes();
+    let mut sites = 0usize;
+    let mut dropped = 0usize;
+    let mut in_string = false;
+    let mut i = 0usize;
+    while i < bytes.len() {
+        let b = bytes[i];
+        if in_string {
+            if b == b'\\' {
+                i += 1;
+            } else if b == b'"' {
+                in_string = false;
+            }
+            i += 1;
+            continue;
+        }
+        if b == b'"' {
+            in_string = true;
+            i += 1;
+            continue;
+        }
+        if !b.is_ascii_digit() {
+            i += 1;
+            continue;
+        }
+        let start = i;
+        while i < bytes.len() && bytes[i].is_ascii_digit() {
+            i += 1;
+        }
+        let prev = if start > 0 { bytes[start - 1] } else { b' ' };
+        let next = bytes.get(i).copied().unwrap_or(b' ');
+        let standalone = !(prev.is_ascii_alphanumeric()
+            || matches!(prev, b'_' | b'.' | b'&' | b'*'))
+            && !(next.is_ascii_alphanumeric() || matches!(next, b'_' | b'.'));
+        if !standalone || in_protected(start, protected) {
+            continue;
+        }
+        let Ok(k) = body[start..i].parse::<u64>() else {
+            continue;
+        };
+        sites += 1;
+        if sites > MAX_NAT_LIT_SITES_PER_DEF {
+            dropped += 1;
+            continue;
+        }
+        let lit = &body[start..i];
+        let up = (k + 1).to_string();
+        out.push((replace_span(body, start, i, &up), format!("{lit} -> {up}")));
+        if k > 0 {
+            let down = (k - 1).to_string();
+            out.push((
+                replace_span(body, start, i, &down),
+                format!("{lit} -> {down}"),
+            ));
+        }
+    }
+    (out, dropped)
 }
 
 fn mutate_drop_bool_operand(body: &str, protected: &[(usize, usize)]) -> Vec<(String, String)> {
@@ -14379,50 +14760,112 @@ fn arms_binder_compatible(
     def_map: &HashMap<String, &Def>,
     ctor_map: &HashMap<String, CtorInfo>,
 ) -> bool {
-    let param_names: HashSet<String> = def.params.iter().map(|p| p.name.clone()).collect();
-    let binds_a = extract_pattern_binders(&a.pat, ctor_map);
-    let binds_b = extract_pattern_binders(&b.pat, ctor_map);
+    let _ = def;
+    let binds_a = pattern_binder_types(&a.pat, ctor_map);
+    let binds_b = pattern_binder_types(&b.pat, ctor_map);
 
-    let tokens_a: HashSet<String> = lock::tokenize_bend(&a.body_text)
-        .into_iter()
-        .filter(|t| !def_map.contains_key(t) && !ctor_map.contains_key(t))
-        .collect();
-    let tokens_b: HashSet<String> = lock::tokenize_bend(&b.body_text)
-        .into_iter()
-        .filter(|t| !def_map.contains_key(t) && !ctor_map.contains_key(t))
-        .collect();
-
-    for var in &binds_a {
-        if !param_names.contains(var) && tokens_a.contains(var) && !binds_b.contains(var) {
-            return false;
-        }
-    }
-    for var in &binds_b {
-        if !param_names.contains(var) && tokens_b.contains(var) && !binds_a.contains(var) {
-            return false;
-        }
-    }
-    true
+    let body_names = |text: &str| -> HashSet<String> {
+        lock::tokenize_bend(text)
+            .into_iter()
+            .filter(|t| {
+                t.starts_with(|c: char| c.is_ascii_alphabetic() || c == '_')
+                    && !def_map.contains_key(t)
+                    && !ctor_map.contains_key(t)
+            })
+            .collect()
+    };
+    // After the swap, arm A's body runs under B's pattern and vice versa. Every name the
+    // body uses must mean the same thing there: bound by both patterns with the same
+    // type, or bound by neither (a parameter or outer local, not shadowed).
+    let same_meaning =
+        |names: &HashSet<String>, from: &HashMap<String, String>, to: &HashMap<String, String>| {
+            names.iter().all(|n| match (from.get(n), to.get(n)) {
+                (Some(ta), Some(tb)) => ta == tb && ta != "?",
+                (None, None) => true,
+                _ => false,
+            })
+        };
+    same_meaning(&body_names(&a.body_text), &binds_a, &binds_b)
+        && same_meaning(&body_names(&b.body_text), &binds_b, &binds_a)
 }
 
-fn extract_pattern_binders(pat: &str, ctor_map: &HashMap<String, CtorInfo>) -> HashSet<String> {
-    let mut binders = HashSet::new();
-    for tok in lock::tokenize_bend(pat) {
-        if matches!(
-            tok.as_str(),
-            "_" | "true" | "false" | "True" | "False" | "Unit"
-        ) || ctor_map.contains_key(&tok)
-        {
-            continue;
-        }
-        let first = tok.chars().next();
-        if first.is_some_and(|c| c.is_ascii_lowercase() || c == '_')
-            && tok.chars().all(|c| c.is_ascii_alphanumeric() || c == '_')
-        {
-            binders.insert(tok);
+/// Binders of a `case` pattern with a key for their type: the constructor field type
+/// when the binder is a direct field (`Num{x}` -> `Nat`), `#<k>` for a whole scrutinee
+/// at position `k` of a multi-scrutinee match, or `?` when unknown (nested patterns).
+/// Binders may be uppercase (`Has{Amt}`); constructors are the names followed by `{`
+/// or `(`.
+fn pattern_binder_types(
+    pat: &str,
+    ctor_map: &HashMap<String, CtorInfo>,
+) -> HashMap<String, String> {
+    let mut out = HashMap::new();
+    // Top-level parts: one per scrutinee.
+    let mut parts = Vec::new();
+    let mut depth = 0i32;
+    let mut start = 0usize;
+    for (idx, ch) in pat.char_indices() {
+        match ch {
+            '(' | '{' | '[' => depth += 1,
+            ')' | '}' | ']' => depth -= 1,
+            ' ' | '\t' if depth == 0 => {
+                if idx > start {
+                    parts.push(&pat[start..idx]);
+                }
+                start = idx + 1;
+            }
+            _ => {}
         }
     }
-    binders
+    if start < pat.len() {
+        parts.push(&pat[start..]);
+    }
+    for (k, part) in parts.iter().enumerate() {
+        let toks = lock::tokenize_bend(part);
+        let is_binder = |i: usize| {
+            let t = toks[i].as_str();
+            t.starts_with(|c: char| c.is_ascii_alphabetic() || c == '_')
+                && t.chars().all(|c| c.is_ascii_alphanumeric() || c == '_')
+                && !matches!(t, "_" | "true" | "false")
+                && !toks.get(i + 1).is_some_and(|n| n == "{" || n == "(")
+                && !ctor_map.contains_key(t)
+        };
+        // Enclosing constructor patterns: (constructor, current field index).
+        let mut stack: Vec<(Option<&CtorInfo>, usize)> = Vec::new();
+        for i in 0..toks.len() {
+            match toks[i].as_str() {
+                "{" | "(" => {
+                    let ctor = if i > 0 {
+                        ctor_map.get(&toks[i - 1])
+                    } else {
+                        None
+                    };
+                    stack.push((ctor, 0));
+                }
+                "}" | ")" => {
+                    stack.pop();
+                }
+                "," => {
+                    if let Some(top) = stack.last_mut() {
+                        top.1 += 1;
+                    }
+                }
+                t if is_binder(i) => {
+                    let key = match stack.as_slice() {
+                        [] => format!("#{k}"),
+                        [(Some(info), field)] => info
+                            .field_types
+                            .get(*field)
+                            .cloned()
+                            .unwrap_or_else(|| "?".to_string()),
+                        _ => "?".to_string(),
+                    };
+                    out.insert(t.to_string(), key);
+                }
+                _ => {}
+            }
+        }
+    }
+    out
 }
 
 fn rebuild_with_swapped_arms(lines: &[&str], a: &ArmSlice, b: &ArmSlice) -> Option<String> {
@@ -14496,7 +14939,9 @@ fn precompute_def_callees<'a>(
     for def in defs {
         let mut callees = Vec::new();
         let mut seen = HashSet::new();
-        for tok in lock::tokenize_bend(&def.body) {
+        let locals = crate::law_test::def_local_names(def);
+        for tok in crate::law_test::referenced_defs(&def.body, |t| def_map.contains_key(t), &locals)
+        {
             if let Some(target) = def_map.get(&tok) {
                 if seen.insert(target.name.as_str()) {
                     callees.push(target.name.as_str());
@@ -14523,7 +14968,8 @@ fn law_dependency_cone_fast<'a>(
                 .flat_map(|h| [h.lhs.as_str(), h.rhs.as_str()]),
         )
     {
-        for tok in lock::tokenize_bend(expr) {
+        let locals = crate::law_test::law_local_names(law);
+        for tok in crate::law_test::referenced_defs(expr, |t| def_map.contains_key(t), &locals) {
             if let Some(def) = def_map.get(&tok) {
                 if visited.insert(def.name.clone()) {
                     queue.push_back(def.name.as_str());
@@ -15531,6 +15977,7 @@ law count_above_limit_refused:
                     + MAX_BOUND_MUTANTS_PER_LAW
                     + MAX_RETURN_LIT_MUTANTS_PER_LAW
                     + MAX_ADD_MAX_MIN_MUTANTS_PER_LAW
+                    + MAX_BOOL_INT_MUTANTS_PER_LAW
         );
         assert!(mutants.iter().any(|m| m.operator == "NatLit"));
     }
@@ -15999,6 +16446,357 @@ def halve_in_band(x, h):
         assert!(out.contains("law_bump_adds_one ... ok"), "{out}");
         assert!(out.contains("law_halve_in_band ... ok"), "{out}");
         let _ = fs::remove_dir_all(&dir);
+    }
+
+    const MUT_FIXTURE_M2: &str = r#"import Base
+
+type Val is Data:
+  Num{x: Nat}
+  Flag{x: Bool}
+
+def score(v: Val) -> Nat:
+  match v:
+    case Num{x}: Nat.add(x, 1n)
+    case Flag{x}: 0n
+
+# promise: a number scores one more
+law score_num:
+  for n: Nat
+  {score(Num{n}) == Nat.add(n, 1n) : Nat}
+
+def score_num(n):
+  {==}
+"#;
+
+    const MUT_FIXTURE_M3: &str = r#"import Base
+
+type Val is Data:
+  Num{x: Nat}
+  Other{}
+
+def pick(x: Bool, v: Val) -> Nat:
+  match v:
+    case Num{x}: Nat.add(x, 1n)
+    case Other{}: 0n
+
+# promise: a number picks one more
+law pick_num:
+  for b: Bool
+  for n: Nat
+  {pick(b, Num{n}) == Nat.add(n, 1n) : Nat}
+
+def pick_num(b, n):
+  {==}
+"#;
+
+    const MUT_FIXTURE_M4: &str = r#"import Base
+
+type Holder is Data:
+  Has{Amt: Nat}
+  Empty0{}
+
+def get(o: Holder) -> Nat:
+  match o:
+    case Has{Amt}: Amt
+    case Empty0{}: 0n
+
+# promise: get reads the amount
+law get_some:
+  for n: Nat
+  {get(Has{n}) == n : Nat}
+
+def get_some(n):
+  {==}
+"#;
+
+    const MUT_FIXTURE_M5: &str = r#"import Base
+
+def sh(+a: U32, +n: Nat) -> U32:
+  ((a << n : U32) + (a >> n : U32) : U32)
+
+# promise: shifting twelve by two sums both ways
+law sh_twelve:
+  {sh(12, 2n) == 51 : U32}
+
+def sh_twelve():
+  {==}
+
+def scale(+a: U32, +b: U32) -> U32:
+  ((a * b : U32) + 1 : U32)
+
+# promise: scaling adds one
+law scale_one:
+  {scale(3, 1) == 4 : U32}
+
+def scale_one():
+  {==}
+"#;
+
+    const MUT_FIXTURE_M6: &str = r#"import Base
+
+def keep_flag(+b: Bool, +n: Nat) -> Nat:
+  match b:
+    case True{}:
+      b = n
+      b
+    case False{}: 0n
+
+# promise: a true flag keeps n
+law keep_true:
+  for n: Nat
+  {keep_flag(True{}, n) == n : Nat}
+
+def keep_true(n):
+  {==}
+"#;
+
+    const MUT_FIXTURE_LET2: &str = r#"import Base
+
+def twice(+n: Nat) -> Nat:
+  +m = Nat.add(n, n)
+  k = Nat.add(m, 1n)
+  -unused = {0n : Nat}
+  Nat.sub(k, 1n)
+
+# promise: twice doubles
+law twice_three:
+  {twice(3n) == 6n : Nat}
+
+def twice_three():
+  {==}
+"#;
+
+    #[test]
+    fn mutants_of_shadowing_swaps_shifts_and_bend2_lets_all_compile() {
+        let bend = crate::resolve_bend_bin(
+            env::var("BEND_BIN").ok(),
+            env::var_os("PATH"),
+            env::var_os("HOME").map(std::path::PathBuf::from),
+        );
+        for (tag, src) in [
+            ("swap_types", MUT_FIXTURE_M2),
+            ("swap_shadow", MUT_FIXTURE_M3),
+            ("upper_binder", MUT_FIXTURE_M4),
+            ("shifts", MUT_FIXTURE_M5),
+            ("rebound_bool", MUT_FIXTURE_M6),
+            ("bend2_let", MUT_FIXTURE_LET2),
+        ] {
+            let dir = tmp_dir(tag);
+            let core = dir.join("core.bend");
+            fs::write(&core, src).unwrap();
+            if let Ok(out) = Command::new(&bend).arg(&core).arg("--check-only").output() {
+                assert!(
+                    out.status.success(),
+                    "{tag}: reference must accept the fixture"
+                );
+            }
+            let report =
+                lock::check_law_lock(&dir.join("l.lock"), std::slice::from_ref(&core), false)
+                    .unwrap();
+            let summary = run_mutation_checks(src, &report, MutateMode::Report, &dir.join("o"))
+                .unwrap_or_else(|e| panic!("{tag}: {e}"));
+            for r in &summary.reports {
+                assert!(
+                    r.skipped_reason.is_none(),
+                    "{tag}/{}: {:?}",
+                    r.law_name,
+                    r.skipped_reason
+                );
+                assert!(
+                    r.caught_by.is_some(),
+                    "{tag}/{}: nothing caught",
+                    r.law_name
+                );
+                for o in &r.mutant_outcomes {
+                    assert!(
+                        !matches!(o.status, MutantStatus::BuildError(_)),
+                        "{tag}: mutant '{}' does not compile: {:?}",
+                        o.description,
+                        o.status
+                    );
+                }
+            }
+            let _ = fs::remove_dir_all(&dir);
+        }
+    }
+
+    fn mutant_descriptions(src: &str) -> Vec<String> {
+        let (_, defs) = parse_book_items(src).unwrap();
+        let def_map: HashMap<String, &Def> = defs.iter().map(|d| (d.name.clone(), d)).collect();
+        let (types, _) = parse_book_items(src).unwrap();
+        let type_env = TypeEnv::build(&types, &defs, &[]);
+        generate_mutants_for_cone_with_stats(&defs, &def_map, &type_env.ctor_map)
+            .mutants
+            .into_iter()
+            .map(|m| m.description)
+            .collect()
+    }
+
+    #[test]
+    fn single_line_match_arms_are_mutated_but_patterns_are_not() {
+        let src = "import Base
+
+def pick_sum(ok: Bool, +a: Nat, +b: Nat) -> Nat:
+  match ok: case True{}: Nat.add(a, b) case False{}: a
+";
+        let descs = mutant_descriptions(src);
+        assert!(
+            descs.iter().any(|d| d.contains("Nat.add -> Nat.sub")),
+            "{descs:#?}"
+        );
+        assert!(
+            !descs.iter().any(|d| d.contains("True{} -> False{}")),
+            "{descs:#?}"
+        );
+    }
+
+    #[test]
+    fn infix_mutations_only_touch_spaced_operators() {
+        let body = "Nat.add(f(a, +x), ((a << n : U32) + (b >> n : U32) : U32)) List<&2, Nat> (c < d : Nat)";
+        let nat_ops: Vec<String> = mutate_nat_ops(body, &[])
+            .into_iter()
+            .map(|(_, d)| d)
+            .collect();
+        assert_eq!(
+            nat_ops,
+            vec![
+                "Nat.add -> Nat.sub",
+                "Nat.add -> Nat.mul",
+                "+ -> -",
+                "< -> <="
+            ],
+            "{nat_ops:#?}"
+        );
+        let flips: Vec<String> = mutate_flip_cmp(body, &[])
+            .into_iter()
+            .map(|(_, d)| d)
+            .collect();
+        assert_eq!(flips, vec!["< -> >"], "{flips:#?}");
+    }
+
+    #[test]
+    fn new_operators_cover_mod_bool_connectives_negation_and_u32_literals() {
+        let ops: Vec<String> = mutate_nat_ops("Nat.mod(a, 3n)", &[])
+            .into_iter()
+            .map(|(_, d)| d)
+            .collect();
+        assert_eq!(ops, vec!["Nat.mod -> Nat.div"]);
+        let bool_ops: Vec<(String, String)> = mutate_bool_ops("Bool.not(Bool.and(a, b))", &[]);
+        let descs: Vec<&str> = bool_ops.iter().map(|(_, d)| d.as_str()).collect();
+        assert_eq!(descs, vec!["Bool.not dropped", "Bool.and -> Bool.or"]);
+        assert_eq!(bool_ops[0].0, "Bool.and(a, b)");
+        let (lits, dropped) = mutate_int_lit("((a * 7 : U32) + 0 : U32) 7n 1.5 x2 &2 \"9\"", &[]);
+        let descs: Vec<&str> = lits.iter().map(|(_, d)| d.as_str()).collect();
+        assert_eq!(descs, vec!["7 -> 8", "7 -> 6", "0 -> 1"]);
+        assert_eq!(dropped, 0);
+        // A pure fixed-width function is no longer mutant-free.
+        let widen = "import Base
+
+def widen(+a: U32) -> U32:
+  (a + 1 : U32)
+";
+        assert!(!mutant_descriptions(widen).is_empty());
+    }
+
+    #[test]
+    fn filler_values_cover_fixed_width_tuples_and_adts_with_fields() {
+        let src = "import Base
+
+type Pt is Data:
+  Pt{x: U32, y: Nat}
+
+type Shape is Data:
+  Dot{at: Pt}
+  Line{a: Pt, b: Pt}
+";
+        let (types, defs) = parse_book_items(src).unwrap();
+        let env = TypeEnv::build(&types, &defs, &[]);
+        assert_eq!(filler_value("U32", &env.ctor_map).as_deref(), Some("0"));
+        assert_eq!(
+            filler_value("Nat & Bool", &env.ctor_map).as_deref(),
+            Some("(0n, False{})")
+        );
+        assert_eq!(
+            filler_value("Pt", &env.ctor_map).as_deref(),
+            Some("Pt.Pt{0, 0n}")
+        );
+        assert_eq!(
+            filler_value("Shape", &env.ctor_map).as_deref(),
+            Some("Shape.Dot{Pt.Pt{0, 0n}}")
+        );
+    }
+
+    #[test]
+    fn a_later_uncompilable_mutant_is_reported_even_after_a_catch() {
+        let dir = tmp_dir("mask_build");
+        let src = "import Base
+
+def inc(+n: Nat) -> Nat:
+  Nat.add(n, 1n)
+
+law inc_adds:
+  for +n: Nat
+  {inc(n) == Nat.add(n, 1n) : Nat}
+";
+        let laws = parse_laws(src);
+        let (types, defs) = parse_book_items(src).unwrap();
+        let type_env = TypeEnv::build(&types, &defs, &collect_law_source_slices(&laws));
+        let type_map: HashMap<String, &TypeDef> =
+            types.iter().map(|t| (t.name.clone(), t)).collect();
+        let caught = Mutant {
+            operator: "Test".to_string(),
+            description: "inc: add -> sub [Test]".to_string(),
+            def_name: "inc".to_string(),
+            mutated_body: "Nat.sub(n, 1n)".to_string(),
+        };
+        let bad = Mutant {
+            operator: "Test".to_string(),
+            description: "inc: body -> True{} [Test]".to_string(),
+            def_name: "inc".to_string(),
+            mutated_body: "True{}".to_string(),
+        };
+        let err = evaluate_mutants_batch(
+            &laws[0],
+            &[caught, bad],
+            &types,
+            &defs,
+            &type_map,
+            &type_env,
+            &dir,
+        )
+        .expect_err("the uncompilable mutant must surface");
+        assert!(err.contains("[E_MUTANT_BUILD]"), "{err}");
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn parameters_named_like_defs_do_not_join_cones_or_make_recursion() {
+        let src = "import Base
+
+def step(+step: Nat) -> Nat:
+  Nat.add(step, 1n)
+
+def size(+n: Nat) -> Nat:
+  n
+
+def uses(+size: Nat) -> Nat:
+  step(size)
+
+law step_adds:
+  for +size: Nat
+  {step(size) == Nat.add(size, 1n) : Nat}
+";
+        let laws = parse_laws(src);
+        let (_, defs) = parse_book_items(src).unwrap();
+        let cone = crate::law_test::law_dependency_cone(&laws[0], &defs);
+        assert_eq!(cone, vec!["step".to_string()]);
+        assert!(!crate::law_test::cone_is_recursive(&cone, &defs));
+        let def_map: HashMap<String, &Def> = defs.iter().map(|d| (d.name.clone(), d)).collect();
+        let callees = precompute_def_callees(&defs, &def_map);
+        assert!(callees["step"].is_empty(), "{:?}", callees["step"]);
+        assert_eq!(callees["uses"], vec!["step"]);
+        let fast = law_dependency_cone_fast(&laws[0], &def_map, &callees);
+        assert_eq!(fast, vec!["step".to_string()]);
     }
 
     #[test]
@@ -16839,8 +17637,9 @@ pub fn analyze_coverage(
     for def in &defs {
         let mut callees = Vec::new();
         let mut seen = HashSet::new();
-        for tok in tokenize_bend(&def.body) {
-            if def_names.contains(&tok) && seen.insert(tok.clone()) {
+        let locals = crate::law_test::def_local_names(def);
+        for tok in crate::law_test::referenced_defs(&def.body, |t| def_names.contains(t), &locals) {
+            if seen.insert(tok.clone()) {
                 callees.push(tok);
             }
         }
@@ -19551,6 +20350,7 @@ def cancel_idempotent(s):
   - The successor sugar `1n+x` is always checked `Nat`, even inside a `U32` function.
   - `F32` maps to `f32` (`1.5` -> `1.5_f32`, IEEE `+ - * / %`; ADTs holding an `F32` derive `PartialEq` without `Eq`). String literals become `String::from("..")` and `a ++ b` concatenates.
 - **Control flow & patterns:** nested `match`, multi-scrutinee `match a b:`, `case 1n+p:` and nested `case 1n+1n+q:` successor patterns, and multi-line `let` bindings are all supported.
+- **Bindings:** Bend 2 bindings `x = e`, `+x = e` (and the legacy `let x = e`) emit Rust `let`s; a dead binding `-x = {e : T}` is erased.
 - **Recursive ADTs & built-in `List`:** direct or mutually recursive `type` definitions automatically box cycle-forming fields (`Box<T>`), omit `Copy` (`#[derive(Debug, Clone, PartialEq, Eq)]`) across recursive types and any wrappers containing them, unbox patterns (`*__rb_box` + nested guards), and insert `.clone()` on multi-use non-`Copy` values. Built-in `Base` `List<T>` / `List<&2, T>`, `Nil{}` / `Con{head, tail}`, and list literals `[]` / `[a, b]` emit `pub enum List<T> { Nil, Con(T, Box<List<T>>) }`.
 - **Cross-file sibling imports (`import sibling.bend as X`):** files under `verified/` can import sibling `.bend` files (`import base_rules.bend as B`) to share functions, types, laws, and helper lemmas (`B.fn_name(...)`, `B.TypeName`, `B.Ctor{}`). Keep top-level names unique across `verified/*.bend`; the emitter resolves each file's import aliases into the single emitted `verified.rs` module, and `rusty-bends.lock` normalizes aliases so renaming `as B` does not trip `E_LAW_LOCK_TAMPERED`.
 - **Bundled `Nat` arithmetic lemma library (`nat_lemmas.bend`):** `rusty-bends-build` ships `rusty_bends_build::lemmas/nat_lemmas.bend` via `rusty_bends_build::NAT_LEMMAS_BEND` and `rusty_bends_build::write_nat_lemmas("verified")` (called in `build.rs` before `verify_and_emit("verified")`, or copied into `verified/`). Import it with `import nat_lemmas.bend as L`. All definitions in `nat_lemmas.bend` are `q=0` proof/type helpers and are erased completely before Rust codegen, covering:
@@ -19564,6 +20364,7 @@ def cancel_idempotent(s):
 - **Mutation checking before sealing (`E_LAW_VACUOUS`):** every unlocked/new law is checked against small mutants of the live functions in its dependency cone (`True{}`/`False{}` swap, `Nat.is_le`/`Nat.is_lt` swap, `Nat.add`/`Nat.sub` swap, `Bool.and`/`Bool.or` operand drop, returning a constructor argument unchanged, swapping match arms) and fails with `[E_LAW_VACUOUS]` if it catches none. Bound and safety laws are covered too: `NatBound` pushes a `Nat` result past a bound (`+ 1n`, `- 1n`, `0n`), `SiblingCtor` replaces a returned constructor with its sibling constructors, `BoolConst` replaces a `Bool` variable with `True{}` / `False{}`, and `FlipCmp` loosens comparisons (`Nat.is_le` <-> `Nat.is_ge`, `Nat.is_lt` <-> `Nat.is_gt`). `ReturnCtor` replaces a returned variable or function call (e.g. a fallthrough `case st _: st`) with each constructor of the return type, `NatLit` changes `Nat` literals (`k` -> `0n`, `k + 1`, `k - 1`, at most 8 sites per function), and `NatAddMaxMin` swaps `Nat.add` (or `(a + b : Nat)`) with `Nat.max` / `Nat.min` and vice versa. Each reported mutant ends with its operator, e.g. `caught by f: result -> Nat.add(result, 1n) [NatBound]`. Run `RUSTY_BENDS_MUTATE=all cargo check` to report one summary line for every law (new and locked) without failing on locked laws, or `RUSTY_BENDS_MUTATE=report cargo check` to evaluate every generated mutant of every law, print per-mutant `caught`/`survived` lines (noting any budget/site-cap drops), and write the report to `OUT_DIR/rusty-bends-mutants.txt`.
 - **Unevaluable new laws (`E_LAW_UNCHECKED`):** a new law the checker cannot evaluate (`exs`, a `where` refinement, an unparsable clause, or a goal without `==`) fails the build, naming the reason and the supported forms. If it truly cannot be sampled, add `# unchecked: <why>` in the comment block directly above `law <name>:`; the marker is stored in `rusty-bends.lock` and shown as `[unchecked: <why>]` by the law listing. Locked laws only warn.
 - **Mutants that do not compile (`E_MUTANT_BUILD`):** a mutant the generated Rust cannot build was never tested, so it never counts as a survivor. The build stops with `[E_MUTANT_BUILD]`, naming the mutant and the first rustc error; that is a RustyBends bug to report, not a weak law.
+- **What the mutation checker mutates:** arm bodies of single-line `match` lines (never patterns or scrutinees), spaced infix operators only (`(a + b : U32)`, never `<<`, `List<&2, Nat>`, or `1n+x`), `Nat.mod` <-> `Nat.div`, `Bool.and` <-> `Bool.or`, dropped `Bool.not`, and bare fixed-width literals (`7` -> `8` / `6`). Match arms are swapped only when every name their bodies use keeps its meaning and type. Parameters, binders, and law variables named like a function do not pull that function into a law's cone.
 - **Names that are Rust keywords:** any Bend name may be used, including ones Rust reserves (`as`, `in`, `fn`, `ref`, `mut`, `dyn`, `loop`, `move`, `self`, `crate`, `super`, ...). The emitted Rust spells them `r#as`, `r#in`, ... and, where Rust allows no raw form, `__rb_self`, `__rb_crate`, `__rb_super`, `__rb_Self`. Call them from Rust by those names, e.g. `verified::r#loop(2, 3)`.
 - **Only checked code in `verified/` (`E_UNCHECKED_DEF`, `E_BEND_NO_VERDICT`):** `@unsafe` defs, `def f?(..)`, and foreign defs whose body is `import "file.c"` / `import "file.js"` are rejected, since Bend reads only their types. A Bend run counts as passing only when it exits 0 *and* prints `ALL PROOFS CHECK` with no `SOME PROOFS FAIL`. Files holding equality lemmas (`def l(..) -> {a == b : T}`) get the `--verdict` cross-check even without a `law`, and `BEND_VERDICT=require` runs it on every file. `bend.pin` matches on version boundaries: `2.0.4` accepts `2.0.4` but not `2.0.40`; `2.0.` or `2.0` accepts any `2.0.x`.
 - **One flat, self-contained `verified/` (`E_IMPORT_OUTSIDE_VERIFIED`, `E_NAME_COLLISION`, `E_LAW_DUPLICATE`):** imports may name only `Base` or `.bend` files inside `verified/` (no `../`, absolute, or BendHub paths), so the lock, the checker, and the emitted Rust read the same code. Every `def`, `type`, and `law` name must be unique across files (a law and its proof `def` share a name in one file), because all files emit into one Rust module.
