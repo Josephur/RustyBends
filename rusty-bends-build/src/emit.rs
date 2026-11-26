@@ -2796,12 +2796,15 @@ fn emit_base_builtin(
     })
 }
 
+/// Splits a one-line `match` tail (`case A{}: x case B{}: "y  z"`) into its arms,
+/// without the `case` keywords. String literals are opaque: their whitespace, brackets
+/// and any `case` inside them are kept byte for byte and never split or counted
+/// (Issue #36). Whitespace between tokens outside strings collapses to one space.
 fn split_case_arms(arms_str: &str) -> Vec<String> {
     let mut arms = Vec::new();
     let mut current = String::new();
     let mut depth = 0i32;
-    let tokens: Vec<&str> = arms_str.split_whitespace().collect();
-    for tok in tokens {
+    for tok in split_whitespace_outside_strings(arms_str) {
         if tok == "case" && depth == 0 {
             if !current.trim().is_empty() {
                 arms.push(current.trim().trim_end_matches(';').to_string());
@@ -2809,13 +2812,7 @@ fn split_case_arms(arms_str: &str) -> Vec<String> {
             }
             continue;
         }
-        for ch in tok.chars() {
-            match ch {
-                '(' | '{' | '[' => depth += 1,
-                ')' | '}' | ']' => depth -= 1,
-                _ => {}
-            }
-        }
+        depth += bracket_delta_outside_strings(tok);
         if !current.is_empty() {
             current.push(' ');
         }
@@ -2827,6 +2824,68 @@ fn split_case_arms(arms_str: &str) -> Vec<String> {
     arms
 }
 
+/// Whitespace-separated tokens of `s`, except that whitespace inside a string literal
+/// does not separate: the literal stays inside its token, byte for byte.
+fn split_whitespace_outside_strings(s: &str) -> Vec<&str> {
+    let mut tokens = Vec::new();
+    let mut start: Option<usize> = None;
+    let mut in_string = false;
+    let mut escaped = false;
+    for (i, ch) in s.char_indices() {
+        if in_string {
+            if escaped {
+                escaped = false;
+            } else if ch == '\\' {
+                escaped = true;
+            } else if ch == '"' {
+                in_string = false;
+            }
+            continue;
+        }
+        if ch.is_whitespace() {
+            if let Some(st) = start.take() {
+                tokens.push(&s[st..i]);
+            }
+            continue;
+        }
+        start.get_or_insert(i);
+        if ch == '"' {
+            in_string = true;
+        }
+    }
+    if let Some(st) = start {
+        tokens.push(&s[st..]);
+    }
+    tokens
+}
+
+/// Net bracket depth change of `tok` (`(`, `{`, `[` open; `)`, `}`, `]` close), not
+/// counting brackets inside string literals.
+fn bracket_delta_outside_strings(tok: &str) -> i32 {
+    let mut delta = 0;
+    let mut in_string = false;
+    let mut escaped = false;
+    for ch in tok.chars() {
+        if in_string {
+            if escaped {
+                escaped = false;
+            } else if ch == '\\' {
+                escaped = true;
+            } else if ch == '"' {
+                in_string = false;
+            }
+            continue;
+        }
+        match ch {
+            '"' => in_string = true,
+            '(' | '{' | '[' => delta += 1,
+            ')' | '}' | ']' => delta -= 1,
+            _ => {}
+        }
+    }
+    delta
+}
+
 pub(crate) fn split_case_arm(arm: &str) -> Option<(&str, &str)> {
     if let Some(pair) = split_fat_arrow(arm) {
         return Some(pair);
@@ -2834,11 +2893,26 @@ pub(crate) fn split_case_arm(arm: &str) -> Option<(&str, &str)> {
     split_top_level_once(arm, ':')
 }
 
+/// The first top-level `=>` of an arm, splitting pattern from body. Brackets and `=>`
+/// inside string literals do not count (`case True{}: "a => b"` has none).
 fn split_fat_arrow(arm: &str) -> Option<(&str, &str)> {
     let mut depth = 0i32;
+    let mut in_string = false;
     let bytes = arm.as_bytes();
-    for i in 0..bytes.len().saturating_sub(1) {
-        match bytes[i] {
+    let mut i = 0;
+    while i + 1 < bytes.len() {
+        let b = bytes[i];
+        if in_string {
+            if b == b'\\' {
+                i += 1;
+            } else if b == b'"' {
+                in_string = false;
+            }
+            i += 1;
+            continue;
+        }
+        match b {
+            b'"' => in_string = true,
             b'(' | b'{' | b'[' => depth += 1,
             b')' | b'}' | b']' => depth -= 1,
             b'=' if depth == 0 && bytes[i + 1] == b'>' => {
@@ -2846,6 +2920,7 @@ fn split_fat_arrow(arm: &str) -> Option<(&str, &str)> {
             }
             _ => {}
         }
+        i += 1;
     }
     None
 }
@@ -4510,6 +4585,65 @@ def dup_end():
             "{runtime_only}\nfn main() {{\n    assert_eq!(area(2.5, 3.0), 9.0);\n    assert_eq!(sh(u32::MAX, 31), 0x8000_0001);\n    assert!(!second_is_zero(Chain::Link(0, Box::new(Chain::End))));\n}}\n"
         );
         compile_and_run("emitter_edges_rt", &harness, &["-A", "dead_code"]);
+    }
+
+    /// Issue #36: string literals in a one-line `match` keep their exact contents, even
+    /// when they hold repeated spaces, the word `case`, brackets or `=>`.
+    const INLINE_MATCH_STRINGS_SRC: &str = r#"import Base
+
+def pick_label(flag: Bool) -> String:
+  match flag: case True{}: "hello  world" case False{}: "a case (b => c)"
+
+# promise: a true flag keeps both spaces
+law label_on:
+  {pick_label(True{}) == "hello  world" : String}
+
+def label_on():
+  {==}
+
+# promise: a false flag keeps the words that look like syntax
+law label_off:
+  {pick_label(False{}) == "a case (b => c)" : String}
+
+def label_off():
+  {==}
+"#;
+
+    #[test]
+    fn inline_match_arms_keep_string_literals_exact() {
+        if let Some((ok, text)) = reference_check_only("inline_strings", INLINE_MATCH_STRINGS_SRC) {
+            assert!(ok, "reference bend must prove every fixture law:\n{text}");
+        }
+        let summary = emit_verified_rust(INLINE_MATCH_STRINGS_SRC, 2).unwrap();
+        let src = &summary.rust_source;
+        for expected in [
+            "true => String::from(\"hello  world\"),",
+            "false => String::from(\"a case (b => c)\"),",
+        ] {
+            assert!(src.contains(expected), "missing {expected:?} in:\n{src}");
+        }
+        let out = compile_and_run("inline_strings", src, &["--test", "-A", "dead_code"]);
+        for law in ["label_on", "label_off"] {
+            assert!(out.contains(&format!("law_{law} ... ok")), "{law}:\n{out}");
+        }
+    }
+
+    #[test]
+    fn case_arm_splitting_treats_string_literals_as_opaque() {
+        // Unbalanced brackets, a tab, an escaped quote and `case` inside strings.
+        let arms = split_case_arms(
+            "case A{}: \"x (  case\" case B{}: f(\"]\\\"\tcase\", 1) case C{}:   \"\"",
+        );
+        assert_eq!(
+            arms,
+            vec![
+                "A{}: \"x (  case\"",
+                "B{}: f(\"]\\\"\tcase\", 1)",
+                "C{}: \"\"",
+            ]
+        );
+        assert_eq!(split_fat_arrow("A{}: \"p => q\""), None);
+        assert_eq!(split_fat_arrow("\"(\" => x"), Some(("\"(\"", "x")));
     }
 
     #[test]
