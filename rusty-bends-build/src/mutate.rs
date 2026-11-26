@@ -2812,6 +2812,11 @@ fn mutate_bool_ops(body: &str, protected: &[(usize, usize)]) -> Vec<(String, Str
 /// `k - 1`. `Nat` literals (`7n`), floats (`1.5`), quantities (`&2`, `*1`), digits
 /// inside names, and string contents are left alone. Returns the mutants and how many
 /// literal sites past the per-function cap were dropped.
+///
+/// Bend reads a bare `NUMBER` as `U32` (`NUMBER n` is `Nat`), so every mutant must stay
+/// within `0..=u32::MAX`: `4294967295` gets only `-> 4294967294`, because
+/// `4294967296` would not compile (Issue #35). Digit runs too large for a `U32` are
+/// not literal sites at all, so no `k + 1` can overflow either.
 fn mutate_int_lit(body: &str, protected: &[(usize, usize)]) -> (Vec<(String, String)>, usize) {
     let mut out = Vec::new();
     let bytes = body.as_bytes();
@@ -2851,7 +2856,8 @@ fn mutate_int_lit(body: &str, protected: &[(usize, usize)]) -> (Vec<(String, Str
         if !standalone || in_protected(start, protected) {
             continue;
         }
-        let Ok(k) = body[start..i].parse::<u64>() else {
+        // Only literals a `U32` can hold are sites; anything wider is not valid Bend.
+        let Ok(k) = body[start..i].parse::<u32>() else {
             continue;
         };
         sites += 1;
@@ -2860,8 +2866,11 @@ fn mutate_int_lit(body: &str, protected: &[(usize, usize)]) -> (Vec<(String, Str
             continue;
         }
         let lit = &body[start..i];
-        let up = (k + 1).to_string();
-        out.push((replace_span(body, start, i, &up), format!("{lit} -> {up}")));
+        // `checked_add` skips the one value (`u32::MAX`) whose successor has no `U32`.
+        if let Some(up) = k.checked_add(1) {
+            let up = up.to_string();
+            out.push((replace_span(body, start, i, &up), format!("{lit} -> {up}")));
+        }
         if k > 0 {
             let down = (k - 1).to_string();
             out.push((
@@ -4930,6 +4939,32 @@ def scale_one():
   {==}
 "#;
 
+    /// Issue #35: a `U32` literal at the type's maximum. Its `k + 1` mutant would not
+    /// compile, so only `k - 1` may be generated.
+    const MUT_FIXTURE_U32_MAX: &str = r#"import Base
+
+def max_u32_limit(flag: Bool) -> U32:
+  match flag:
+    case True{}:
+      4294967295
+    case False{}:
+      1
+
+# promise: a true flag gives the largest U32
+law max_u32_on:
+  {max_u32_limit(True{}) == 4294967295 : U32}
+
+def max_u32_on():
+  {==}
+
+# promise: a false flag gives one
+law max_u32_off:
+  {max_u32_limit(False{}) == 1 : U32}
+
+def max_u32_off():
+  {==}
+"#;
+
     const MUT_FIXTURE_M6: &str = r#"import Base
 
 def keep_flag(+b: Bool, +n: Nat) -> Nat:
@@ -4978,6 +5013,7 @@ def twice_three():
             ("shifts", MUT_FIXTURE_M5),
             ("rebound_bool", MUT_FIXTURE_M6),
             ("bend2_let", MUT_FIXTURE_LET2),
+            ("u32_max", MUT_FIXTURE_U32_MAX),
         ] {
             let dir = tmp_dir(tag);
             let core = dir.join("core.bend");
@@ -5016,6 +5052,28 @@ def twice_three():
             }
             let _ = fs::remove_dir_all(&dir);
         }
+    }
+
+    #[test]
+    fn int_lit_mutants_stay_within_u32() {
+        // Issue #35: `u32::MAX + 1` is no `U32`, and a digit run wider than a `U32` is
+        // no Bend literal, so neither may yield a mutant (or overflow while trying).
+        let body = "(a + 4294967295 : U32) 18446744073709551615 99999999999999999999 4294967294";
+        let (lits, dropped) = mutate_int_lit(body, &[]);
+        let descs: Vec<&str> = lits.iter().map(|(_, d)| d.as_str()).collect();
+        assert_eq!(
+            descs,
+            vec![
+                "4294967295 -> 4294967294",
+                "4294967294 -> 4294967295",
+                "4294967294 -> 4294967293"
+            ]
+        );
+        assert_eq!(dropped, 0);
+        assert_eq!(
+            lits[0].0,
+            "(a + 4294967294 : U32) 18446744073709551615 99999999999999999999 4294967294"
+        );
     }
 
     fn mutant_descriptions(src: &str) -> Vec<String> {
