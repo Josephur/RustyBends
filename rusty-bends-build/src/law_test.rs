@@ -577,6 +577,15 @@ pub(crate) fn emit_pool_runtime_helpers(
     fn __rb_is_step_limit(payload: &(dyn std::any::Any + Send)) -> bool {
         __rb_panic_msg(payload).contains("rusty-bends: step limit")
     }
+
+    /// Both sides of a law's `==` have the law's one type. Pairing them through `T`
+    /// gives a bare literal on one side (`4294967295`) the other side's type even where
+    /// the pair is never compared (the mutation checker's first `match` only counts
+    /// it); a plain tuple there lets the literal fall back to `i32`, which fails to
+    /// compile for values past `i32::MAX`.
+    fn __rb_pair<T>(lhs: T, rhs: T) -> (T, T) {
+        (lhs, rhs)
+    }
 "#,
     );
     if eval_mode {
@@ -1558,7 +1567,7 @@ pub(crate) fn emit_eval_law_checker(
         hyp_checks.push_str(&format!("if ({hl}) != ({hr}) {{ return None; }} "));
     }
     let eval_expr = format!(
-        "std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {{ __rb_reset_steps(); {hyp_checks}Some(({lhs_rs}, {rhs_rs})) }}))"
+        "std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {{ __rb_reset_steps(); {hyp_checks}Some(__rb_pair({lhs_rs}, {rhs_rs})) }}))"
     );
 
     let mut s = String::new();
